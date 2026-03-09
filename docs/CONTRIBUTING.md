@@ -249,7 +249,7 @@ pytest tests/test_binary_protocol.py::test_produce_messages -v
 tail -f /tmp/pulsar-lite.log
 
 # 启动时启用调试日志
-RUST_LOG=debug ./rust/target/release/pulsar-lite
+RUST_LOG=debug rust/pulsar-lite.sh start
 ```
 
 ### 调试 Python SDK
@@ -276,7 +276,7 @@ sudo apt-get install protobuf-compiler
 **Q: Python 测试失败，提示连接被拒绝**
 ```bash
 # 确保 broker 正在运行
-RUST_LOG=info ./rust/target/release/pulsar-lite &
+rust/pulsar-lite.sh start
 sleep 2
 pytest tests/test_binary_protocol.py
 ```

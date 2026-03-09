@@ -1,0 +1,413 @@
+/*
+ * ${dispatcher_type} Dispatcher
+ * Implements message distribution for ${dispatcher_type} subscription mode
+ *
+ * Reference: Apache Pulsar's ${pulsar_reference}
+ */
+
+use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use crate::broker::service::{Consumer, SharedStorage};
+use crate::broker::dispatcher::Dispatcher;
+use crate::broker::service::topic::SubscriptionType;
+
+/// Batch size limit for dispatching (consistent with Apache Pulsar)
+const DISPATCHER_MAX_BATCH_SIZE: u32 = 20;
+
+/// ${dispatcher_type} mode dispatcher
+///
+/// This dispatcher implements the ${description} distribution strategy.
+/// Messages are distributed to consumers based on ${algorithm_description}.
+pub struct ${dispatcher_type}Dispatcher {
+    /// All consumers for this subscription
+    consumers: HashMap<u64, Arc<Consumer>>,
+
+    /// Total available permits across all consumers (atomic for thread safety)
+    total_available_permits: AtomicU32,
+
+    /// Flag to prevent reentrant dispatching
+    dispatch_in_progress: AtomicBool,
+
+    // ========================================
+    // Dispatcher-specific fields
+    // ========================================
+    // TODO: Add dispatcher-specific fields here
+    // Examples:
+    // - Round-Robin index: round_robin_index: AtomicUsize
+    // - Hash ring: hash_ring: HashRing<u64>
+    // - Active consumer (for failover): active_consumer_id: AtomicU64
+}
+
+impl ${dispatcher_type}Dispatcher {
+    /// Create a new ${dispatcher_type}Dispatcher
+    pub fn new() -> Self {
+        Self {
+            consumers: HashMap::new(),
+            total_available_permits: AtomicU32::new(0),
+            dispatch_in_progress: AtomicBool::new(false),
+
+            // TODO: Initialize dispatcher-specific fields
+        }
+    }
+
+    /// Core dispatch algorithm
+    ///
+    /// This method implements the message distribution logic:
+    /// 1. Check if dispatching is possible (permits, consumers)
+    /// 2. Select consumer(s) according to the algorithm
+    /// 3. Get messages from storage
+    /// 4. Send to selected consumer(s)
+    /// 5. Update tracking and state
+    async fn dispatch_messages_batch(
+        &self,
+        storage: SharedStorage,
+        topic: String,
+        subscription: String,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Check if we have permits
+        let total_permits = self.total_available_permits.load(Ordering::Relaxed);
+        if total_permits == 0 {
+            log::debug!("[${dispatcher_type}] No permits available, skipping dispatch");
+            return Ok(());
+        }
+
+        // Calculate batch size
+        let batch_size = std::cmp::min(total_permits, DISPATCHER_MAX_BATCH_SIZE);
+        let mut dispatched = 0;
+
+        log::debug!(
+            "[${dispatcher_type}] Starting dispatch: batch_size={}, consumers={}",
+            batch_size,
+            self.consumers.len()
+        );
+
+        for _ in 0..batch_size {
+            // ========================================
+            // Step 1: Select consumer
+            // ========================================
+            // TODO: Implement consumer selection algorithm
+            let consumer = match self.select_consumer() {
+                Some(c) => c,
+                None => {
+                    log::debug!("[${dispatcher_type}] No available consumer found");
+                    break;
+                }
+            };
+
+            // ========================================
+            // Step 2: Check and use permit
+            // ========================================
+            if !consumer.use_permit().await {
+                log::warn!("[${dispatcher_type}] Consumer {} permits exhausted", consumer.consumer_id);
+                continue;
+            }
+            self.total_available_permits.fetch_sub(1, Ordering::Relaxed);
+
+            // ========================================
+            // Step 3: Get next message
+            // ========================================
+            let message_opt = {
+                let mut guard = storage.lock().await;
+                guard.get_next_unassigned_message(&topic, &subscription, consumer.consumer_id)?
+            };
+
+            // ========================================
+            // Step 4: Dispatch message
+            // ========================================
+            if let Some((message_id, payload)) = message_opt {
+                consumer.enqueue_message(message_id.clone(), payload.clone()).await;
+                consumer.record_message_dispatched(payload.len()).await;
+                dispatched += 1;
+
+                log::trace!(
+                    "[${dispatcher_type}] Dispatched message {}:{} to consumer {}",
+                    message_id.ledger, message_id.entry, consumer.consumer_id
+                );
+            } else {
+                // No more messages, restore permit
+                consumer.add_permits(1).await;
+                self.total_available_permits.fetch_add(1, Ordering::Relaxed);
+                log::debug!("[${dispatcher_type}] No more unassigned messages");
+                break;
+            }
+        }
+
+        if dispatched > 0 {
+            log::info!(
+                "[${dispatcher_type}] Batch dispatch completed: dispatched={}, remaining_permits={}",
+                dispatched,
+                self.total_available_permits.load(Ordering::Relaxed)
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Select the next consumer according to the dispatch algorithm
+    ///
+    /// TODO: Implement the specific selection algorithm
+    /// - Shared: Round-robin among all consumers
+    /// - Failover: Return active consumer only
+    /// - Key_Shared: Select based on message key hash
+    fn select_consumer(&self) -> Option<Arc<Consumer>> {
+        if self.consumers.is_empty() {
+            return None;
+        }
+
+        // TODO: Implement selection logic
+        // Default: return first available consumer
+        self.consumers.values()
+            .find(|c| c.has_permits().await)
+            .cloned()
+    }
+}
+
+// ========================================
+// Dispatcher Trait Implementation
+// ========================================
+
+impl Dispatcher for ${dispatcher_type}Dispatcher {
+    /// Get the subscription type for this dispatcher
+    fn get_type(&self) -> SubscriptionType {
+        SubscriptionType::${dispatcher_type}
+    }
+
+    /// Check if any consumer is connected
+    fn is_consumer_connected(&self) -> bool {
+        !self.consumers.is_empty()
+    }
+
+    /// Get all connected consumers
+    fn get_consumers(&self) -> Vec<Arc<Consumer>> {
+        self.consumers.values().cloned().collect()
+    }
+
+    /// Add a new consumer to the dispatcher
+    ///
+    /// # Arguments
+    /// * `consumer` - The consumer to add
+    ///
+    /// # Returns
+    /// * `Ok(())` if added successfully
+    /// * `Err(...)` if consumer already exists
+    fn add_consumer(&mut self, consumer: Arc<Consumer>) -> Result<(), String> {
+        let consumer_id = consumer.consumer_id;
+
+        if self.consumers.contains_key(&consumer_id) {
+            return Err(format!("Consumer {} already exists", consumer_id));
+        }
+
+        log::info!(
+            "[${dispatcher_type}] Adding consumer {} (total: {})",
+            consumer_id,
+            self.consumers.len() + 1
+        );
+
+        self.consumers.insert(consumer_id, consumer);
+        Ok(())
+    }
+
+    /// Remove a consumer from the dispatcher
+    ///
+    /// # Arguments
+    /// * `consumer_id` - ID of consumer to remove
+    ///
+    /// # Returns
+    /// * `Some(consumer)` if removed
+    /// * `None` if not found
+    fn remove_consumer(&mut self, consumer_id: u64) -> Option<Arc<Consumer>> {
+        let consumer = self.consumers.remove(&consumer_id);
+
+        if let Some(ref c) = consumer {
+            // TODO: Handle dispatcher-specific cleanup
+            // - Shared: No special handling
+            // - Failover: May need to promote standby
+            // - Key_Shared: Remove from hash ring, redistribute keys
+
+            log::info!(
+                "[${dispatcher_type}] Removed consumer {} (remaining: {})",
+                consumer_id,
+                self.consumers.len()
+            );
+
+            // Adjust total permits
+            let permits = futures::executor::block_on(c.get_available_permits());
+            self.total_available_permits.fetch_sub(permits, Ordering::Relaxed);
+        }
+
+        consumer
+    }
+
+    /// Handle consumer flow control
+    ///
+    /// Called when consumer sends Flow command with additional permits.
+    ///
+    /// # Arguments
+    /// * `consumer_id` - Consumer that sent flow command
+    /// * `additional_permits` - Number of additional permits
+    fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {
+        if let Some(consumer) = self.consumers.get(&consumer_id) {
+            let consumer = consumer.clone();
+            tokio::spawn(async move {
+                consumer.add_permits(additional_permits).await;
+            });
+        }
+
+        self.total_available_permits.fetch_add(additional_permits, Ordering::Relaxed);
+
+        log::info!(
+            "[${dispatcher_type}] Consumer {} flowed {} permits, total={}",
+            consumer_id,
+            additional_permits,
+            self.total_available_permits.load(Ordering::Relaxed)
+        );
+    }
+
+    /// Dispatch messages to consumers
+    ///
+    /// Main entry point for message dispatching.
+    async fn dispatch_messages(
+        &self,
+        storage: SharedStorage,
+        topic: String,
+        subscription: String,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Prevent reentrant dispatching
+        if self.dispatch_in_progress.swap(true, Ordering::Relaxed) {
+            log::debug!("[${dispatcher_type}] Dispatch already in progress, skipping");
+            return Ok(());
+        }
+
+        let result = self.dispatch_messages_batch(storage, topic, subscription).await;
+
+        // Reset flag
+        self.dispatch_in_progress.store(false, Ordering::Relaxed);
+
+        result
+    }
+}
+
+// ========================================
+// Default Implementation
+// ========================================
+
+impl Default for ${dispatcher_type}Dispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ========================================
+// Tests
+// ========================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::broker::service::topic::{Subscription, SubscriptionType};
+    use crate::storage::Storage;
+    use std::path::Path;
+    use tokio::sync::{Mutex, mpsc};
+
+    fn create_test_storage() -> SharedStorage {
+        Arc::new(Mutex::new(
+            Storage::new(Path::new("/tmp/test-dispatcher-storage")).unwrap()
+        ))
+    }
+
+    fn create_test_subscription() -> Arc<tokio::sync::RwLock<Subscription>> {
+        Arc::new(tokio::sync::RwLock::new(Subscription::new(
+            "test-sub".to_string(),
+            "test-topic".to_string(),
+            SubscriptionType::${dispatcher_type},
+            create_test_storage(),
+        )))
+    }
+
+    fn create_test_consumer(
+        id: u64,
+        subscription: Arc<tokio::sync::RwLock<Subscription>>,
+    ) -> Arc<Consumer> {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        Arc::new(Consumer::new(
+            id,
+            format!("consumer-{}", id),
+            subscription,
+            "test-conn".to_string(),
+            tx,
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_dispatcher_creation() {
+        let dispatcher = ${dispatcher_type}Dispatcher::new();
+        assert!(!dispatcher.is_consumer_connected());
+        assert_eq!(dispatcher.get_consumers().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_add_consumer() {
+        let mut dispatcher = ${dispatcher_type}Dispatcher::new();
+        let subscription = create_test_subscription();
+        let consumer = create_test_consumer(1, subscription);
+
+        let result = dispatcher.add_consumer(consumer);
+        assert!(result.is_ok());
+        assert!(dispatcher.is_consumer_connected());
+        assert_eq!(dispatcher.get_consumers().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_add_duplicate_consumer() {
+        let mut dispatcher = ${dispatcher_type}Dispatcher::new();
+        let subscription = create_test_subscription();
+
+        let consumer1 = create_test_consumer(1, subscription.clone());
+        let consumer2 = create_test_consumer(1, subscription);
+
+        dispatcher.add_consumer(consumer1).unwrap();
+        let result = dispatcher.add_consumer(consumer2);
+
+        assert!(result.is_err());
+        assert_eq!(dispatcher.get_consumers().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_remove_consumer() {
+        let mut dispatcher = ${dispatcher_type}Dispatcher::new();
+        let subscription = create_test_subscription();
+        let consumer = create_test_consumer(1, subscription);
+
+        dispatcher.add_consumer(consumer).unwrap();
+        let removed = dispatcher.remove_consumer(1);
+
+        assert!(removed.is_some());
+        assert!(!dispatcher.is_consumer_connected());
+    }
+
+    #[tokio::test]
+    async fn test_consumer_flow() {
+        let mut dispatcher = ${dispatcher_type}Dispatcher::new();
+        let subscription = create_test_subscription();
+        let consumer = create_test_consumer(1, subscription);
+
+        consumer.add_permits(5).await;
+        dispatcher.add_consumer(consumer).unwrap();
+
+        dispatcher.consumer_flow(1, 10);
+
+        // Wait for async spawn
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        assert_eq!(
+            dispatcher.total_available_permits.load(Ordering::Relaxed),
+            15
+        );
+    }
+
+    // TODO: Add dispatcher-specific tests
+    // - Test message distribution pattern
+    // - Test consumer selection algorithm
+    // - Test edge cases
+}

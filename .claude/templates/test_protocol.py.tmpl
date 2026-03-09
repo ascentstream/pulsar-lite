@@ -1,0 +1,223 @@
+"""
+Tests for ${command_name} command protocol
+
+This module contains tests for the ${command_name} command implementation.
+It verifies both the command functionality and protocol compatibility.
+
+Reference: docs/PULSAR_BINARY_PROTOCOL.md
+"""
+
+import pytest
+import pulsar
+import time
+import threading
+from typing import Generator
+
+
+# ========================================
+# Fixtures
+# ========================================
+
+@pytest.fixture(scope="module")
+def client() -> Generator[pulsar.Client, None, None]:
+    """Create Pulsar client connected to local broker"""
+    c = pulsar.Client("pulsar://localhost:6650")
+    yield c
+    c.close()
+
+
+@pytest.fixture(scope="module")
+def producer(client: pulsar.Client) -> Generator[pulsar.Producer, None, None]:
+    """Create producer for testing"""
+    p = client.create_producer("test-${command_name_lower}-topic")
+    yield p
+    p.close()
+
+
+@pytest.fixture(scope="function")
+def test_topic(client: pulsar.Client) -> Generator[str, None, None]:
+    """Create a unique test topic for each test"""
+    import uuid
+    topic = f"test-${command_name_lower}-{uuid.uuid4()}"
+    yield topic
+    # Cleanup: topic will be auto-deleted after inactivity
+
+
+# ========================================
+# Test Classes
+# ========================================
+
+class Test${command_name}Basic:
+    """Basic functionality tests for ${command_name}"""
+
+    def test_${command_name_lower}_success(self, client: pulsar.Client):
+        """Test successful ${command_name} operation"""
+        # Arrange
+        # TODO: Set up test conditions
+
+        # Act
+        # TODO: Execute the operation
+
+        # Assert
+        # TODO: Verify the result
+        pass
+
+    def test_${command_name_lower}_with_parameters(self, client: pulsar.Client):
+        """Test ${command_name} with various parameters"""
+        # TODO: Test with different parameter combinations
+        pass
+
+    def test_${command_name_lower}_default_parameters(self, client: pulsar.Client):
+        """Test ${command_name} with default parameters"""
+        # TODO: Test default behavior
+        pass
+
+
+class Test${command_name}ErrorHandling:
+    """Error handling tests for ${command_name}"""
+
+    def test_${command_name_lower}_error_invalid_input(self, client: pulsar.Client):
+        """Test ${command_name} error handling for invalid input"""
+        # TODO: Test with invalid input
+        # with pytest.raises(Exception):
+        #     # Trigger error condition
+        pass
+
+    def test_${command_name_lower}_error_not_found(self, client: pulsar.Client):
+        """Test ${command_name} error when resource not found"""
+        # TODO: Test non-existent resource
+        pass
+
+    def test_${command_name_lower}_error_permission(self, client: pulsar.Client):
+        """Test ${command_name} error for permission issues"""
+        # TODO: Test permission denied scenarios
+        pass
+
+
+class Test${command_name}Concurrency:
+    """Concurrency tests for ${command_name}"""
+
+    def test_${command_name_lower}_concurrent_operations(self, client: pulsar.Client):
+        """Test concurrent ${command_name} operations"""
+        results = []
+        errors = []
+
+        def worker(worker_id: int):
+            try:
+                # TODO: Perform concurrent operation
+                results.append(worker_id)
+            except Exception as e:
+                errors.append((worker_id, e))
+
+        threads = [
+            threading.Thread(target=worker, args=(i,))
+            for i in range(10)
+        ]
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # TODO: Assert on results and errors
+        assert len(errors) == 0, f"Errors occurred: {errors}"
+
+    def test_${command_name_lower}_sequential_operations(self, client: pulsar.Client):
+        """Test sequential ${command_name} operations"""
+        # TODO: Test sequential calls
+        pass
+
+
+class Test${command_name}Protocol:
+    """Protocol-level tests for ${command_name}"""
+
+    def test_binary_protocol_compatibility(self):
+        """Verify binary protocol compatibility with official Pulsar"""
+        # This test ensures the command works with the official Pulsar client
+        # TODO: Use official client to verify protocol compatibility
+        client = pulsar.Client("pulsar://localhost:6650")
+
+        try:
+            # TODO: Execute protocol operation
+            pass
+        finally:
+            client.close()
+
+    def test_command_response_format(self, client: pulsar.Client):
+        """Test command response format matches protocol spec"""
+        # TODO: Verify response format
+        pass
+
+    def test_command_timeout_handling(self, client: pulsar.Client):
+        """Test command timeout handling"""
+        # TODO: Test timeout scenarios
+        pass
+
+
+class Test${command_name}EdgeCases:
+    """Edge case tests for ${command_name}"""
+
+    def test_${command_name_lower}_empty_input(self, client: pulsar.Client):
+        """Test ${command_name} with empty input"""
+        # TODO: Test empty/null inputs
+        pass
+
+    def test_${command_name_lower}_large_input(self, client: pulsar.Client):
+        """Test ${command_name} with large input"""
+        # TODO: Test large payloads
+        pass
+
+    def test_${command_name_lower}_unicode_handling(self, client: pulsar.Client):
+        """Test ${command_name} with unicode characters"""
+        # TODO: Test unicode in topic names, etc.
+        pass
+
+
+# ========================================
+# Integration Tests
+# ========================================
+
+class Test${command_name}Integration:
+    """Integration tests combining ${command_name} with other operations"""
+
+    def test_${command_name_lower}_with_producer(self, client: pulsar.Client, test_topic: str):
+        """Test ${command_name} in producer workflow"""
+        # TODO: Test with producer operations
+        pass
+
+    def test_${command_name_lower}_with_consumer(self, client: pulsar.Client, test_topic: str):
+        """Test ${command_name} in consumer workflow"""
+        # TODO: Test with consumer operations
+        pass
+
+    def test_${command_name_lower}_full_workflow(self, client: pulsar.Client, test_topic: str):
+        """Test full workflow involving ${command_name}"""
+        # TODO: Test complete message flow
+        pass
+
+
+# ========================================
+# Performance Tests (Optional)
+# ========================================
+
+@pytest.mark.skip(reason="Performance test - run manually")
+class Test${command_name}Performance:
+    """Performance tests for ${command_name}"""
+
+    def test_${command_name_lower}_throughput(self, client: pulsar.Client):
+        """Test ${command_name} throughput"""
+        # TODO: Measure operations per second
+        pass
+
+    def test_${command_name_lower}_latency(self, client: pulsar.Client):
+        """Test ${command_name} latency"""
+        # TODO: Measure response time
+        pass
+
+
+# ========================================
+# Run Tests
+# ========================================
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "--tb=short"])

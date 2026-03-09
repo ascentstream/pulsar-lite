@@ -1,0 +1,121 @@
+/*
+ * ${command_name} Handler
+ * Handles ${command_name} command from Pulsar protocol
+ *
+ * Reference: Apache Pulsar ${command_name} command
+ */
+
+use crate::broker::service::ServerCnx;
+use crate::protocol::codec::ServerCommand;
+use crate::proto::pulsar_api;
+
+/// Handle ${command_name} command
+///
+/// # Arguments
+/// * `server_cnx` - Server connection context
+/// * `command` - The ${command_name} command from client
+///
+/// # Returns
+/// * `Ok(ServerCommand)` - Response to send back to client
+/// * `Err(...)` - Error handling the command
+///
+/// # Protocol Reference
+/// Command${command_name} is defined in PulsarApi.proto with fields:
+/// ${proto_fields}
+pub async fn handle_${command_name_lower}(
+    server_cnx: &ServerCnx,
+    command: pulsar_api::Command${command_name},
+) -> Result<ServerCommand, Box<dyn std::error::Error + Send + Sync>> {
+    let request_id = command.request_id;
+
+    log::info!(
+        "[{}] Handling ${command_name}, request_id={}",
+        server_cnx.connection_id(),
+        request_id
+    );
+
+    // ========================================
+    // Step 1: Validate request parameters
+    // ========================================
+    // TODO: Add validation logic
+    // Example:
+    // if command.topic.is_empty() {
+    //     return Ok(ServerCommand::Error {
+    //         request_id,
+    //         message: "Topic name is required".to_string(),
+    //     });
+    // }
+
+    // ========================================
+    // Step 2: Execute business logic
+    // ========================================
+    // TODO: Implement the main logic for this command
+    // This typically involves:
+    // - Looking up or creating resources (topics, subscriptions, etc.)
+    // - Updating internal state
+    // - Interacting with storage
+
+    // ========================================
+    // Step 3: Return response
+    // ========================================
+    // TODO: Return appropriate response
+    // Common responses:
+    // - ServerCommand::Success { request_id } for successful operations
+    // - ServerCommand::Error { request_id, message } for failures
+    // - ServerCommand::Connected { ... } for connection commands
+    // - ServerCommand::ProducerSuccess { ... } for producer commands
+    // - ServerCommand::LookupResponse { ... } for lookup commands
+
+    log::debug!(
+        "[{}] ${command_name} completed successfully, request_id={}",
+        server_cnx.connection_id(),
+        request_id
+    );
+
+    Ok(ServerCommand::Success { request_id })
+}
+
+// ========================================
+// Helper Functions
+// ========================================
+
+// TODO: Add helper functions as needed
+
+// ========================================
+// Tests
+// ========================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // use crate::broker::service::ServerCnx;
+    // use crate::storage::Storage;
+    // use std::path::Path;
+    // use tokio::sync::Mutex;
+    // use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_handle_${command_name_lower}_success() {
+        // TODO: Implement success test case
+        // Arrange: Set up test fixtures
+        // Act: Call the handler
+        // Assert: Verify the result
+    }
+
+    #[tokio::test]
+    async fn test_handle_${command_name_lower}_error_invalid_input() {
+        // TODO: Implement error handling test case
+        // Test with invalid/missing parameters
+    }
+
+    #[tokio::test]
+    async fn test_handle_${command_name_lower}_error_not_found() {
+        // TODO: Implement not found test case
+        // Test when requested resource doesn't exist
+    }
+
+    // Add more tests as needed:
+    // - Boundary conditions
+    // - Concurrent access
+    // - State changes
+}

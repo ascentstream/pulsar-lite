@@ -79,8 +79,9 @@ client = PulsarClient("pulsar://prod-cluster:6650")
 ### 1. 构建 Rust Broker
 
 ```bash
-cd rust
-cargo build --release
+make build
+# 或
+cd rust && cargo build --release
 ```
 
 二进制文件位置: `rust/target/release/pulsar-lite`
@@ -88,7 +89,7 @@ cargo build --release
 ### 2. 启动服务器
 
 ```bash
-
+# 使用脚本启动
 rust/pulsar-lite.sh start
 
 # 默认监听 pulsar://localhost:6650
@@ -99,70 +100,119 @@ rust/pulsar-lite.sh start
 如果想使用 Milvus Lite 风格的嵌入式体验：
 
 ```bash
-[example_usage.py](python/example_usage.py)
+cd python
+pip install -e .
 ```
 
-## 架构设计
-
-### 整体架构
-
-```
-┌─────────────────────────────────────────┐
-│          用户应用代码                     │
-│                                         │
-│  方式1: import pulsar                   │
-│  方式2: from pulsar_lite import Client  │
-└─────────────┬───────────────────────────┘
-              │
-              ▼
-┌─────────────────────────────────────────┐
-│      pulsar-client (官方 Python SDK)    │
-│  • 标准 Pulsar 二进制协议                │
-│  • 完整的 Pulsar API                    │
-└─────────────┬───────────────────────────┘
-              │
-              │ Pulsar 二进制协议 (TCP)
-              ▼
-┌─────────────────────────────────────────┐
-│       Pulsar Lite Broker (Rust)         │
-│  ├── broker/service.rs  (连接管理)      │
-│  ├── broker/handler.rs  (命令处理)      │
-│  ├── protocol/codec.rs  (协议编解码)    │
-│  └── storage/           (RocksDB)       │
-└─────────────┬───────────────────────────┘
-              │
-              ▼
-         ./pulsar-lite.db (本地文件)
-```
-
-### 项目结构
+## 项目结构
 
 ```
 pulsar-lite/
-├── rust/                          # Rust Broker
-│   ├── Cargo.toml                # 依赖配置
-│   ├── build.rs                  # Protobuf 生成
-│   ├── proto/                    # 协议定义
-│   │   └── PulsarApi.proto      # Pulsar 官方协议
-│   └── src/
-│       ├── main.rs               # 入口（~43行）
-│       ├── broker/               # Broker 模块
-│       │   ├── service.rs       # 核心服务
-│       │   └── handler.rs       # 命令处理
-│       ├── protocol/codec.rs    # 协议编解码
-│       └── storage/mod.rs       # RocksDB 存储
+├── CLAUDE.md                     # Claude Code 开发指南
+├── Makefile                      # 构建命令
+├── README.md                     # 项目说明
 │
-├── python/                        # Python SDK
-│   ├── pyproject.toml            # 打包配置
+├── rust/                         # Rust Broker (核心实现)
+│   ├── Cargo.toml               # Rust 依赖配置
+│   ├── build.rs                 # Protobuf 代码生成
+│   ├── pulsar-lite.sh           # 启动脚本
+│   ├── pulsar-lite.toml         # 配置文件
+│   ├── proto/
+│   │   └── PulsarApi.proto      # Pulsar 官方协议定义
+│   ├── tests/                   # Rust 单元测试
+│   └── src/
+│       ├── main.rs              # 程序入口
+│       ├── lib.rs               # 库导出
+│       ├── config.rs            # 配置解析
+│       ├── error.rs             # 错误类型定义
+│       │
+│       ├── broker/              # Broker 核心模块
+│       │   ├── mod.rs
+│       │   ├── broker_service.rs    # Broker 主服务 (连接管理、消息路由)
+│       │   │
+│       │   ├── dispatcher/          # 消息分发器
+│       │   │   ├── mod.rs
+│       │   │   ├── traits.rs        # Dispatcher trait 定义
+│       │   │   ├── enums.rs         # 订阅类型枚举
+│       │   │   ├── shared.rs        # Shared 订阅分发器 (Round-Robin)
+│       │   │   ├── failover.rs      # Failover 订阅分发器 (主备)
+│       │   │   └── exclusive.rs     # Exclusive 订阅分发器 (独占)
+│       │   │
+│       │   ├── handler/             # 协议命令处理器
+│       │   │   ├── mod.rs
+│       │   │   ├── connection_handler.rs   # 连接处理 (Connect/Connected)
+│       │   │   ├── lookup_handler.rs       # Topic 查找 (Lookup)
+│       │   │   ├── producer_handler.rs     # 生产者命令 (Producer/Send)
+│       │   │   └── consumer_handler.rs     # 消费者命令 (Subscribe/Flow/Ack)
+│       │   │
+│       │   ├── service/             # 服务层
+│       │   │   ├── mod.rs
+│       │   │   ├── server_cnx.rs        # 服务器连接上下文
+│       │   │   ├── producer.rs           # 生产者管理
+│       │   │   ├── consumer.rs            # 消费者管理
+│       │   │   └── topic/                # Topic 管理
+│       │   │       ├── mod.rs
+│       │   │       ├── topic.rs            # Topic 实现
+│       │   │       ├── partitioned_topic.rs # 分区 Topic
+│       │   │       └── subscription.rs     # 订阅管理
+│       │   │
+│       │   └── stats/              # 统计指标
+│       │       ├── mod.rs
+│       │       └── metrics.rs          # Metrics 收集
+│       │
+│       ├── protocol/               # 协议层
+│       │   ├── mod.rs
+│       │   ├── command.rs          # 命令类型定义
+│       │   └── codec.rs            # 二进制协议编解码
+│       │
+│       └── storage/                # 存储层
+│           └── mod.rs              # 内存存储 (MVP版本)
+│
+├── python/                       # Python SDK
+│   ├── pyproject.toml            # Python 包配置
+│   ├── setup.py                  # 安装脚本
 │   ├── example_usage.py          # 使用示例
 │   └── src/pulsar_lite/
-│       ├── client.py             # 主客户端（代理模式）
-│       ├── process_manager.py    # 进程管理器
-│       └── binary_finder.py      # 二进制查找
+│       ├── __init__.py           # 包导出
+│       ├── client.py             # 主客户端 (代理到 pulsar.Client)
+│       ├── process_manager.py    # Broker 进程管理器
+│       ├── binary_finder.py      # 二进制文件查找
+│       └── lib/                  # 预编译二进制
 │
-└── tests/
-    └── test_binary_protocol.py   # 协议测试
+├── tests/                        # 集成测试
+│   ├── test_binary_protocol.py   # 二进制协议测试
+│   ├── test_shared_simple.py     # Shared 订阅基础测试
+│   └── test_shared_dispatcher.py # Shared 分发器详细测试
+│
+├── examples/                     # 使用示例
+│   └── basic_usage.py            # 基础用法示例
+│
+└── docs/                         # 项目文档
+    ├── PROJECT_OVERVIEW.md       # 项目概览
+    ├── CONTRIBUTING.md           # 贡献指南
+    ├── CHANGELOG.md              # 变更日志
+    ├── PULSAR_BINARY_PROTOCOL.md # 协议实现文档
+    │
+    ├── design/                   # 设计文档
+    │   └── consumer/
+    │       └── shared.md         # Shared 消费者设计
+    │
+    └── difference/               # 与原生 Pulsar 差异分析
+        ├── shared_subscription_comparison.md    # Shared 订阅对比
+        ├── failover_subscription_comparison.md  # Failover 订阅对比
+        └── exclusive_subscription_comparison.md # Exclusive 订阅对比
 ```
+
+### 核心模块说明
+
+| 模块 | 路径 | 职责 |
+|------|------|------|
+| **Broker Service** | `rust/src/broker/broker_service.rs` | TCP 连接管理、命令路由 |
+| **Dispatcher** | `rust/src/broker/dispatcher/` | 消息分发策略 (Shared/Failover/Exclusive) |
+| **Handler** | `rust/src/broker/handler/` | 协议命令处理 |
+| **Service** | `rust/src/broker/service/` | 业务实体管理 (Producer/Consumer/Topic) |
+| **Protocol** | `rust/src/protocol/` | Pulsar 二进制协议编解码 |
+| **Storage** | `rust/src/storage/` | 消息持久化存储 |
 
 ## 功能支持
 
@@ -170,7 +220,7 @@ pulsar-lite/
 
 | 功能 | 状态 | 说明 |
 |------|------|------|
-| 生产者 | ✅ | 完整支持 |
+| **生产者** | ✅ | 完整支持 |
 | 消息发送 | ✅ | 同步发送，支持消息回执 |
 | 消息持久化 | ✅ | 内存存储（MVP版本） |
 | Connect 协议 | ✅ | 标准握手 |
@@ -328,23 +378,6 @@ exclusive_consumer.close()
 client.close()
 ```
 
-### 基础生产者（仅发送）
-
-```python
-import pulsar
-
-client = pulsar.Client("pulsar://localhost:6650")
-producer = client.create_producer("persistent://public/default/test-topic")
-
-# 发送多条消息
-for i in range(10):
-    msg_id = producer.send(f"Message {i}".encode('utf-8'))
-    print(f"Sent message {i}: {msg_id}")
-
-producer.close()
-client.close()
-```
-
 ### 使用 with 语句
 
 ```python
@@ -363,39 +396,83 @@ with PulsarClient("./demo.db") as client:
 
 - Rust 1.70+
 - Python 3.8+
-- RocksDB (系统依赖)
+- protobuf (protoc)
 
-### 构建
+### 常用命令
 
 ```bash
-# 构建 Rust Broker
-cd rust
-cargo build --release
+# 构建
+make build              # 构建 Rust broker
 
-# 运行测试
-RUST_LOG=info ./target/release/pulsar-lite &
-python3 tests/test_binary_protocol.py
+# 测试
+make test              # 所有测试
+make test-rust         # Rust 单元测试
+make test-python       # Python 集成测试
+
+# 开发
+rust/pulsar-lite.sh start                          # 启动服务器
+
+# 代码质量
+make fmt              # 格式化代码
+make lint             # 代码检查
 ```
 
-### 代码检查
+## 架构设计
 
-```bash
-# Rust 代码检查
-cd rust
-cargo clippy
-cargo fmt
+### 整体架构
 
-# Python 代码检查
-cd python
-black src/
-ruff check src/
+```
+┌─────────────────────────────────────────┐
+│          用户应用代码                     │
+│                                         │
+│  方式1: import pulsar                   │
+│  方式2: from pulsar_lite import Client  │
+└─────────────┬───────────────────────────┘
+              │
+              ▼
+┌─────────────────────────────────────────┐
+│      pulsar-client (官方 Python SDK)    │
+│  • 标准 Pulsar 二进制协议                │
+│  • 完整的 Pulsar API                    │
+└─────────────┬───────────────────────────┘
+              │
+              │ Pulsar 二进制协议 (TCP)
+              ▼
+┌─────────────────────────────────────────┐
+│       Pulsar Lite Broker (Rust)         │
+│  ├── broker_service.rs  (连接管理)      │
+│  ├── dispatcher/        (消息分发)      │
+│  ├── handler/           (命令处理)      │
+│  ├── service/           (业务实体)      │
+│  ├── protocol/codec.rs  (协议编解码)    │
+│  └── storage/           (消息存储)      │
+└─────────────┬───────────────────────────┘
+              │
+              ▼
+         ./pulsar-lite.db (本地文件)
+```
+
+### 消息流转
+
+```
+Producer                    Broker                      Consumer
+   │                          │                            │
+   │ ─────── Send ─────────> │                            │
+   │                         │ ──── store message ────>   │
+   │ <───── Receipt ──────── │                            │
+   │                          │                            │
+   │                          │ <──── Flow(permits) ───── │
+   │                          │                            │
+   │                          │ ───── Message ─────────> │
+   │                          │ <───── Ack ───────────── │
+   │                          │                            │
 ```
 
 ## 性能特点
 
 - **零拷贝**: 使用 Pulsar 原生二进制协议，无需协议转换
 - **异步 IO**: 基于 tokio 的高性能异步运行时
-- **嵌入式存储**: RocksDB 提供高效的本地持久化
+- **嵌入式存储**: 内存存储 (MVP)，后续支持 RocksDB
 - **轻量级**: 单二进制文件，无外部依赖
 
 ## 技术栈
@@ -403,61 +480,11 @@ ruff check src/
 ### Rust
 - **tokio**: 异步运行时
 - **prost**: Protobuf 编解码
-- **rocksdb**: 嵌入式存储
 - **tokio-util**: 编解码器工具
 
 ### Python
 - **pulsar-client**: 官方 Pulsar Python SDK (>=3.0.0)
 - **setuptools**: 包管理
-
-## 路线图
-
-### ✅ 阶段一：核心功能（已完成）
-- [x] Pulsar 二进制协议支持
-- [x] 模块化 Broker 架构
-- [x] 生产者功能
-- [x] Python SDK (Milvus Lite 风格)
-- [x] 代码重构优化
-
-### ✅ 阶段二：消费者功能（已完成）
-- [x] 消费者订阅（Subscribe 命令）
-- [x] 消息推送（Flow 控制，permit-based 流控）
-- [x] 消息确认（Ack 命令，支持可选 request_id）
-- [x] Shared 订阅模式（与 Apache Pulsar 完全一致）
-- [x] CloseConsumer 命令（优雅关闭）
-- [x] Ping/Pong 心跳检测
-- [x] 消息分配追踪（避免重复消费）
-- [x] Round-robin 批处理（dispatcherMaxRoundRobinBatchSize = 20）
-
-### ✅ 阶段三：订阅模式完善（已完成）
-- [x] 代码优化重构
-  - [x] 从 codec.rs 拆分 command.rs
-  - [x] 添加 trait 和接口抽象
-  - [x] 改进错误处理和类型安全
-- [x] Failover 订阅模式实现
-  - [x] dispatcher/failover.rs 实现
-  - [x] 主消费者接收所有消息
-  - [x] 备用消费者待命机制
-  - [x] 测试用例验证
-- [x] Exclusive 订阅模式实现
-  - [x] dispatcher/exclusive.rs 实现
-  - [x] 独占访问控制（拒绝第二个消费者）
-  - [x] SubscriptionType 枚举定义
-  - [x] 消费者关闭后重连支持
-  - [x] 测试用例验证
-- [x] Broker Metrics 收集
-  - [x] broker/stats/metrics.rs 实现
-  - [x] 原子计数器（连接、生产者、消费者、消息等）
-  - [x] 性能指标统计（消息速率、吞吐量）
-
-### ⏳ 阶段四：完善与发布（进行中）
-- [ ] Key_Shared 订阅模式
-- [ ] 多分区支持
-- [ ] 持久化存储（RocksDB）
-- [ ] 性能优化
-- [ ] 压力测试
-- [ ] 文档完善
-- [ ] PyPI 发布
 
 ## 与 Apache Pulsar 对比
 
@@ -466,10 +493,48 @@ ruff check src/
 | 部署方式 | 单机嵌入式 | 分布式集群 |
 | 协议支持 | 标准 Pulsar 协议 | 完整 Pulsar 协议 |
 | 客户端 | 官方客户端 | 官方客户端 |
-| 持久化 | RocksDB | BookKeeper |
+| 持久化 | 内存/RocksDB | BookKeeper |
 | 消息顺序 | 单分区 | 多分区 |
 | 适用场景 | 开发/测试/边缘 | 生产环境 |
 | 运维成本 | 零 | 需要专业团队 |
+
+### 已知差异
+
+详细的差异分析请查看 `docs/difference/` 目录：
+
+- [Shared 订阅差异](docs/difference/shared_subscription_comparison.md)
+- [Failover 订阅差异](docs/difference/failover_subscription_comparison.md)
+- [Exclusive 订阅差异](docs/difference/exclusive_subscription_comparison.md)
+
+## 路线图
+
+### ✅ 阶段一：核心功能（已完成）
+- [x] Pulsar 二进制协议支持
+- [x] 模块化 Broker 架构
+- [x] 生产者功能
+- [x] Python SDK (Milvus Lite 风格)
+
+### ✅ 阶段二：消费者功能（已完成）
+- [x] 消费者订阅（Subscribe 命令）
+- [x] 消息推送（Flow 控制）
+- [x] 消息确认（Ack 命令）
+- [x] Shared 订阅模式
+- [x] CloseConsumer 命令
+- [x] Ping/Pong 心跳检测
+
+### ✅ 阶段三：订阅模式完善（已完成）
+- [x] Failover 订阅模式
+- [x] Exclusive 订阅模式
+- [x] Broker Metrics 收集
+- [x] 代码重构优化
+
+### ⏳ 阶段四：完善与发布（进行中）
+- [ ] Key_Shared 订阅模式
+- [ ] 消息重投递机制
+- [ ] 持久化存储（RocksDB）
+- [ ] 性能优化
+- [ ] 文档完善
+- [ ] PyPI 发布
 
 ## 参考项目
 

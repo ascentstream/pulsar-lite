@@ -1,0 +1,398 @@
+"""
+Tests for ${dispatcher_type} dispatcher
+
+This module contains tests for the ${dispatcher_type} subscription dispatcher.
+It verifies message distribution, consumer management, and flow control.
+
+Reference: rust/src/broker/dispatcher/${dispatcher_type_lower}.rs
+"""
+
+import pytest
+import pulsar
+import threading
+import time
+from typing import Generator, List, Tuple
+from concurrent.futures import ThreadPoolExecutor
+
+
+# ========================================
+# Test Configuration
+# ========================================
+
+TEST_TOPIC = "test-${dispatcher_type_lower}-topic"
+TEST_SUBSCRIPTION = "test-${dispatcher_type_lower}-sub"
+NUM_MESSAGES = 100
+NUM_CONSUMERS = 3
+
+
+# ========================================
+# Fixtures
+# ========================================
+
+@pytest.fixture(scope="module")
+def client() -> Generator[pulsar.Client, None, None]:
+    """Create Pulsar client"""
+    c = pulsar.Client("pulsar://localhost:6650")
+    yield c
+    c.close()
+
+
+@pytest.fixture(scope="module")
+def producer(client: pulsar.Client) -> Generator[pulsar.Producer, None, None]:
+    """Create producer for testing"""
+    p = client.create_producer(TEST_TOPIC)
+    yield p
+    p.close()
+
+
+@pytest.fixture
+def clean_subscription(client: pulsar.Client) -> Generator[None, None, None]:
+    """Ensure clean subscription state for each test"""
+    # TODO: Clean up subscription before/after test
+    yield
+
+
+# ========================================
+# Basic Tests
+# ========================================
+
+class Test${dispatcher_type}DispatcherBasic:
+    """Basic functionality tests"""
+
+    def test_single_consumer_receives_messages(
+        self, client: pulsar.Client, producer: pulsar.Producer
+    ):
+        """Test that single consumer receives all messages"""
+        consumer = client.subscribe(
+            TEST_TOPIC,
+            TEST_SUBSCRIPTION,
+            consumer_type=pulsar.ConsumerType.${consumer_type}
+        )
+
+        # Send messages
+        for i in range(10):
+            producer.send(f"message-{i}".encode())
+
+        # Receive and verify
+        received = []
+        for _ in range(10):
+            msg = consumer.receive(timeout_millis=5000)
+            received.append(msg.data().decode())
+            consumer.acknowledge(msg)
+
+        consumer.close()
+
+        assert len(received) == 10
+        for i in range(10):
+            assert f"message-{i}" in received
+
+    def test_multiple_consumers(
+        self, client: pulsar.Client, producer: pulsar.Producer
+    ):
+        """Test with multiple consumers"""
+        consumers = []
+        for i in range(NUM_CONSUMERS):
+            c = client.subscribe(
+                TEST_TOPIC,
+                f"{TEST_SUBSCRIPTION}-multi",
+                consumer_type=pulsar.ConsumerType.${consumer_type},
+                consumer_name=f"consumer-{i}"
+            )
+            consumers.append(c)
+
+        # Send messages
+        for i in range(NUM_MESSAGES):
+            producer.send(f"message-{i}".encode())
+
+        # Collect received messages
+        all_received = []
+        for consumer in consumers:
+            try:
+                while True:
+                    msg = consumer.receive(timeout_millis=1000)
+                    all_received.append(msg.data().decode())
+                    consumer.acknowledge(msg)
+            except Exception:
+                pass
+
+        for c in consumers:
+            c.close()
+
+        # Verify all messages received
+        assert len(all_received) == NUM_MESSAGES
+
+
+# ========================================
+# Distribution Tests
+# ========================================
+
+class Test${dispatcher_type}Distribution:
+    """Test message distribution pattern"""
+
+    def test_distribution_pattern(
+        self, client: pulsar.Client, producer: pulsar.Producer
+    ):
+        """Test message distribution follows expected pattern"""
+        # TODO: Implement distribution verification based on dispatcher type
+        # - Shared: Round-robin distribution
+        # - Failover: All to active consumer
+        # - Key_Shared: Same key to same consumer
+        pass
+
+    def test_distribution_with_consumer_add(
+        self, client: pulsar.Client, producer: pulsar.Producer
+    ):
+        """Test distribution when new consumer joins"""
+        pass
+
+    def test_distribution_with_consumer_remove(
+        self, client: pulsar.Client, producer: pulsar.Producer
+    ):
+        """Test distribution when consumer leaves"""
+        pass
+
+
+# ========================================
+# Flow Control Tests
+# ========================================
+
+class Test${dispatcher_type}FlowControl:
+    """Test flow control behavior"""
+
+    def test_flow_control_limits(
+        self, client: pulsar.Client, producer: pulsar.Producer
+    ):
+        """Test that flow control limits message delivery"""
+        consumer = client.subscribe(
+            TEST_TOPIC,
+            f"{TEST_SUBSCRIPTION}-flow",
+            consumer_type=pulsar.ConsumerType.${consumer_type}
+        )
+
+        # Send more messages than permits
+        for i in range(100):
+            producer.send(f"flow-message-{i}".encode())
+
+        # Consumer only receives up to initial permits
+        # TODO: Verify flow control behavior
+
+        consumer.close()
+
+    def test_flow_permits_refill(
+        self, client: pulsar.Client, producer: pulsar.Producer
+    ):
+        """Test that permits are refilled after ack"""
+        pass
+
+
+# ========================================
+# Concurrency Tests
+# ========================================
+
+class Test${dispatcher_type}Concurrency:
+    """Test concurrent access"""
+
+    def test_concurrent_producers(
+        self, client: pulsar.Client
+    ):
+        """Test multiple producers sending concurrently"""
+        def produce(producer_id: int, num_messages: int):
+            p = client.create_producer(TEST_TOPIC)
+            for i in range(num_messages):
+                p.send(f"producer-{producer_id}-msg-{i}".encode())
+            p.close()
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [
+                executor.submit(produce, i, 20)
+                for i in range(5)
+            ]
+            for f in futures:
+                f.result()
+
+        # Verify all messages received
+        consumer = client.subscribe(
+            TEST_TOPIC,
+            f"{TEST_SUBSCRIPTION}-concurrent",
+            consumer_type=pulsar.ConsumerType.${consumer_type}
+        )
+
+        count = 0
+        try:
+            while True:
+                consumer.receive(timeout_millis=1000)
+                count += 1
+        except Exception:
+            pass
+
+        consumer.close()
+        assert count == 100  # 5 producers * 20 messages
+
+    def test_concurrent_consumers(
+        self, client: pulsar.Client, producer: pulsar.Producer
+    ):
+        """Test multiple consumers receiving concurrently"""
+        pass
+
+
+# ========================================
+# Edge Case Tests
+# ========================================
+
+class Test${dispatcher_type}EdgeCases:
+    """Test edge cases"""
+
+    def test_no_messages(self, client: pulsar.Client):
+        """Test consumer behavior with no messages"""
+        consumer = client.subscribe(
+            TEST_TOPIC,
+            f"{TEST_SUBSCRIPTION}-empty",
+            consumer_type=pulsar.ConsumerType.${consumer_type}
+        )
+
+        # Try to receive with timeout
+        with pytest.raises(Exception):
+            consumer.receive(timeout_millis=1000)
+
+        consumer.close()
+
+    def test_large_messages(
+        self, client: pulsar.Client, producer: pulsar.Producer
+    ):
+        """Test with large messages"""
+        large_payload = b"x" * (1024 * 1024)  # 1MB
+
+        consumer = client.subscribe(
+            TEST_TOPIC,
+            f"{TEST_SUBSCRIPTION}-large",
+            consumer_type=pulsar.ConsumerType.${consumer_type}
+        )
+
+        producer.send(large_payload)
+        msg = consumer.receive(timeout_millis=5000)
+        assert len(msg.data()) == len(large_payload)
+
+        consumer.acknowledge(msg)
+        consumer.close()
+
+    def test_rapid_connect_disconnect(self, client: pulsar.Client):
+        """Test rapid consumer connect/disconnect"""
+        for i in range(10):
+            consumer = client.subscribe(
+                TEST_TOPIC,
+                f"{TEST_SUBSCRIPTION}-rapid",
+                consumer_type=pulsar.ConsumerType.${consumer_type}
+            )
+            consumer.close()
+
+
+# ========================================
+# Reliability Tests
+# ========================================
+
+class Test${dispatcher_type}Reliability:
+    """Test reliability features"""
+
+    def test_consumer_failure_recovery(
+        self, client: pulsar.Client, producer: pulsar.Producer
+    ):
+        """Test message delivery after consumer failure"""
+        # TODO: Test that messages are redelivered when consumer fails
+        pass
+
+    def test_message_ordering(
+        self, client: pulsar.Client, producer: pulsar.Producer
+    ):
+        """Test message ordering guarantees"""
+        # TODO: Test ordering based on dispatcher type
+        pass
+
+    def test_no_message_loss(
+        self, client: pulsar.Client, producer: pulsar.Producer
+    ):
+        """Test that no messages are lost"""
+        # Send known number of messages
+        num_messages = 50
+        for i in range(num_messages):
+            producer.send(f"no-loss-{i}".encode())
+
+        # Receive with multiple consumers
+        consumers = []
+        for i in range(3):
+            c = client.subscribe(
+                TEST_TOPIC,
+                f"{TEST_SUBSCRIPTION}-noloss",
+                consumer_type=pulsar.ConsumerType.${consumer_type}
+            )
+            consumers.append(c)
+
+        # Collect all messages
+        all_messages = set()
+        for consumer in consumers:
+            try:
+                while True:
+                    msg = consumer.receive(timeout_millis=2000)
+                    all_messages.add(msg.data().decode())
+                    consumer.acknowledge(msg)
+            except Exception:
+                pass
+
+        for c in consumers:
+            c.close()
+
+        # Verify no loss
+        assert len(all_messages) == num_messages
+
+
+# ========================================
+# Performance Tests (Optional)
+# ========================================
+
+@pytest.mark.skip(reason="Performance test - run manually")
+class Test${dispatcher_type}Performance:
+    """Performance tests"""
+
+    def test_throughput(self, client: pulsar.Client, producer: pulsar.Producer):
+        """Test message throughput"""
+        import time
+
+        consumer = client.subscribe(
+            TEST_TOPIC,
+            f"{TEST_SUBSCRIPTION}-perf",
+            consumer_type=pulsar.ConsumerType.${consumer_type}
+        )
+
+        # Send messages
+        num_messages = 10000
+        start_time = time.time()
+
+        for i in range(num_messages):
+            producer.send(f"perf-{i}".encode())
+
+        send_time = time.time() - start_time
+
+        # Receive messages
+        start_time = time.time()
+        received = 0
+        try:
+            while received < num_messages:
+                consumer.receive(timeout_millis=5000)
+                received += 1
+        except Exception:
+            pass
+
+        receive_time = time.time() - start_time
+
+        consumer.close()
+
+        print(f"\nThroughput Results:")
+        print(f"  Send: {num_messages / send_time:.2f} msg/s")
+        print(f"  Receive: {received / receive_time:.2f} msg/s")
+
+
+# ========================================
+# Run Tests
+# ========================================
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "--tb=short"])

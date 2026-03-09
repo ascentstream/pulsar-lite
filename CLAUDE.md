@@ -32,7 +32,7 @@ make test-rust         # Rust 单元测试
 make test-python       # Python 集成测试
 
 # 开发
-RUST_LOG=info ./rust/target/release/pulsar-lite   # 启动服务器
+rust/pulsar-lite.sh start                          # 启动服务器
 tail -f /tmp/pulsar-lite.log                       # 查看日志
 
 # 代码质量
@@ -119,8 +119,8 @@ brew install protobuf  # macOS
 
 **Q: 测试连接被拒绝**
 ```bash
-# 确保服务器运行
-RUST_LOG=info ./rust/target/release/pulsar-lite &
+# 使用脚本启动服务器
+rust/pulsar-lite.sh start
 sleep 2
 ```
 

@@ -320,14 +320,15 @@ Pulsar Lite 兼容以下官方客户端：
 ### 启用日志
 
 ```bash
-RUST_LOG=debug ./rust/target/release/pulsar-lite
+# 使用脚本启动（推荐）
+RUST_LOG=debug rust/pulsar-lite.sh start
 ```
 
 ### 查看协议交互
 
 ```bash
-# 启动服务器
-RUST_LOG=debug ./rust/target/release/pulsar-lite 2>&1 | tee pulsar.log
+# 启动服务器并记录日志
+RUST_LOG=debug rust/pulsar-lite.sh start 2>&1 | tee pulsar.log
 
 # 查看命令处理
 grep "Handling.*command" pulsar.log

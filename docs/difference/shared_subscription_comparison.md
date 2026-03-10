@@ -1,6 +1,6 @@
 # Pulsar Lite Shared 消费模式 vs 原生 Pulsar 全面对比分析
 
-> 分析日期: 2026-03-09
+> 分析日期: 2026-03-10
 > 对比版本: Pulsar Lite (当前实现) vs Apache Pulsar (官方实现)
 
 ---
@@ -16,6 +16,9 @@
 | **消息分配器** | 无（直接在 storage 中跟踪） | `SharedConsumerAssignor` |
 | **重投递控制** | 无 | `MessageRedeliveryController` |
 | **游标管理** | 简单 HashMap | ManagedCursor + BookKeeper |
+| **连接管理** | 无状态，无超时检测 | 完整的连接生命周期管理 |
+| **事务支持** | 无 | 完整事务支持 |
+| **消息元数据** | 仅存储 payload | 完整的属性和元数据支持 |
 
 ---
 
@@ -243,14 +246,20 @@ public synchronized void removeConsumer(Consumer consumer) {
 // SharedDispatcher
 total_available_permits: AtomicU32,  // 全局 permits
 
+// consumer_flow 是同步函数
 fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {
-    consumer.add_permits(additional_permits);
-    self.total_available_permits.fetch_add(additional_permits);
+    // permit 更新通过异步任务执行
+    let consumer = self.consumers.get(&consumer_id).cloned();
+    if let Some(consumer) = consumer {
+        consumer.add_permits(additional_permits);  // 内部使用异步任务
+    }
+    self.total_available_permits.fetch_add(additional_permits, Ordering::Relaxed);
 }
 ```
 
 **特点**：
 - ✅ 简单的全局 permits 计数
+- ⚠️ `consumer_flow` 是同步函数，但 permit 更新通过异步任务执行
 - ❌ **无 per-consumer unacked 限制**
 - ❌ **无 backpressure 机制**
 
@@ -287,9 +296,214 @@ static int getMaxEntriesInThisBatch(
 
 ---
 
-## 七、缺失功能清单
+## 七、连接管理差异
 
-### 7.1 Pulsar Lite 当前缺失的关键功能
+### 7.1 Pulsar Lite
+
+**❌ 缺少完整的连接管理**
+
+```rust
+// rust/src/broker/service/consumer.rs
+pub struct Consumer {
+    consumer_id: u64,
+    consumer_name: String,
+    available_permits: AtomicU32,
+    // 缺少:
+    // - connected: AtomicBool
+    // - last_active: Instant
+    // - heartbeat tracking
+}
+```
+
+**问题**：
+- ❌ **无连接状态跟踪** - 不知道 Consumer 是否存活
+- ❌ **无超时断开检测** - Consumer 崩溃后不会自动清理
+- ❌ **无心跳机制** - 无法检测僵尸连接
+- ❌ **无连接恢复** - 断开后需要重新订阅
+
+### 7.2 原生 Pulsar
+
+```java
+// ServerCnx.java - 连接管理
+public class ServerCnx extends PulsarHandler {
+    // 连接状态
+    State state = State.Start;
+    ChannelHandlerContext ctx;
+    volatile boolean isActive = true;
+
+    // 心跳检测
+    long lastActive = System.currentTimeMillis();
+    int maxConsecutiveFailedHeartbeats = 3;
+
+    // 超时处理
+    void checkConnectionTimeout() {
+        if (System.currentTimeMillis() - lastActive > connectionTimeoutMs) {
+            closeConnection();
+        }
+    }
+
+    // Consumer 移除时清理
+    void closeConsumer(Consumer consumer) {
+        consumer.close();
+        removeConsumerFromDispatcher(consumer);
+        replayPendingMessages(consumer);
+    }
+}
+```
+
+**特点**：
+- ✅ **完整的连接状态机** - Start, Connected, Closing, Closed
+- ✅ **心跳检测** - 定期发送 Ping/Pong
+- ✅ **超时断开** - 自动清理无效连接
+- ✅ **优雅关闭** - Consumer 移除时 replay pending 消息
+
+### 7.3 关键差异
+
+| 特性 | Pulsar Lite | 原生 Pulsar |
+|------|-------------|-------------|
+| **连接状态跟踪** | ❌ 无 | ✅ State 状态机 |
+| **心跳检测** | ❌ 无 | ✅ Ping/Pong + 失败计数 |
+| **超时断开** | ❌ 无 | ✅ 可配置超时 |
+| **优雅关闭** | ❌ 直接移除 | ✅ replay pending 消息 |
+| **连接恢复** | ❌ 需重新订阅 | ✅ 支持 reconnect |
+
+---
+
+## 八、事务支持差异
+
+### 8.1 Pulsar Lite
+
+**❌ 完全不支持事务**
+
+当前实现没有任何事务相关的代码：
+- 无事务协调器 (Transaction Coordinator)
+- 无事务日志
+- 无事务性消息发送
+- 无事务性确认
+
+### 8.2 原生 Pulsar
+
+```java
+// TransactionMetadataStoreService.java
+public class TransactionMetadataStoreService {
+    // 事务状态管理
+    enum TxnStatus { OPEN, COMMITTING, COMMITTED, ABORTING, ABORTED }
+
+    // 事务协调器
+    Map<Long, TransactionMetadata> transactions;
+
+    // 事务性发送
+    void addPublishToTxn(long txnId, long ledgerId, long entryId) {
+        transactions.get(txnId).addEntry(ledgerId, entryId);
+    }
+
+    // 事务性确认
+    void addAckToTxn(long txnId, String topic, String subscription, List<Position> positions) {
+        transactions.get(txnId).addAckPositions(positions);
+    }
+
+    // 提交/回滚
+    void commitTxn(long txnId) { /* ... */ }
+    void abortTxn(long txnId) { /* ... */ }
+}
+```
+
+**特点**：
+- ✅ **原子性发送** - 多条消息原子写入
+- ✅ **原子性确认** - 批量确认的原子性保证
+- ✅ **跨 Topic 事务** - 一个事务可涉及多个 Topic
+- ✅ **2PC 支持** - 两阶段提交协议
+
+### 8.3 关键差异
+
+| 特性 | Pulsar Lite | 原生 Pulsar |
+|------|-------------|-------------|
+| **事务协调器** | ❌ 无 | ✅ TransactionCoordinator |
+| **事务性发送** | ❌ 无 | ✅ 原子写入多条消息 |
+| **事务性确认** | ❌ 无 | ✅ 批量确认原子性 |
+| **跨 Topic 事务** | ❌ 无 | ✅ 支持 |
+| **2PC 协议** | ❌ 无 | ✅ 完整支持 |
+
+---
+
+## 九、消息元数据差异
+
+### 9.1 Pulsar Lite
+
+```rust
+// rust/src/storage/mod.rs
+pub struct Message {
+    pub payload: Vec<u8>,
+    // 缺少:
+    // - properties: HashMap<String, String>
+    // - event_time: Option<i64>
+    // - key: Option<String>
+    // - ordering_key: Option<Vec<u8>>
+    // - sequence_id: Option<i64>
+}
+```
+
+**问题**：
+- ❌ **无消息属性** - 不能携带自定义 key-value
+- ❌ **无 event_time** - 无法按事件时间处理
+- ❌ **无 ordering_key** - 无法保证有序性
+- ❌ **无 sequence_id** - 无法检测消息丢失/重复
+
+### 9.2 原生 Pulsar
+
+```java
+// MessageMetadata.proto
+message MessageMetadata {
+    required string producer_name = 1;
+    required uint64 sequence_id = 2;
+    optional uint64 event_time = 4;
+    repeated KeyValue properties = 5;
+    optional string partition_key = 6;
+    optional bytes ordering_key = 16;
+    // ... 更多字段
+}
+
+// 消息处理
+public class MessageImpl {
+    private MessageMetadata metadata;
+    private ByteBuf payload;
+
+    public String getProperty(String key) {
+        return metadata.getProperties().get(key);
+    }
+
+    public long getEventTime() {
+        return metadata.getEventTime();
+    }
+
+    public String getOrderingKey() {
+        return metadata.getOrderingKey();
+    }
+}
+```
+
+**特点**：
+- ✅ **完整的元数据** - properties, event_time, key 等
+- ✅ **自定义属性** - 用户可添加任意 key-value
+- ✅ **事件时间语义** - 支持按 event_time 处理
+- ✅ **有序性保证** - ordering_key 支持严格有序
+
+### 9.3 关键差异
+
+| 特性 | Pulsar Lite | 原生 Pulsar |
+|------|-------------|-------------|
+| **消息属性** | ❌ 无 | ✅ HashMap<String, String> |
+| **event_time** | ❌ 无 | ✅ 支持 |
+| **ordering_key** | ❌ 无 | ✅ 支持严格有序 |
+| **sequence_id** | ❌ 无 | ✅ 检测丢失/重复 |
+| **partition_key** | ❌ 无 | ✅ 分区路由 |
+| **压缩支持** | ❌ 无 | ✅ LZ4/Zlib/Zstd |
+
+---
+
+## 十、缺失功能清单
+
+### 10.1 Pulsar Lite 当前缺失的关键功能
 
 | 功能 | 优先级 | 影响范围 |
 |------|--------|----------|
@@ -297,16 +511,21 @@ static int getMaxEntriesInThisBatch(
 | **自动重投递** | 高 | Consumer 故障时消息无法恢复 |
 | **Unacked 消息限制** | 高 | 慢消费者可能拖垮系统 |
 | **Dispatcher 阻塞机制** | 高 | 背压缺失 |
+| **连接状态管理** | 高 | 僵尸连接无法检测 |
+| **心跳/超时检测** | 高 | Consumer 崩溃后无法清理 |
+| **消息元数据** | 中 | 无法携带属性和有序性保证 |
 | **消费者优先级** | 中 | 负载分配不均衡 |
 | **累积确认** | 中 | 性能优化 |
 | **延迟消息** | 中 | 功能缺失 |
+| **事务支持** | 低 | 不支持原子性操作 |
 | **Chunked Messages** | 低 | 大消息支持 |
+| **消息压缩** | 低 | 带宽优化 |
 
 ---
 
-## 八、架构改进建议
+## 十一、架构改进建议
 
-### 8.1 短期改进（MVP 完善）
+### 11.1 短期改进（MVP 完善）
 
 ```rust
 // 1. 添加 Pending Acks 跟踪
@@ -336,7 +555,7 @@ impl SharedDispatcher {
 }
 ```
 
-### 8.2 中期改进（功能对齐）
+### 11.2 中期改进（功能对齐）
 
 ```rust
 // 4. 消费者优先级支持
@@ -362,9 +581,9 @@ pub struct SharedDispatcher {
 
 ---
 
-## 九、总结
+## 十二、总结
 
-### 9.1 相似之处
+### 12.1 相似之处
 
 | 方面 | 说明 |
 |------|------|
@@ -373,7 +592,7 @@ pub struct SharedDispatcher {
 | 批量限制 | 都有 `dispatcherMaxRoundRobinBatchSize` |
 | 消息分配跟踪 | 都跟踪消息分配状态 |
 
-### 9.2 主要差异
+### 12.2 主要差异
 
 | 差异点 | Pulsar Lite | 原生 Pulsar |
 |--------|-------------|-------------|
@@ -382,8 +601,11 @@ pub struct SharedDispatcher {
 | **背压** | 无 | 多层流控 |
 | **存储** | 内存 HashMap | BookKeeper + ManagedCursor |
 | **异步** | 简单同步 | 完整异步回调链 |
+| **连接管理** | 无状态，无超时检测 | 完整连接生命周期 |
+| **事务支持** | 无 | 完整事务协调器 |
+| **消息元数据** | 仅 payload | 完整属性和元数据 |
 
-### 9.3 Pulsar Lite 定位
+### 12.3 Pulsar Lite 定位
 
 作为一个 **轻量级嵌入式消息队列**，Pulsar Lite 当前的 Shared 模式实现：
 - ✅ 适合开发测试场景
@@ -393,7 +615,7 @@ pub struct SharedDispatcher {
 
 ---
 
-## 十、参考代码位置
+## 十三、参考代码位置
 
 ### Pulsar Lite 关键文件
 
@@ -403,6 +625,7 @@ pub struct SharedDispatcher {
 | `rust/src/broker/service/consumer.rs` | Consumer 定义 |
 | `rust/src/storage/mod.rs` | 消息存储和确认 |
 | `rust/src/broker/service/topic/subscription.rs` | 订阅管理 |
+| `rust/src/protocol/codec.rs` | 协议编解码 |
 
 ### 原生 Pulsar 关键文件
 
@@ -412,3 +635,6 @@ pub struct SharedDispatcher {
 | `pulsar-broker/.../AbstractDispatcherMultipleConsumers.java` | 基类，消费者选择算法 |
 | `pulsar-broker/.../SharedConsumerAssignor.java` | 消息分配器 |
 | `pulsar-broker/.../MessageRedeliveryController.java` | 重投递控制 |
+| `pulsar-broker/.../ServerCnx.java` | 连接管理 |
+| `pulsar-broker/.../TransactionMetadataStoreService.java` | 事务支持 |
+| `pulsar-common/.../MessageMetadata.proto` | 消息元数据定义 |

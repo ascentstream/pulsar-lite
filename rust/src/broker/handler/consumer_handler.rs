@@ -121,6 +121,11 @@ pub async fn handle_flow(
 }
 
 /// Handle Ack command - Message acknowledgment (Apache Pulsar style)
+///
+/// For Shared subscription:
+/// 1. Validate that the message belongs to this consumer
+/// 2. Remove from pending_acks
+/// 3. Update storage cursor using ack_message_shared()
 pub async fn handle_ack<T>(
     framed: &mut Framed<T, PulsarFrameCodec>,
     cmd: BaseCommand,
@@ -146,14 +151,52 @@ where
             partition: message_id.partition.unwrap_or(0),
         };
 
-        // Record in consumer stats
-        consumer.ack_message(msg_id.clone()).await;
+        // Get subscription type
+        let sub_type = consumer.get_sub_type();
 
-        // Update storage cursor
-        let mut guard = storage.lock().await;
-        let topic_name = consumer.get_topic_name();
-        let sub_name = consumer.get_subscription_name();
-        guard.ack_message(&topic_name, &sub_name, msg_id)?;
+        if sub_type == SubscriptionType::Shared {
+            let ack_owner = if consumer.has_pending_ack(&msg_id).await {
+                Some(consumer.clone())
+            } else {
+                let subscription = consumer.get_subscription();
+                let subscription_consumers = {
+                    let sub_guard = subscription.read().await;
+                    sub_guard.get_consumers()
+                };
+
+                let mut owner = None;
+                for candidate in subscription_consumers {
+                    if candidate.consumer_id != consumer.consumer_id && candidate.has_pending_ack(&msg_id).await {
+                        owner = Some(candidate);
+                        break;
+                    }
+                }
+                owner
+            };
+
+            if let Some(owner_consumer) = ack_owner {
+                owner_consumer.remove_pending_ack(&msg_id).await;
+                owner_consumer.record_message_acked().await;
+
+                let mut guard = storage.lock().await;
+                let topic_name = consumer.get_topic_name();
+                let sub_name = consumer.get_subscription_name();
+                guard.ack_message_shared(&topic_name, &sub_name, msg_id)?;
+            } else {
+                log::warn!(
+                    "Consumer {} attempted to ack message {}:{} without ownership; ignoring storage ack",
+                    ack_cmd.consumer_id, message_id.ledger_id, message_id.entry_id
+                );
+            }
+        } else {
+            // Non-Shared mode: original behavior
+            consumer.ack_message(msg_id.clone()).await;
+
+            let mut guard = storage.lock().await;
+            let topic_name = consumer.get_topic_name();
+            let sub_name = consumer.get_subscription_name();
+            guard.ack_message(&topic_name, &sub_name, msg_id)?;
+        }
 
         log::info!("Message {}:{} acknowledged for consumer {}",
             message_id.ledger_id, message_id.entry_id, ack_cmd.consumer_id);
@@ -191,7 +234,7 @@ where
         // Remove consumer from Subscription (no need to lookup topic - Consumer has reference)
         {
             let mut sub_guard = consumer.subscription.write().await;
-            sub_guard.remove_consumer(consumer.consumer_id);
+            sub_guard.remove_consumer_with_recovery(consumer.consumer_id).await;
             log::info!("Removed consumer {} from subscription {}",
                 consumer.consumer_id, sub_guard.name);
         }

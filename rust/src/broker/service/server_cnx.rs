@@ -241,7 +241,7 @@ where
             // Remove consumer from Subscription (no need to lookup topic)
             {
                 let mut sub_guard = consumer.subscription.write().await;
-                sub_guard.remove_consumer(consumer_id);
+                sub_guard.remove_consumer_with_recovery(consumer_id).await;
             }
             log::debug!("Closed consumer {} on connection cleanup", consumer_id);
         }

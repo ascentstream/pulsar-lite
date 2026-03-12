@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use super::traits::Dispatcher;
 use super::{ExclusiveDispatcher, SharedDispatcher, FailoverDispatcher};
-use crate::broker::service::Consumer;
+use crate::broker::service::{Consumer, SharedStorage};
 use crate::broker::service::topic::SubscriptionType;
 
 /// Dispatcher enum - holds the concrete dispatcher implementation
@@ -59,6 +59,23 @@ impl DispatcherEnum {
         match self {
             DispatcherEnum::Exclusive(d) => d.remove_consumer(consumer_id),
             DispatcherEnum::Shared(d) => d.remove_consumer(consumer_id),
+            DispatcherEnum::Failover(d) => d.remove_consumer(consumer_id),
+        }
+    }
+
+    pub async fn remove_consumer_with_recovery(
+        &mut self,
+        consumer_id: u64,
+        storage: SharedStorage,
+        topic: &str,
+        subscription: &str,
+    ) -> Option<Arc<Consumer>> {
+        match self {
+            DispatcherEnum::Shared(d) => {
+                d.remove_consumer_with_recovery(consumer_id, storage, topic, subscription)
+                    .await
+            }
+            DispatcherEnum::Exclusive(d) => d.remove_consumer(consumer_id),
             DispatcherEnum::Failover(d) => d.remove_consumer(consumer_id),
         }
     }

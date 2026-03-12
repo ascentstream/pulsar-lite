@@ -101,9 +101,14 @@ impl Dispatcher for FailoverDispatcher {
                 };
 
                 if let Some((message_id, payload)) = message_opt {
-                    primary_consumer.enqueue_message(message_id, payload.clone()).await;
-                    primary_consumer.record_message_dispatched(payload.len()).await;
-                    dispatched += 1;
+                    if primary_consumer.enqueue_message(message_id, payload.clone()).await {
+                        primary_consumer.record_message_dispatched(payload.len()).await;
+                        dispatched += 1;
+                    } else {
+                        primary_consumer.add_permits(1).await;
+                        self.total_available_permits.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
                 } else {
                     primary_consumer.add_permits(1).await;
                     self.total_available_permits.fetch_add(1, Ordering::Relaxed);

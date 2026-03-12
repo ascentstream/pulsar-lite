@@ -105,9 +105,14 @@ impl Dispatcher for ExclusiveDispatcher {
                 };
 
                 if let Some((message_id, payload)) = message_opt {
-                    consumer.enqueue_message(message_id, payload.clone()).await;
-                    consumer.record_message_dispatched(payload.len()).await;
-                    dispatched += 1;
+                    if consumer.enqueue_message(message_id, payload.clone()).await {
+                        consumer.record_message_dispatched(payload.len()).await;
+                        dispatched += 1;
+                    } else {
+                        consumer.add_permits(1).await;
+                        self.total_available_permits.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
                 } else {
                     consumer.add_permits(1).await;
                     self.total_available_permits.fetch_add(1, Ordering::Relaxed);

@@ -3,7 +3,9 @@
  * Inspired by Apache Pulsar's Consumer design
  */
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{RwLock, mpsc};
 use super::topic::SubscriptionType;
 
@@ -22,6 +24,15 @@ pub struct ConsumerStats {
     pub messages_acked: u64,
     /// Available permits (flow control)
     pub available_permits: u32,
+}
+
+/// 待确认消息信息 (用于 Shared 模式)
+#[derive(Debug, Clone)]
+pub struct PendingAck {
+    /// 分发时间
+    pub dispatched_at: Instant,
+    /// 重投递次数
+    pub redelivery_count: u32,
 }
 
 /// Pending message waiting to be sent to consumer
@@ -55,6 +66,10 @@ pub struct Consumer {
     /// Format: (consumer_id, PendingMessage)
     /// This avoids circular dependency between Consumer and ServerCnx
     message_tx: mpsc::UnboundedSender<(u64, PendingMessage)>,
+
+    /// 待确认消息 (ledger_id, entry_id) -> PendingAck
+    /// 用于 Shared 模式的消息跟踪和断开重投递
+    pending_acks: Arc<RwLock<BTreeMap<MessageId, PendingAck>>>,
 }
 
 impl std::fmt::Debug for Consumer {
@@ -84,6 +99,7 @@ impl Consumer {
             connection_id,
             stats: Arc::new(RwLock::new(ConsumerStats::default())),
             message_tx,
+            pending_acks: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -179,27 +195,101 @@ impl Consumer {
     /// Called by Dispatcher to send messages for delivery.
     /// The message is sent through the channel to ServerCnx which will
     /// serialize and send it to the client.
-    pub async fn send_message(&self, message_id: MessageId, payload: Vec<u8>) {
+    pub async fn send_message(&self, message_id: MessageId, payload: Vec<u8>, redelivery_count: u32) -> bool {
         let msg = PendingMessage { message_id: message_id.clone(), payload };
 
-        // Send via channel with consumer_id (non-blocking)
+        // 先发送消息到 channel
         if let Err(e) = self.message_tx.send((self.consumer_id, msg)) {
             log::error!(
                 "Failed to send message {}:{} to consumer {}: {}",
                 message_id.ledger, message_id.entry, self.consumer_id, e
             );
-        } else {
-            log::debug!(
-                "Sent message {}:{} to consumer {} via channel",
-                message_id.ledger, message_id.entry, self.consumer_id
-            );
+            // 发送失败，不记录 pending_ack，消息不会被"持有"
+            return false;
         }
+
+        // 发送成功后才记录 pending ack
+        if self.get_sub_type() == SubscriptionType::Shared {
+            self.track_message_dispatched(&message_id, redelivery_count).await;
+        }
+
+        log::debug!(
+            "Sent message {}:{} to consumer {} via channel",
+            message_id.ledger, message_id.entry, self.consumer_id
+        );
+        true
     }
 
     /// Legacy method - now just calls send_message
     /// Kept for backward compatibility with dispatcher
-    pub async fn enqueue_message(&self, message_id: MessageId, payload: Vec<u8>) {
-        self.send_message(message_id, payload).await;
+    pub async fn enqueue_message(&self, message_id: MessageId, payload: Vec<u8>) -> bool {
+        self.send_message(message_id, payload, 0).await
+    }
+
+    // ========================================
+    // Pending Acks Tracking (Shared Mode)
+    // ========================================
+
+    /// 记录消息已分发 (用于 Shared 模式)
+    ///
+    /// 当消息成功发送到 Consumer 后调用此方法
+    pub async fn track_message_dispatched(&self, message_id: &MessageId, redelivery_count: u32) {
+        let mut pending = self.pending_acks.write().await;
+        pending.insert(
+            message_id.clone(),
+            PendingAck {
+                dispatched_at: Instant::now(),
+                redelivery_count,
+            },
+        );
+        log::debug!(
+            "Tracked message {}:{} for consumer {}",
+            message_id.ledger, message_id.entry, self.consumer_id
+        );
+    }
+
+    /// 确认消息并移除跟踪
+    ///
+    /// 返回：
+    /// - true: 消息确实由该 Consumer 持有并成功移除
+    /// - false: 消息不属于该 Consumer（可能是别的 Consumer 的消息或已重投递）
+    pub async fn remove_pending_ack(&self, message_id: &MessageId) -> bool {
+        let mut pending = self.pending_acks.write().await;
+        if pending.remove(message_id).is_some() {
+            log::debug!(
+                "Acked tracked message {}:{} for consumer {}",
+                message_id.ledger, message_id.entry, self.consumer_id
+            );
+            true
+        } else {
+            log::warn!(
+                "Consumer {} attempted to ack message {}:{} not in pending_acks",
+                self.consumer_id, message_id.ledger, message_id.entry
+            );
+            false
+        }
+    }
+
+    pub async fn has_pending_ack(&self, message_id: &MessageId) -> bool {
+        self.pending_acks.read().await.contains_key(message_id)
+    }
+
+    /// 获取所有待确认消息 (用于 disconnect recovery)
+    ///
+    /// 返回所有 pending messages 的 ID 和信息
+    pub async fn drain_pending_acks(&self) -> Vec<(MessageId, PendingAck)> {
+        let mut pending = self.pending_acks.write().await;
+        let drained = pending
+            .iter()
+            .map(|(message_id, ack)| (message_id.clone(), ack.clone()))
+            .collect::<Vec<_>>();
+        pending.clear();
+        drained
+    }
+
+    /// 获取待确认消息数量
+    pub async fn pending_ack_count(&self) -> usize {
+        self.pending_acks.read().await.len()
     }
 
     // ========================================
@@ -368,12 +458,36 @@ mod tests {
 
         // Send message via channel
         let msg_id = MessageId { ledger: 1, entry: 1, partition: -1 };
-        consumer.send_message(msg_id.clone(), b"test-payload".to_vec()).await;
+        assert!(consumer.send_message(msg_id.clone(), b"test-payload".to_vec(), 0).await);
 
         // Verify message was sent through channel with consumer_id
         let (consumer_id, received) = rx.recv().await.unwrap();
         assert_eq!(consumer_id, 42);
         assert_eq!(received.message_id, msg_id);
         assert_eq!(received.payload, b"test-payload");
+        assert_eq!(consumer.pending_ack_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_pending_ack_tracking_and_drain() {
+        let subscription = create_test_subscription();
+        let consumer = create_test_consumer(7, "test-consumer", subscription, "conn-7");
+        let msg1 = MessageId { ledger: 1, entry: 1, partition: -1 };
+        let msg2 = MessageId { ledger: 1, entry: 2, partition: -1 };
+
+        consumer.track_message_dispatched(&msg1, 0).await;
+        consumer.track_message_dispatched(&msg2, 2).await;
+
+        assert!(consumer.has_pending_ack(&msg1).await);
+        assert_eq!(consumer.pending_ack_count().await, 2);
+        assert!(consumer.remove_pending_ack(&msg1).await);
+        assert!(!consumer.has_pending_ack(&msg1).await);
+        assert_eq!(consumer.pending_ack_count().await, 1);
+
+        let drained = consumer.drain_pending_acks().await;
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, msg2);
+        assert_eq!(drained[0].1.redelivery_count, 2);
+        assert_eq!(consumer.pending_ack_count().await, 0);
     }
 }

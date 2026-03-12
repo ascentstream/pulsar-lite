@@ -4,12 +4,13 @@
  * Consistent with Apache Pulsar's PersistentDispatcherMultipleConsumers
  */
 
-use std::sync::Arc;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU32, AtomicUsize, AtomicBool, Ordering};
 use crate::broker::service::{Consumer, SharedStorage};
 use crate::broker::dispatcher::Dispatcher;
 use crate::broker::service::topic::SubscriptionType;
+use crate::storage::MessageId;
 
 /// Consistent with Apache Pulsar: dispatcherMaxRoundRobinBatchSize = 20
 const DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE: u32 = 20;
@@ -27,6 +28,10 @@ pub struct SharedDispatcher {
 
     /// Flag to prevent reentrant dispatching
     dispatch_in_progress: AtomicBool,
+
+    // Pending messages to redeliver (ordered for debugging)
+    // When a Consumer disconnects, its held messages are added to this queue
+    messages_to_redeliver: Arc<RwLock<BTreeMap<MessageId, u32>>>,
 }
 
 impl SharedDispatcher {
@@ -37,6 +42,7 @@ impl SharedDispatcher {
             round_robin_index: AtomicUsize::new(0),
             total_available_permits: AtomicU32::new(0),
             dispatch_in_progress: AtomicBool::new(false),
+            messages_to_redeliver: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -78,9 +84,10 @@ impl SharedDispatcher {
     ///
     /// This is the core method that implements Apache Pulsar's message distribution logic:
     /// 1. Check if we have permits
-    /// 2. Use Round-Robin to select consumers
-    /// 3. Get unassigned messages from storage
-    /// 4. Enqueue messages to consumer's pending queue
+    /// 2. Priority: redelivery queue first
+    /// 3. Fall back to unassigned messages when redelivery is empty
+    /// 4. Use Round-Robin to select consumers
+    /// 5. Enqueue messages to consumer's pending queue
     async fn dispatch_messages_batch(
         &self,
         storage: SharedStorage,
@@ -96,11 +103,13 @@ impl SharedDispatcher {
 
         // Dispatch up to DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE messages
         let mut dispatched = 0;
+        let mut redelivered = 0;
         let max_batch = std::cmp::min(total_permits, DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE);
 
         log::debug!(
-            "Starting batch dispatch: max_batch={}, total_permits={}, consumers={}",
-            max_batch, total_permits, self.consumers.len()
+            "Starting batch dispatch: max_batch={}, total_permits={}, consumers={}, redelivery_queue={}",
+            max_batch, total_permits, self.consumers.len(),
+            self.get_redelivery_queue_size()
         );
 
         for _ in 0..max_batch {
@@ -124,26 +133,88 @@ impl SharedDispatcher {
             // Decrease total permits
             self.total_available_permits.fetch_sub(1, Ordering::Relaxed);
 
-            // Get next unassigned message
+            // 1. Priority: get message from redelivery queue
+            if let Some((msg_id, redelivery_count)) = self.pop_redelivery_message() {
+                let already_acked = {
+                    let guard = storage.lock().await;
+                    guard.is_acknowledged_shared(&topic, &subscription, &msg_id)
+                };
+                if already_acked {
+                    consumer.add_permits(1).await;
+                    self.total_available_permits.fetch_add(1, Ordering::Relaxed);
+                    log::debug!(
+                        "Skipping replay for already-acked message {}:{}",
+                        msg_id.ledger, msg_id.entry
+                    );
+                    continue;
+                }
+
+                // Get message content from storage
+                let message_opt = {
+                    let guard = storage.lock().await;
+                    guard.get_message_by_id(&topic, &msg_id)
+                };
+
+                if let Some((message_id, payload)) = message_opt {
+                    {
+                        let mut guard = storage.lock().await;
+                        guard.assign_message(&topic, &subscription, &message_id, consumer_id);
+                    }
+
+                    if consumer
+                        .send_message(message_id.clone(), payload.clone(), redelivery_count + 1)
+                        .await
+                    {
+                        consumer.record_message_dispatched(payload.len()).await;
+                        dispatched += 1;
+                        redelivered += 1;
+
+                        log::debug!(
+                            "Redelivered message {}:{} to consumer {}, remaining permits={}",
+                            message_id.ledger, message_id.entry, consumer_id,
+                            self.total_available_permits.load(Ordering::Relaxed)
+                        );
+                    } else {
+                        let mut guard = storage.lock().await;
+                        guard.release_assignment(&topic, &subscription, &message_id, consumer_id);
+                        drop(guard);
+                        self.add_to_redelivery_queue(vec![(message_id, redelivery_count + 1)]);
+                        consumer.add_permits(1).await;
+                        self.total_available_permits.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    // Message no longer exists (may have been deleted), restore permit
+                    consumer.add_permits(1).await;
+                    self.total_available_permits.fetch_add(1, Ordering::Relaxed);
+                    log::warn!("Redelivery message {}:{} not found in storage", msg_id.ledger, msg_id.entry);
+                }
+                continue;
+            }
+
+            // 2. Redelivery queue empty, get new message
             let message_opt = {
                 let mut guard = storage.lock().await;
                 guard.get_next_unassigned_message(&topic, &subscription, consumer_id)?
             };
 
             if let Some((message_id, payload)) = message_opt {
-                // Enqueue message to consumer's pending queue
-                consumer.enqueue_message(message_id.clone(), payload.clone()).await;
+                if consumer.send_message(message_id.clone(), payload.clone(), 0).await {
+                    consumer.record_message_dispatched(payload.len()).await;
+                    dispatched += 1;
 
-                // Record message dispatched
-                consumer.record_message_dispatched(payload.len()).await;
-
-                dispatched += 1;
-
-                log::debug!(
-                    "Dispatched message {}:{} to consumer {} via Round-Robin, remaining permits={}",
-                    message_id.ledger, message_id.entry, consumer_id,
-                    self.total_available_permits.load(Ordering::Relaxed)
-                );
+                    log::debug!(
+                        "Dispatched new message {}:{} to consumer {} via Round-Robin, remaining permits={}",
+                        message_id.ledger, message_id.entry, consumer_id,
+                        self.total_available_permits.load(Ordering::Relaxed)
+                    );
+                } else {
+                    let mut guard = storage.lock().await;
+                    guard.release_assignment(&topic, &subscription, &message_id, consumer_id);
+                    drop(guard);
+                    self.add_to_redelivery_queue(vec![(message_id, 0)]);
+                    consumer.add_permits(1).await;
+                    self.total_available_permits.fetch_add(1, Ordering::Relaxed);
+                }
             } else {
                 // No more messages, restore permit
                 consumer.add_permits(1).await;
@@ -155,13 +226,73 @@ impl SharedDispatcher {
 
         if dispatched > 0 {
             log::info!(
-                "Batch dispatch completed: dispatched={} messages, remaining_permits={}",
-                dispatched,
+                "Batch dispatch completed: dispatched={} (redelivered={}), remaining_permits={}",
+                dispatched, redelivered,
                 self.total_available_permits.load(Ordering::Relaxed)
             );
         }
 
         Ok(())
+    }
+
+    /// Add messages to redelivery queue
+    pub fn add_to_redelivery_queue(&self, message_ids: Vec<(MessageId, u32)>) {
+        let mut redeliver = self.messages_to_redeliver.write().unwrap();
+        let count_before = redeliver.len();
+
+        for (msg_id, redelivery_count) in message_ids {
+            redeliver
+                .entry(msg_id)
+                .and_modify(|count| *count = (*count).max(redelivery_count))
+                .or_insert(redelivery_count);
+        }
+
+        log::debug!(
+            "Added {} messages to redelivery queue, total={}",
+            redeliver.len() - count_before, redeliver.len()
+        );
+    }
+
+    /// Pop next message from redelivery queue
+    pub fn pop_redelivery_message(&self) -> Option<(MessageId, u32)> {
+        let mut redeliver = self.messages_to_redeliver.write().unwrap();
+        redeliver.pop_first()
+    }
+
+    pub async fn remove_consumer_with_recovery(
+        &mut self,
+        consumer_id: u64,
+        storage: SharedStorage,
+        topic: &str,
+        subscription: &str,
+    ) -> Option<Arc<Consumer>> {
+        let consumer = self.consumers.remove(&consumer_id);
+
+        if let Some(ref consumer) = consumer {
+            let pending = consumer.drain_pending_acks().await;
+            let mut recovered = Vec::with_capacity(pending.len());
+            {
+                let mut guard = storage.lock().await;
+                for (message_id, pending_ack) in pending {
+                    guard.release_assignment(topic, subscription, &message_id, consumer_id);
+                    recovered.push((message_id, pending_ack.redelivery_count));
+                }
+            }
+            self.add_to_redelivery_queue(recovered);
+
+            log::info!(
+                "Consumer {} removed, {} messages queued for replay",
+                consumer_id,
+                self.get_redelivery_queue_size()
+            );
+        }
+
+        consumer
+    }
+
+    /// Get redelivery queue size
+    pub fn get_redelivery_queue_size(&self) -> usize {
+        self.messages_to_redeliver.read().unwrap().len()
     }
 }
 

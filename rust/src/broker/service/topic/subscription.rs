@@ -121,6 +121,39 @@ impl Subscription {
         }
     }
 
+    pub async fn remove_consumer_with_recovery(&mut self, consumer_id: u64) -> Option<Arc<Consumer>> {
+        let consumer = if let Some(ref mut dispatcher) = self.dispatcher {
+            dispatcher
+                .remove_consumer_with_recovery(
+                    consumer_id,
+                    self.storage.clone(),
+                    &self.topic,
+                    &self.name,
+                )
+                .await
+        } else {
+            None
+        };
+
+        if let Some(ref dispatcher) = self.dispatcher {
+            if let Err(e) = dispatcher
+                .dispatch_messages(self.storage.clone(), self.topic.clone(), self.name.clone())
+                .await
+            {
+                log::error!(
+                    "Failed to dispatch replay messages for subscription '{}': {}",
+                    self.name, e
+                );
+            }
+
+            if !dispatcher.is_consumer_connected() {
+                self.dispatcher = None;
+            }
+        }
+
+        consumer
+    }
+
     /// Get a consumer by ID
     pub fn get_consumer(&self, consumer_id: u64) -> Option<Arc<Consumer>> {
         self.dispatcher.as_ref()?.get_consumer(consumer_id)

@@ -9,7 +9,7 @@ use prost::Message;
 use super::codec::proto::pulsar::{
     base_command, BaseCommand, CommandAckResponse, CommandConnected, CommandConsumerStatsResponse,
     CommandError, CommandLookupTopicResponse, CommandMessage, CommandPartitionedTopicMetadataResponse,
-    CommandPong, CommandProducerSuccess, CommandSendReceipt, CommandSuccess, MessageIdData,
+    CommandPing, CommandPong, CommandProducerSuccess, CommandSendReceipt, CommandSuccess, MessageIdData,
     MessageMetadata, command_lookup_topic_response, command_partitioned_topic_metadata_response,
 };
 
@@ -18,6 +18,7 @@ use super::codec::proto::pulsar::{
 pub enum ServerCommand {
     Connected {
         server_version: String,
+        protocol_version: i32,
     },
     LookupResponse {
         request_id: u64,
@@ -61,6 +62,7 @@ pub enum ServerCommand {
         consumer_id: u64,
         request_id: u64,
     },
+    Ping,
     Pong,
 }
 
@@ -76,10 +78,14 @@ impl ServerCommand {
         use base_command::Type;
 
         match self {
-            ServerCommand::Connected { server_version } => BaseCommand {
+            ServerCommand::Connected {
+                server_version,
+                protocol_version,
+            } => BaseCommand {
                 r#type: Type::Connected as i32,
                 connected: Some(CommandConnected {
                     server_version: server_version.clone(),
+                    protocol_version: Some(*protocol_version),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -205,6 +211,13 @@ impl ServerCommand {
                 ack_response: Some(CommandAckResponse {
                     consumer_id: *consumer_id,
                     request_id: Some(*request_id),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ServerCommand::Ping => BaseCommand {
+                r#type: Type::Ping as i32,
+                ping: Some(CommandPing {
                     ..Default::default()
                 }),
                 ..Default::default()

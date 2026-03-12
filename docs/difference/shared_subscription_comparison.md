@@ -16,7 +16,7 @@
 | **消息分配器** | 无（直接在 storage 中跟踪） | `SharedConsumerAssignor` |
 | **重投递控制** | 无 | `MessageRedeliveryController` |
 | **游标管理** | 简单 HashMap | ManagedCursor + BookKeeper |
-| **连接管理** | 无状态，无超时检测 | 完整的连接生命周期管理 |
+| **连接管理** | 可治理版状态机 + keep-alive + 连接限流 | 完整的连接生命周期管理 |
 | **事务支持** | 无 | 完整事务支持 |
 | **消息元数据** | 仅存储 payload | 完整的属性和元数据支持 |
 
@@ -153,22 +153,37 @@ Flow 命令 → consumerFlow() → totalAvailablePermits += N
 ### 4.1 Pulsar Lite 确认逻辑
 
 ```rust
-// rust/src/storage/mod.rs:146-158
-pub fn ack_message(&mut self, topic: &str, subscription: &str, message_id: MessageId) -> Result<()> {
-    // 1. 更新游标到当前消息
-    let cursor_key = format!("{}:{}", topic, subscription);
-    self.cursors.insert(cursor_key, message_id.entry);
+// rust/src/broker/service/consumer.rs
+pub struct PendingAck {
+    pub dispatched_at: Instant,
+    pub redelivery_count: u32,
+}
 
-    // 2. 清除消息分配状态
-    let assignment_key = format!("{}:{}:{}", topic, subscription, message_id.entry);
-    self.message_assignments.remove(&assignment_key);
+pub async fn track_message_dispatched(&self, message_id: &MessageId, redelivery_count: u32) {
+    let mut pending = self.pending_acks.write().await;
+    pending.insert(
+        message_id.clone(),
+        PendingAck {
+            dispatched_at: Instant::now(),
+            redelivery_count,
+        },
+    );
+}
+
+pub async fn remove_pending_ack(&self, message_id: &MessageId) -> bool {
+    self.pending_acks.write().await.remove(message_id).is_some()
 }
 ```
 
-**问题**：
-- ⚠️ **仅更新到当前消息**，不支持累计确认
-- ⚠️ **无 pending acks 跟踪**
-- ⚠️ **无 unacked messages 计数**
+**当前状态**：
+- ✅ **已支持 Pending Acks 跟踪** - Shared 模式下每个 Consumer 维护自己的 `pending_acks`
+- ✅ **已支持 ack 归属校验** - 只有持有该消息的 Consumer 才会移除 pending ack 并落 storage ack
+- ✅ **已支持断开恢复所需的 pending drain** - Consumer 移除时可一次性取出全部待确认消息
+
+**与原生 Pulsar 的剩余差异**：
+- ⚠️ **仍不支持累计确认 (cumulative ack)** - 当前仍以单条消息 ack 为主
+- ⚠️ **无 unacked messages 计数/限流** - 还没有官方那套 per-consumer / per-subscription unacked 控制
+- ⚠️ **Pending Ack 元数据较少** - 当前只记录时间和重投递次数，未覆盖 batchSize、stickyKeyHash 等更完整信息
 
 ### 4.2 原生 Pulsar 确认逻辑
 
@@ -195,12 +210,19 @@ pub fn ack_message(&mut self, topic: &str, subscription: &str, message_id: Messa
 
 ### 5.1 Pulsar Lite
 
-**❌ 完全缺失重投递机制**
+**✅ 已支持基础重投递机制**
 
-当 Consumer 断开或消息未确认时：
-- 消息分配状态保留在 `message_assignments`
-- 不会自动重投递
-- 需要 Consumer 主动重新订阅
+当前行为：
+- ✅ **Consumer 断开自动重投递** - 移除 Consumer 时会 drain `pending_acks`，释放 assignment，并放入 replay 队列
+- ✅ **优先 replay 再分发新消息** - dispatcher 先消费 `messages_to_redeliver`，再取新消息
+- ✅ **发送失败自动回队** - 分发失败的消息会重新加入 redelivery queue
+- ✅ **已 ack 消息跳过 replay** - replay 前会检查 storage 中是否已确认，避免重复恢复
+
+**与原生 Pulsar 的剩余差异**：
+- ⚠️ **重投递控制器仍是简化版** - 当前主要是 `BTreeMap<MessageId, redelivery_count>`，还不是官方 `MessageRedeliveryController`
+- ⚠️ **无 Key_Shared hash 阻塞/有序重投递能力** - 尚未实现 sticky key 维度的 replay 控制
+- ⚠️ **无显式 redelivery 命令处理** - 目前主要覆盖断连恢复和发送失败回队，尚未完整支持客户端主动触发的 redelivery
+- ⚠️ **无 ack timeout / negative ack 驱动的重投递** - 连接保持存活但长期不 ack 的场景仍未覆盖
 
 ### 5.2 原生 Pulsar
 
@@ -300,72 +322,111 @@ static int getMaxEntriesInThisBatch(
 
 ### 7.1 Pulsar Lite
 
-**❌ 缺少完整的连接管理**
+**⚠️ 已具备基础连接管理，但仍不完整**
 
 ```rust
-// rust/src/broker/service/consumer.rs
-pub struct Consumer {
-    consumer_id: u64,
-    consumer_name: String,
-    available_permits: AtomicU32,
-    // 缺少:
-    // - connected: AtomicBool
-    // - last_active: Instant
-    // - heartbeat tracking
+// rust/src/broker/service/server_cnx.rs
+pub struct ServerCnx<T> {
+    state: State,                  // Start / Connecting / Connected / Failed / Closing / Closed
+    handshake_completed: bool,
+    last_activity: Instant,
+    waiting_for_pong: bool,
+    remote_protocol_version: i32,
+    connection_check_in_progress: Option<...>,
+    keep_alive_interval: Duration,
+    handshake_timeout: Duration,
 }
 ```
 
-**问题**：
-- ❌ **无连接状态跟踪** - 不知道 Consumer 是否存活
-- ❌ **无超时断开检测** - Consumer 崩溃后不会自动清理
-- ❌ **无心跳机制** - 无法检测僵尸连接
-- ❌ **无连接恢复** - 断开后需要重新订阅
+**当前能力**：
+- ✅ **可治理版连接状态机** - `Start / Connecting / Connected / Failed / Closing / Closed`
+- ✅ **握手超时关闭** - `Connect` 未在超时内完成时关闭连接
+- ✅ **broker 侧 Ping/Pong keep-alive** - 仅对支持 `Ping/Pong` 的协议版本启用主动 keep-alive
+- ✅ **单次连接活性检查** - 通过一次性 `Ping` + timeout 判断连接是否仍存活
+- ✅ **连接数限制** - 支持全局连接数和每地址连接数限制
+- ✅ **超时关闭接入 cleanup** - 连接超时后继续走现有 Shared recovery
+
+**当前缺口**：
+- ⚠️ **无 consumer 级活动跟踪** - 仍没有更细粒度的 consumer liveness
+- ⚠️ **无 ack timeout redelivery** - 连接活着但消息长期未 ack 时仍不会回收
+- ⚠️ **无连接可写性驱动的节流/暂停读取** - 尚未对齐官方的 channel writability / auto-read 协调
+- ⚠️ **显式 liveness check 仍偏内部化** - 已能发起一次性探测，但还没有官方那样更完整的异步结果语义与上层复用
+- ⚠️ **连接关闭生命周期仍较简化** - 已能统一 cleanup，但还没有官方那么完整的统计、回调、任务取消与上下文回收
+- ⚠️ **无复杂 backoff/reconnect 协调** - 仅有 broker 侧最小超时关闭
 
 ### 7.2 原生 Pulsar
 
 ```java
-// ServerCnx.java - 连接管理
-public class ServerCnx extends PulsarHandler {
-    // 连接状态
-    State state = State.Start;
-    ChannelHandlerContext ctx;
-    volatile boolean isActive = true;
+// PulsarHandler.java
+private final long keepAliveIntervalSeconds;
+private boolean waitingForPingResponse = false;
+private ScheduledFuture<?> keepAliveTask;
 
-    // 心跳检测
-    long lastActive = System.currentTimeMillis();
-    int maxConsecutiveFailedHeartbeats = 3;
+@Override
+protected void messageReceived(BaseCommand cmd) {
+    waitingForPingResponse = false;
+}
 
-    // 超时处理
-    void checkConnectionTimeout() {
-        if (System.currentTimeMillis() - lastActive > connectionTimeoutMs) {
-            closeConnection();
-        }
-    }
+@Override
+public void channelActive(ChannelHandlerContext ctx) {
+    this.keepAliveTask = ctx.executor().scheduleAtFixedRate(
+        this::handleKeepAliveTimeout,
+        keepAliveIntervalSeconds,
+        keepAliveIntervalSeconds,
+        TimeUnit.SECONDS
+    );
+}
 
-    // Consumer 移除时清理
-    void closeConsumer(Consumer consumer) {
-        consumer.close();
-        removeConsumerFromDispatcher(consumer);
-        replayPendingMessages(consumer);
+private void handleKeepAliveTimeout() {
+    if (!isHandshakeCompleted()) {
+        ctx.close();
+    } else if (waitingForPingResponse && ctx.channel().config().isAutoRead()) {
+        ctx.close();
+    } else if (getRemoteEndpointProtocolVersion() >= ProtocolVersion.v1.getValue()) {
+        waitingForPingResponse = true;
+        sendPing();
     }
 }
 ```
 
+```java
+// ServerCnx.java
+enum State { Start, Connected, Failed, Connecting }
+
+private void completeConnect(int clientProtoVersion, String clientVersion) {
+    writeAndFlush(Commands.newConnected(...));
+    state = State.Connected;
+    setRemoteEndpointProtocolVersion(clientProtoVersion);
+}
+
+@Override
+protected boolean isHandshakeCompleted() {
+    return state == State.Connected;
+}
+```
+
 **特点**：
-- ✅ **完整的连接状态机** - Start, Connected, Closing, Closed
-- ✅ **心跳检测** - 定期发送 Ping/Pong
-- ✅ **超时断开** - 自动清理无效连接
-- ✅ **优雅关闭** - Consumer 移除时 replay pending 消息
+- ✅ **连接状态机** - `Start / Connecting / Connected / Failed`
+- ✅ **握手超时关闭** - `isHandshakeCompleted()` 未完成时由 keep-alive task 主动关闭连接
+- ✅ **Ping/Pong keep-alive** - `PulsarHandler` 周期性发送 `Ping`，收到任意合法命令后清除等待状态
+- ✅ **连接关闭清理** - `ServerCnx.channelInactive()` 中统一关闭 producer / consumer 并清理连接上下文
+- ✅ **显式连接活性探测** - `checkConnectionLiveness()` 提供一次性 Ping + future 结果
+- ✅ **连接可写性治理** - 不可写时可暂停接收请求，恢复后重新开启
 
 ### 7.3 关键差异
 
 | 特性 | Pulsar Lite | 原生 Pulsar |
 |------|-------------|-------------|
-| **连接状态跟踪** | ❌ 无 | ✅ State 状态机 |
-| **心跳检测** | ❌ 无 | ✅ Ping/Pong + 失败计数 |
-| **超时断开** | ❌ 无 | ✅ 可配置超时 |
-| **优雅关闭** | ❌ 直接移除 | ✅ replay pending 消息 |
-| **连接恢复** | ❌ 需重新订阅 | ✅ 支持 reconnect |
+| **连接状态跟踪** | ✅ `Start/Connecting/Connected/Failed` + close reason | ✅ State 状态机 |
+| **握手完成判定** | ✅ `handshake_completed` | ✅ `isHandshakeCompleted()` |
+| **心跳检测** | ✅ broker 侧 Ping/Pong + 协议版本判定 | ✅ `PulsarHandler` 周期性 Ping/Pong |
+| **超时断开** | ✅ 握手超时 + keep-alive/liveness timeout | ✅ 握手超时 + keep-alive timeout |
+| **显式活性检查** | ✅ 支持一次性 Ping + timeout | ✅ `checkConnectionLiveness()` 返回 future 结果 |
+| **连接准入治理** | ✅ 全局/每地址连接数限制 | ✅ `ConnectionController` 等更完整治理 |
+| **连接背压治理** | ⚠️ 暂无 channel writability / auto-read 协调 | ✅ 不可写时暂停接收请求 |
+| **连接关闭清理** | ✅ cleanup 接入 Shared recovery | ✅ `channelInactive()` 统一清理 producer/consumer |
+| **关闭后配套回收** | ⚠️ 以基础 cleanup 为主 | ✅ 统计、回调、任务取消、pending check 完成 |
+| **连接恢复能力** | ❌ 需重新订阅 | ✅ broker 具备完整连接生命周期管理，客户端可重建连接 |
 
 ---
 
@@ -601,7 +662,7 @@ pub struct SharedDispatcher {
 | **背压** | 无 | 多层流控 |
 | **存储** | 内存 HashMap | BookKeeper + ManagedCursor |
 | **异步** | 简单同步 | 完整异步回调链 |
-| **连接管理** | 无状态，无超时检测 | 完整连接生命周期 |
+| **连接管理** | 可治理版状态机 + keep-alive + 连接限流 | 完整连接生命周期 |
 | **事务支持** | 无 | 完整事务协调器 |
 | **消息元数据** | 仅 payload | 完整属性和元数据 |
 

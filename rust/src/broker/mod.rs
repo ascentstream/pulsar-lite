@@ -8,6 +8,7 @@ pub mod handler;
 pub mod dispatcher;
 pub mod stats;
 pub mod broker_service;
+pub mod connection_limiter;
 
 // Re-export main types and functions for convenience
 pub use service::SharedStorage;
@@ -15,3 +16,4 @@ pub use service::topic::{Topic, TopicStats, Subscription, SubscriptionStats, Sub
 pub use service::{handle_connection, ConnectionState};
 pub use stats::{BrokerMetrics, SharedMetrics};
 pub use broker_service::{BrokerService, SharedTopic, SharedBrokerService};
+pub use connection_limiter::{ConnectionLimiter, ConnectionPermit};

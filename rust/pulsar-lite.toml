@@ -13,3 +13,16 @@ default_partitions = 2
 
 # Log level: trace, debug, info, warn, error
 log_level = "info"
+
+# Keep-alive ping interval in seconds
+keep_alive_interval_secs = 30
+
+# Maximum time to wait for Pulsar Connect handshake
+handshake_timeout_secs = 30
+
+# Timeout for a one-shot connection liveness check
+connection_liveness_check_timeout_secs = 10
+
+# Connection limits (0 = unlimited)
+max_connections = 0
+max_connections_per_ip = 0

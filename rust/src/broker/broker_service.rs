@@ -542,6 +542,7 @@ mod tests {
                 subscription.clone(),
                 "conn-1".to_string(),
                 tx,
+                0,
             ));
 
             // Add consumer to subscription

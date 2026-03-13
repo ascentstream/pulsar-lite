@@ -314,6 +314,7 @@ mod tests {
             subscription,
             format!("conn-{}", id),
             tx,
+            0,
         ))
     }
 

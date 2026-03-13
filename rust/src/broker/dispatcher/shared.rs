@@ -57,19 +57,45 @@ impl SharedDispatcher {
 
         // Convert to vector for indexed access
         let consumers: Vec<_> = self.consumers.values().cloned().collect();
-        let consumer_count = consumers.len();
+        let mut best_priority: Option<i32> = None;
+        let mut eligible_indices = Vec::new();
 
-        // Try each consumer in Round-Robin order
-        for _ in 0..consumer_count {
-            // Get next index atomically
-            let index = self.round_robin_index.fetch_add(1, Ordering::Relaxed) % consumer_count;
-            let consumer = consumers[index].clone();
+        for (index, consumer) in consumers.iter().enumerate() {
+            let permits = consumer.get_available_permits().await;
+            if permits == 0 {
+                continue;
+            }
 
-            // Check if this consumer has permits
-            if consumer.get_available_permits().await > 0 {
+            let priority = consumer.get_priority_level();
+            match best_priority {
+                Some(current_best) if priority > current_best => {}
+                Some(current_best) if priority == current_best => eligible_indices.push(index),
+                _ => {
+                    best_priority = Some(priority);
+                    eligible_indices.clear();
+                    eligible_indices.push(index);
+                }
+            }
+        }
+
+        if eligible_indices.is_empty() {
+            log::debug!("No consumer has available permits");
+            return None;
+        }
+
+        let eligible_count = eligible_indices.len();
+        let start = self.round_robin_index.fetch_add(1, Ordering::Relaxed) % eligible_count;
+
+        for offset in 0..eligible_count {
+            let vector_index = eligible_indices[(start + offset) % eligible_count];
+            let consumer = consumers[vector_index].clone();
+            let permits = consumer.get_available_permits().await;            if permits > 0 {
                 log::debug!(
-                    "Round-Robin selected consumer {} (index {}) with {} permits",
-                    consumer.consumer_id, index, consumer.get_available_permits().await
+                    "Priority-aware Round-Robin selected consumer {} (priority {}, index {}) with {} permits",
+                    consumer.consumer_id,
+                    consumer.get_priority_level(),
+                    vector_index,
+                    permits
                 );
                 return Some(consumer);
             }
@@ -162,7 +188,12 @@ impl SharedDispatcher {
                     }
 
                     if consumer
-                        .send_message(message_id.clone(), payload.clone(), redelivery_count + 1)
+                        .send_message(
+                            message_id.clone(),
+                            Vec::new(),
+                            payload.clone(),
+                            redelivery_count + 1,
+                        )
                         .await
                     {
                         consumer.record_message_dispatched(payload.len()).await;
@@ -198,7 +229,15 @@ impl SharedDispatcher {
             };
 
             if let Some((message_id, payload)) = message_opt {
-                if consumer.send_message(message_id.clone(), payload.clone(), 0).await {
+                if consumer
+                    .send_message(
+                        message_id.clone(),
+                        Vec::new(),
+                        payload.clone(),
+                        0,
+                    )
+                    .await
+                {
                     consumer.record_message_dispatched(payload.len()).await;
                     dispatched += 1;
 
@@ -363,5 +402,81 @@ impl Dispatcher for SharedDispatcher {
         self.dispatch_in_progress.store(false, Ordering::Relaxed);
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::broker::service::topic::Subscription;
+    use crate::storage::Storage;
+    use std::path::Path;
+    use tokio::sync::{mpsc, Mutex, RwLock};
+
+    fn create_test_storage() -> SharedStorage {
+        Arc::new(Mutex::new(Storage::new(Path::new("/tmp/test-shared-dispatcher-storage")).unwrap()))
+    }
+
+    fn create_test_subscription(storage: SharedStorage) -> Arc<RwLock<Subscription>> {
+        Arc::new(RwLock::new(Subscription::new(
+            "test-sub".to_string(),
+            "persistent://public/default/test-topic".to_string(),
+            SubscriptionType::Shared,
+            storage,
+        )))
+    }
+
+    fn create_test_consumer(
+        consumer_id: u64,
+        priority_level: i32,
+        subscription: Arc<RwLock<Subscription>>,
+    ) -> Arc<Consumer> {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        Arc::new(Consumer::new(
+            consumer_id,
+            format!("consumer-{}", consumer_id),
+            subscription,
+            format!("conn-{}", consumer_id),
+            tx,
+            priority_level,
+        ))
+    }
+
+    #[tokio::test]
+    async fn priority_dispatch_prefers_higher_priority_consumers() {
+        let storage = create_test_storage();
+        let subscription = create_test_subscription(storage);
+        let high = create_test_consumer(1, 0, subscription.clone());
+        let low = create_test_consumer(2, 5, subscription);
+
+        high.add_permits(1).await;
+        low.add_permits(1).await;
+
+        let mut dispatcher = SharedDispatcher::new();
+        dispatcher.add_consumer(high.clone()).unwrap();
+        dispatcher.add_consumer(low.clone()).unwrap();
+
+        let selected = dispatcher.get_next_available_consumer().await.unwrap();
+        assert_eq!(selected.consumer_id, high.consumer_id);
+    }
+
+    #[tokio::test]
+    async fn same_priority_consumers_continue_round_robin_selection() {
+        let storage = create_test_storage();
+        let subscription = create_test_subscription(storage);
+        let consumer_a = create_test_consumer(1, 0, subscription.clone());
+        let consumer_b = create_test_consumer(2, 0, subscription);
+
+        consumer_a.add_permits(2).await;
+        consumer_b.add_permits(2).await;
+
+        let mut dispatcher = SharedDispatcher::new();
+        dispatcher.add_consumer(consumer_a).unwrap();
+        dispatcher.add_consumer(consumer_b).unwrap();
+
+        let first = dispatcher.get_next_available_consumer().await.unwrap().consumer_id;
+        let second = dispatcher.get_next_available_consumer().await.unwrap().consumer_id;
+
+        assert_ne!(first, second);
     }
 }

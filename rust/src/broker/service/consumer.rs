@@ -40,6 +40,8 @@ pub struct PendingAck {
 pub struct PendingMessage {
     /// Message ID
     pub message_id: MessageId,
+    /// Encoded Pulsar MessageMetadata
+    pub metadata: Vec<u8>,
     /// Message payload
     pub payload: Vec<u8>,
 }
@@ -70,6 +72,9 @@ pub struct Consumer {
     /// 待确认消息 (ledger_id, entry_id) -> PendingAck
     /// 用于 Shared 模式的消息跟踪和断开重投递
     pending_acks: Arc<RwLock<BTreeMap<MessageId, PendingAck>>>,
+
+    /// Lower value means higher priority, consistent with native Pulsar.
+    priority_level: i32,
 }
 
 impl std::fmt::Debug for Consumer {
@@ -78,6 +83,7 @@ impl std::fmt::Debug for Consumer {
             .field("consumer_id", &self.consumer_id)
             .field("consumer_name", &self.consumer_name)
             .field("connection_id", &self.connection_id)
+            .field("priority_level", &self.priority_level)
             .field("subscription", &self.subscription.try_read().map(|s| s.name.clone()))
             .finish()
     }
@@ -91,6 +97,7 @@ impl Consumer {
         subscription: Arc<RwLock<Subscription>>,
         connection_id: String,
         message_tx: mpsc::UnboundedSender<(u64, PendingMessage)>,
+        priority_level: i32,
     ) -> Self {
         Self {
             consumer_id,
@@ -100,6 +107,7 @@ impl Consumer {
             stats: Arc::new(RwLock::new(ConsumerStats::default())),
             message_tx,
             pending_acks: Arc::new(RwLock::new(BTreeMap::new())),
+            priority_level,
         }
     }
 
@@ -195,8 +203,14 @@ impl Consumer {
     /// Called by Dispatcher to send messages for delivery.
     /// The message is sent through the channel to ServerCnx which will
     /// serialize and send it to the client.
-    pub async fn send_message(&self, message_id: MessageId, payload: Vec<u8>, redelivery_count: u32) -> bool {
-        let msg = PendingMessage { message_id: message_id.clone(), payload };
+    pub async fn send_message(
+        &self,
+        message_id: MessageId,
+        metadata: Vec<u8>,
+        payload: Vec<u8>,
+        redelivery_count: u32,
+    ) -> bool {
+        let msg = PendingMessage { message_id: message_id.clone(), metadata, payload };
 
         // 先发送消息到 channel
         if let Err(e) = self.message_tx.send((self.consumer_id, msg)) {
@@ -222,8 +236,8 @@ impl Consumer {
 
     /// Legacy method - now just calls send_message
     /// Kept for backward compatibility with dispatcher
-    pub async fn enqueue_message(&self, message_id: MessageId, payload: Vec<u8>) -> bool {
-        self.send_message(message_id, payload, 0).await
+    pub async fn enqueue_message(&self, message_id: MessageId, metadata: Vec<u8>, payload: Vec<u8>) -> bool {
+        self.send_message(message_id, metadata, payload, 0).await
     }
 
     // ========================================
@@ -290,6 +304,10 @@ impl Consumer {
     /// 获取待确认消息数量
     pub async fn pending_ack_count(&self) -> usize {
         self.pending_acks.read().await.len()
+    }
+
+    pub fn get_priority_level(&self) -> i32 {
+        self.priority_level
     }
 
     // ========================================
@@ -377,6 +395,7 @@ mod tests {
             subscription,
             conn_id.to_string(),
             tx,
+            0,
         )
     }
 
@@ -454,16 +473,18 @@ mod tests {
             subscription,
             "conn-1".to_string(),
             tx,
+            0,
         );
 
         // Send message via channel
         let msg_id = MessageId { ledger: 1, entry: 1, partition: -1 };
-        assert!(consumer.send_message(msg_id.clone(), b"test-payload".to_vec(), 0).await);
+        assert!(consumer.send_message(msg_id.clone(), vec![9, 9], b"test-payload".to_vec(), 0).await);
 
         // Verify message was sent through channel with consumer_id
         let (consumer_id, received) = rx.recv().await.unwrap();
         assert_eq!(consumer_id, 42);
         assert_eq!(received.message_id, msg_id);
+        assert_eq!(received.metadata, vec![9, 9]);
         assert_eq!(received.payload, b"test-payload");
         assert_eq!(consumer.pending_ack_count().await, 1);
     }

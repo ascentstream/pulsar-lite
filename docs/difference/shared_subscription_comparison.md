@@ -27,15 +27,36 @@
 ### 2.1 Pulsar Lite 实现
 
 ```rust
-// rust/src/broker/dispatcher/shared.rs:47-75
+// rust/src/broker/dispatcher/shared.rs
 async fn get_next_available_consumer(&self) -> Option<Arc<Consumer>> {
     let consumers: Vec<_> = self.consumers.values().cloned().collect();
-    let consumer_count = consumers.len();
+    let mut best_priority: Option<i32> = None;
+    let mut eligible_indices = Vec::new();
 
-    for _ in 0..consumer_count {
-        let index = self.round_robin_index.fetch_add(1, Ordering::Relaxed) % consumer_count;
-        let consumer = consumers[index].clone();
+    for (index, consumer) in consumers.iter().enumerate() {
+        let permits = consumer.get_available_permits().await;
+        if permits == 0 {
+            continue;
+        }
 
+        let priority = consumer.get_priority_level();
+        match best_priority {
+            Some(current_best) if priority > current_best => {}
+            Some(current_best) if priority == current_best => eligible_indices.push(index),
+            _ => {
+                best_priority = Some(priority);
+                eligible_indices.clear();
+                eligible_indices.push(index);
+            }
+        }
+    }
+
+    let eligible_count = eligible_indices.len();
+    let start = self.round_robin_index.fetch_add(1, Ordering::Relaxed) % eligible_count;
+
+    for offset in 0..eligible_count {
+        let vector_index = eligible_indices[(start + offset) % eligible_count];
+        let consumer = consumers[vector_index].clone();
         if consumer.get_available_permits().await > 0 {
             return Some(consumer);
         }
@@ -45,9 +66,38 @@ async fn get_next_available_consumer(&self) -> Option<Arc<Consumer>> {
 ```
 
 **特点**：
-- ✅ 简单的原子 Round-Robin 索引
-- ❌ **无优先级支持**
+- ✅ **已支持消费者优先级**
+- ✅ 先选择数值更小的 `priority_level`（`0 = 最高优先级`）
+- ✅ 同优先级内继续保持 Round-Robin
+- ✅ 高优先级组无 permit 时才降级到低优先级组
 - ✅ 支持流控 (permits)
+
+同时，订阅命令路径已经补上 `priority_level` 透传：
+
+```rust
+// rust/src/broker/handler/consumer_handler.rs
+let priority_level = subscribe_cmd.priority_level.unwrap_or(0);
+
+let consumer = Arc::new(Consumer::new(
+    consumer_id,
+    consumer_name.clone(),
+    subscription_arc.clone(),
+    connection_id,
+    message_tx,
+    priority_level,
+));
+```
+
+```rust
+// rust/src/broker/service/consumer.rs
+pub struct Consumer {
+    // ...
+    /// Lower value means higher priority, consistent with native Pulsar.
+    priority_level: i32,
+}
+```
+
+这意味着 Shared 模式现在已经不是“无序 HashMap + 简单轮询”，而是具备了与原生 Pulsar 更接近的优先级选择语义。
 
 ### 2.2 原生 Pulsar 实现
 
@@ -80,10 +130,15 @@ public Consumer getNextConsumer() {
 
 | 特性 | Pulsar Lite | 原生 Pulsar |
 |------|-------------|-------------|
-| **优先级调度** | ❌ 不支持 | ✅ 完整支持 (0=最高) |
-| **算法复杂度** | O(n) 简单轮询 | O(n) 带优先级 |
-| **消费者排序** | 无序 HashMap | 按优先级排序的 List |
+| **优先级调度** | ✅ 已支持 (0=最高) | ✅ 完整支持 (0=最高) |
+| **算法复杂度** | O(n) 优先级筛选 + 同组轮询 | O(n) 带优先级 |
+| **消费者排序** | 运行时按优先级筛选 | 按优先级排序的 List |
 | **索引管理** | 原子 usize | volatile int + 同步块 |
+
+**当前仍与原生存在的差异**：
+- `pulsar-lite` 目前是在运行时遍历 `HashMap` 后筛选优先级组，还没有原生 Pulsar 那种长期按优先级组织的 consumer 列表
+- 当前优先级调度只覆盖 Shared 路径，没有扩散到其他订阅模式
+- 尚未实现和优先级联动的更复杂 blocked/unacked 调度策略
 
 ---
 
@@ -181,28 +236,57 @@ pub async fn remove_pending_ack(&self, message_id: &MessageId) -> bool {
 - ✅ **已支持断开恢复所需的 pending drain** - Consumer 移除时可一次性取出全部待确认消息
 
 **与原生 Pulsar 的剩余差异**：
-- ⚠️ **仍不支持累计确认 (cumulative ack)** - 当前仍以单条消息 ack 为主
+- ℹ️ **累计确认 (cumulative ack) 不属于 Shared 模式目标** - 原生 Pulsar 中 Shared / Key_Shared 明确走 `individual ack`，累计确认只适用于 Exclusive / Failover
 - ⚠️ **无 unacked messages 计数/限流** - 还没有官方那套 per-consumer / per-subscription unacked 控制
 - ⚠️ **Pending Ack 元数据较少** - 当前只记录时间和重投递次数，未覆盖 batchSize、stickyKeyHash 等更完整信息
 
 ### 4.2 原生 Pulsar 确认逻辑
 
 ```java
-// PersistentDispatcherMultipleConsumers.java
-// 1. 消费者持有 pendingAcks 映射
-// 2. Ack 时：
-//    - 从 pendingAcks 移除
-//    - 更新 cursor 的 markDeletePosition
-//    - 减少 totalUnackedMessages
-// 3. 支持累计确认 (cumulative) 和单独确认
-// 4. Consumer 断开时，pendingAcks 消息被 replay
+// Subscription.java
+static boolean isCumulativeAckMode(SubType subType) {
+    return SubType.Exclusive.equals(subType) || SubType.Failover.equals(subType);
+}
+
+static boolean isIndividualAckMode(SubType subType) {
+    return SubType.Shared.equals(subType) || SubType.Key_Shared.equals(subType);
+}
+```
+
+```java
+// Consumer.java
+if (ack.getAckType() == AckType.Cumulative) {
+    if (Subscription.isIndividualAckMode(subType)) {
+        log.warn("[{}] [{}] Received cumulative ack on shared subscription, ignoring",
+                subscription, consumerId);
+        return CompletableFuture.completedFuture(null);
+    }
+    subscription.acknowledgeMessage(positionsAcked, AckType.Cumulative, properties);
+}
+```
+
+```java
+// PersistentSubscription.java
+if (ackType == AckType.Cumulative) {
+    cursor.asyncMarkDelete(position, mergeCursorProperties(properties),
+            markDeleteCallback, previousMarkDeletePosition);
+} else {
+    cursor.asyncDelete(positions, deleteCallback, previousMarkDeletePosition);
+}
 ```
 
 **特点**：
 - ✅ **Pending Acks 跟踪** - 每个 Consumer 维护
 - ✅ **Unacked 消息限制** - 防止消息积压
 - ✅ **Consumer 断开重投递** - 自动 replay pending 消息
-- ✅ **累积确认支持**
+- ✅ **Exclusive / Failover 支持累积确认**
+- ✅ **Shared / Key_Shared 明确走单条确认**
+
+**为什么这里不把 cumulative ack 作为 Shared 目标**：
+- 原生 Pulsar 在 `Subscription.isCumulativeAckMode(...)` 中只把 `Exclusive` 和 `Failover` 视为累计确认模式
+- 原生 Pulsar 在 `Subscription.isIndividualAckMode(...)` 中把 `Shared` 和 `Key_Shared` 归为单条确认模式
+- `Consumer` 在收到 `AckType.Cumulative` 且订阅模式为 Shared 时，会直接记录 warning 并忽略，不会推进 subscription/cursor 状态
+- 因此从“与原生 Pulsar Shared 语义对齐”的角度看，`pulsar-lite` 不需要把 cumulative ack 当成 Shared 的缺失能力去补齐
 
 ---
 
@@ -492,23 +576,31 @@ public class TransactionMetadataStoreService {
 ### 9.1 Pulsar Lite
 
 ```rust
-// rust/src/storage/mod.rs
-pub struct Message {
-    pub payload: Vec<u8>,
-    // 缺少:
-    // - properties: HashMap<String, String>
-    // - event_time: Option<i64>
-    // - key: Option<String>
-    // - ordering_key: Option<Vec<u8>>
-    // - sequence_id: Option<i64>
-}
+// rust/src/broker/handler/producer_handler.rs
+let message_id = producer.publish_message(&frame.payload).await?;
 ```
 
-**问题**：
-- ❌ **无消息属性** - 不能携带自定义 key-value
-- ❌ **无 event_time** - 无法按事件时间处理
-- ❌ **无 ordering_key** - 无法保证有序性
-- ❌ **无 sequence_id** - 无法检测消息丢失/重复
+```rust
+// rust/src/protocol/codec.rs
+let metadata_bytes = if metadata.is_empty() {
+    MessageMetadata {
+        sequence_id: entry_id,
+        ..Default::default()
+    }
+    .encode_to_vec()
+} else {
+    metadata.to_vec()
+};
+```
+
+**当前状态**：
+- ✅ **已保留协议层 metadata 编码能力** - `ServerCommand::Message` 和 codec 仍支持携带 metadata
+- ✅ **已保留压缩字段透传能力** - `compression` 与 `uncompressed_size` 在协议编码层仍可保留
+- ✅ **broker 不主动解压缩** - 压缩 payload 仍按 Pulsar 协议交由客户端处理
+- ⚠️ **当前未贯通 storage/replay 路径** - 这一轮明确不改 storage，消息进入 storage 后仍只保存 payload
+- ⚠️ **Shared 分发路径当前不持久保留 metadata** - dispatcher 从 storage 取消息时会补空 metadata，下发链仅保留接口能力
+
+也就是说，这一轮保留的是 **协议层/下发层对 metadata 与 compression 的兼容接口**，但**并没有把 metadata/compression 做成完整的存储与重投递能力**。这部分要等后续 storage 重构时再一起贯通。
 
 ### 9.2 原生 Pulsar
 
@@ -553,12 +645,17 @@ public class MessageImpl {
 
 | 特性 | Pulsar Lite | 原生 Pulsar |
 |------|-------------|-------------|
-| **消息属性** | ❌ 无 | ✅ HashMap<String, String> |
-| **event_time** | ❌ 无 | ✅ 支持 |
-| **ordering_key** | ❌ 无 | ✅ 支持严格有序 |
-| **sequence_id** | ❌ 无 | ✅ 检测丢失/重复 |
-| **partition_key** | ❌ 无 | ✅ 分区路由 |
-| **压缩支持** | ❌ 无 | ✅ LZ4/Zlib/Zstd |
+| **消息属性** | ⚠️ 协议层保留能力，未贯通 storage/replay | ✅ HashMap<String, String> |
+| **event_time** | ⚠️ 协议层保留能力，未贯通 storage/replay | ✅ 支持 |
+| **ordering_key** | ⚠️ 协议层保留能力，未贯通 storage/replay | ✅ 支持严格有序 |
+| **sequence_id** | ⚠️ 协议层保留能力，未贯通 storage/replay | ✅ 检测丢失/重复 |
+| **partition_key** | ⚠️ 尚未作为本轮重点补齐 | ✅ 分区路由 |
+| **压缩支持** | ⚠️ 协议层基础透传（不解压、不持久化） | ✅ LZ4/Zlib/Zstd |
+
+**当前仍与原生存在的差异**：
+- `pulsar-lite` 这轮保留的是协议层/下发层接口，没有把 `MessageMetadata` 贯通到 storage 与 replay 路径
+- 压缩目前只是**协议层透传能力保留**，不是 broker 侧编解码；broker 不会主动解压缩或重压缩
+- `partition_key`、更完整的 schema/encryption/batch 相关字段还未纳入本轮范围
 
 ---
 

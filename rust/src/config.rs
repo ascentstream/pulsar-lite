@@ -25,6 +25,26 @@ pub struct Config {
     /// Log level
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// Keep-alive interval in seconds
+    #[serde(default = "default_keep_alive_interval_secs")]
+    pub keep_alive_interval_secs: u64,
+
+    /// Handshake timeout in seconds
+    #[serde(default = "default_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
+
+    /// Timeout for a one-shot connection liveness check in seconds
+    #[serde(default = "default_connection_liveness_check_timeout_secs")]
+    pub connection_liveness_check_timeout_secs: u64,
+
+    /// Maximum number of broker connections (0 = unlimited)
+    #[serde(default)]
+    pub max_connections: usize,
+
+    /// Maximum number of connections per IP address (0 = unlimited)
+    #[serde(default)]
+    pub max_connections_per_ip: usize,
 }
 
 fn default_addr() -> String {
@@ -39,6 +59,18 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+fn default_keep_alive_interval_secs() -> u64 {
+    30
+}
+
+fn default_handshake_timeout_secs() -> u64 {
+    30
+}
+
+fn default_connection_liveness_check_timeout_secs() -> u64 {
+    10
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -46,6 +78,11 @@ impl Default for Config {
             db_path: default_db_path(),
             default_partitions: 0,
             log_level: default_log_level(),
+            keep_alive_interval_secs: default_keep_alive_interval_secs(),
+            handshake_timeout_secs: default_handshake_timeout_secs(),
+            connection_liveness_check_timeout_secs: default_connection_liveness_check_timeout_secs(),
+            max_connections: 0,
+            max_connections_per_ip: 0,
         }
     }
 }
@@ -85,6 +122,11 @@ mod tests {
         assert_eq!(config.db_path, PathBuf::from("./pulsar-lite.db"));
         assert_eq!(config.default_partitions, 0);
         assert_eq!(config.log_level, "info");
+        assert_eq!(config.keep_alive_interval_secs, 30);
+        assert_eq!(config.handshake_timeout_secs, 30);
+        assert_eq!(config.connection_liveness_check_timeout_secs, 10);
+        assert_eq!(config.max_connections, 0);
+        assert_eq!(config.max_connections_per_ip, 0);
     }
 
     #[test]
@@ -94,6 +136,11 @@ mod tests {
             db_path: PathBuf::from("/tmp/test.db"),
             default_partitions: 3,
             log_level: "debug".to_string(),
+            keep_alive_interval_secs: 15,
+            handshake_timeout_secs: 10,
+            connection_liveness_check_timeout_secs: 5,
+            max_connections: 100,
+            max_connections_per_ip: 8,
         };
 
         let toml_str = toml::to_string(&config).unwrap();
@@ -104,5 +151,13 @@ mod tests {
         assert_eq!(parsed.db_path, config.db_path);
         assert_eq!(parsed.default_partitions, config.default_partitions);
         assert_eq!(parsed.log_level, config.log_level);
+        assert_eq!(parsed.keep_alive_interval_secs, config.keep_alive_interval_secs);
+        assert_eq!(parsed.handshake_timeout_secs, config.handshake_timeout_secs);
+        assert_eq!(
+            parsed.connection_liveness_check_timeout_secs,
+            config.connection_liveness_check_timeout_secs
+        );
+        assert_eq!(parsed.max_connections, config.max_connections);
+        assert_eq!(parsed.max_connections_per_ip, config.max_connections_per_ip);
     }
 }

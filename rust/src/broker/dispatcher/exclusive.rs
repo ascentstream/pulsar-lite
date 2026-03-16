@@ -105,7 +105,10 @@ impl Dispatcher for ExclusiveDispatcher {
                 };
 
                 if let Some((message_id, payload)) = message_opt {
-                    if consumer.enqueue_message(message_id, payload.clone()).await {
+                    if consumer
+                        .enqueue_message(message_id, Vec::new(), payload.clone())
+                        .await
+                    {
                         consumer.record_message_dispatched(payload.len()).await;
                         dispatched += 1;
                     } else {

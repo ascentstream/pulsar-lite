@@ -3,15 +3,14 @@
  * Defines server-side commands for Pulsar protocol
  */
 
-use prost::Message;
-
 // Import generated protobuf types
 use super::codec::proto::pulsar::{
     base_command, BaseCommand, CommandAckResponse, CommandConnected, CommandConsumerStatsResponse,
     CommandError, CommandLookupTopicResponse, CommandMessage, CommandPartitionedTopicMetadataResponse,
     CommandPing, CommandPong, CommandProducerSuccess, CommandSendReceipt, CommandSuccess, MessageIdData,
-    MessageMetadata, command_lookup_topic_response, command_partitioned_topic_metadata_response,
+    command_lookup_topic_response, command_partitioned_topic_metadata_response,
 };
+use prost::Message;
 
 /// Command to send to client
 #[derive(Debug)]
@@ -56,6 +55,7 @@ pub enum ServerCommand {
         ledger_id: u64,
         entry_id: u64,
         partition: i32,
+        metadata: Vec<u8>,
         payload: Vec<u8>,
     },
     AckResponse {
@@ -188,6 +188,7 @@ impl ServerCommand {
                 ledger_id,
                 entry_id,
                 partition,
+                metadata: _,
                 payload: _,
             } => BaseCommand {
                 r#type: Type::Message as i32,
@@ -246,17 +247,10 @@ impl ServerCommand {
     }
 }
 
-/// Helper to create message metadata
-pub fn create_message_metadata(sequence_id: u64) -> MessageMetadata {
-    MessageMetadata {
-        sequence_id,
-        ..Default::default()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
 
     #[test]
     fn test_server_command_serialization() {
@@ -284,6 +278,7 @@ mod tests {
             ledger_id: 2,
             entry_id: 3,
             partition: 0,
+            metadata: vec![4, 5, 6],
             payload: vec![1, 2, 3],
         };
         assert!(msg_cmd.has_payload());

@@ -20,7 +20,7 @@ pub mod proto {
 }
 
 // Import ServerCommand from command module
-use super::command::{ServerCommand, create_message_metadata};
+use super::command::ServerCommand;
 
 /// Magic number for checksum verification (0x0e01)
 const MAGIC_NUMBER: u16 = 0x0e01;
@@ -151,8 +151,8 @@ impl Encoder<ServerCommand> for PulsarFrameCodec {
 
     fn encode(&mut self, item: ServerCommand, dst: &mut BytesMut) -> Result<(), Self::Error> {
         // 特殊处理 Message 命令（包含 payload）
-        if let ServerCommand::Message { consumer_id, ledger_id, entry_id, partition, payload } = &item {
-            return self.encode_message(*consumer_id, *ledger_id, *entry_id, *partition, payload, dst);
+        if let ServerCommand::Message { consumer_id, ledger_id, entry_id, partition, metadata, payload } = &item {
+            return self.encode_message(*consumer_id, *ledger_id, *entry_id, *partition, metadata, payload, dst);
         }
 
         let cmd_bytes = item.to_bytes();
@@ -181,6 +181,7 @@ impl PulsarFrameCodec {
         ledger_id: u64,
         entry_id: u64,
         partition: i32,
+        metadata: &[u8],
         payload: &[u8],
         dst: &mut BytesMut,
     ) -> Result<(), io::Error> {
@@ -204,9 +205,15 @@ impl PulsarFrameCodec {
 
         let cmd_bytes = command.encode_to_vec();
 
-        // 使用 helper 创建 MessageMetadata
-        let metadata = create_message_metadata(entry_id);
-        let metadata_bytes = metadata.encode_to_vec();
+        let metadata_bytes = if metadata.is_empty() {
+            MessageMetadata {
+                sequence_id: entry_id,
+                ..Default::default()
+            }
+            .encode_to_vec()
+        } else {
+            metadata.to_vec()
+        };
 
         // Pulsar wire format for messages with payload:
         // [TOTAL_SIZE (4B)] [CMD_SIZE (4B)] [CMD] [METADATA_SIZE (4B)] [METADATA] [PAYLOAD]
@@ -227,6 +234,9 @@ impl PulsarFrameCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::proto::pulsar::{CompressionType, KeyValue, MessageMetadata};
+    use crate::protocol::command::ServerCommand;
+    use prost::Message;
 
     #[test]
     fn test_frame_codec_simple() {
@@ -259,5 +269,50 @@ mod tests {
         let frame = codec.decode(&mut data).unwrap().unwrap();
         assert_eq!(frame.command, vec![1, 2, 3, 4]);
         assert_eq!(frame.payload, vec![5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn test_message_encode_preserves_metadata_and_compression() {
+        let mut codec = PulsarFrameCodec::new();
+        let metadata = MessageMetadata {
+            producer_name: "producer-1".to_string(),
+            sequence_id: 42,
+            publish_time: 100,
+            properties: vec![KeyValue {
+                key: "env".to_string(),
+                value: "test".to_string(),
+            }],
+            compression: Some(CompressionType::Lz4 as i32),
+            uncompressed_size: Some(128),
+            event_time: Some(200),
+            ordering_key: Some(b"order-key".to_vec()),
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        let payload = b"compressed-payload".to_vec();
+        let command = ServerCommand::Message {
+            consumer_id: 7,
+            ledger_id: 9,
+            entry_id: 11,
+            partition: -1,
+            metadata: metadata.clone(),
+            payload: payload.clone(),
+        };
+
+        let mut encoded = BytesMut::new();
+        codec.encode(command, &mut encoded).unwrap();
+        let frame = codec.decode(&mut encoded).unwrap().unwrap();
+        let decoded_metadata = MessageMetadata::decode(&frame.metadata.unwrap()[..]).unwrap();
+
+        assert_eq!(decoded_metadata.sequence_id, 42);
+        assert_eq!(decoded_metadata.event_time, Some(200));
+        assert_eq!(decoded_metadata.ordering_key, Some(b"order-key".to_vec()));
+        assert_eq!(decoded_metadata.compression, Some(CompressionType::Lz4 as i32));
+        assert_eq!(decoded_metadata.uncompressed_size, Some(128));
+        assert_eq!(decoded_metadata.properties.len(), 1);
+        assert_eq!(decoded_metadata.properties[0].key, "env");
+        assert_eq!(decoded_metadata.properties[0].value, "test");
+        assert_eq!(frame.payload, payload);
     }
 }

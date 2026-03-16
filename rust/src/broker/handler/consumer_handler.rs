@@ -47,6 +47,7 @@ where
     let consumer_name = subscribe_cmd.consumer_name
         .clone()
         .unwrap_or_else(|| format!("consumer-{}", consumer_id));
+    let priority_level = subscribe_cmd.priority_level.unwrap_or(0);
 
     // Get or create subscription, then create Consumer (Apache Pulsar style)
     let consumer = {
@@ -67,6 +68,7 @@ where
             subscription_arc.clone(),
             connection_id,
             message_tx,  // Pass the sender - Consumer will prepend its ID
+            priority_level,
         ));
 
         // Add consumer to Subscription
@@ -83,6 +85,11 @@ where
 
     log::info!("Consumer {} created: topic={}, subscription={}, sub_type={:?}",
         consumer_id, subscribe_cmd.topic, subscribe_cmd.subscription, sub_type);
+    log::debug!(
+        "Consumer {} subscribed with priority level {}",
+        consumer_id,
+        priority_level
+    );
 
     // Send Success response
     let response = ServerCommand::Success {
@@ -253,4 +260,107 @@ where
     log::info!("Sent Success response for CloseConsumer request {}", close_cmd.request_id);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::broker::broker_service::BrokerService;
+    use crate::protocol::codec::proto::pulsar::{base_command, CommandSubscribe};
+    use crate::storage::Storage;
+    use futures::StreamExt;
+    use prost::Message;
+    use std::path::Path;
+    use tokio::io::duplex;
+    use tokio::sync::{Mutex, RwLock};
+
+    async fn create_subscribe_test_context() -> (
+        Framed<tokio::io::DuplexStream, PulsarFrameCodec>,
+        Framed<tokio::io::DuplexStream, PulsarFrameCodec>,
+        HashMap<u64, Arc<Consumer>>,
+        SharedBrokerService,
+        mpsc::UnboundedSender<(u64, PendingMessage)>,
+    ) {
+        let (server_io, client_io) = duplex(4096);
+        let server_framed = Framed::new(server_io, PulsarFrameCodec::new());
+        let client_framed = Framed::new(client_io, PulsarFrameCodec::new());
+        let storage = Arc::new(Mutex::new(
+            Storage::new(Path::new("/tmp/test-consumer-handler-storage")).unwrap(),
+        ));
+        let broker_service = Arc::new(RwLock::new(BrokerService::with_config(storage, 0)));
+        let (message_tx, _message_rx) = mpsc::unbounded_channel();
+
+        (
+            server_framed,
+            client_framed,
+            HashMap::new(),
+            broker_service,
+            message_tx,
+        )
+    }
+
+    fn build_subscribe_command(priority_level: Option<i32>) -> BaseCommand {
+        BaseCommand {
+            r#type: base_command::Type::Subscribe as i32,
+            subscribe: Some(CommandSubscribe {
+                topic: "persistent://public/default/test-topic".to_string(),
+                subscription: "test-sub".to_string(),
+                sub_type: 1,
+                consumer_id: 11,
+                request_id: 22,
+                consumer_name: Some("test-consumer".to_string()),
+                priority_level,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_priority_level_is_propagated_to_consumer() {
+        let (mut server_framed, mut client_framed, mut consumers, broker_service, message_tx) =
+            create_subscribe_test_context().await;
+        let mut next_consumer_id = 0;
+
+        handle_subscribe(
+            &mut server_framed,
+            build_subscribe_command(Some(3)),
+            &mut consumers,
+            &mut next_consumer_id,
+            broker_service,
+            "conn-1".to_string(),
+            message_tx,
+        )
+        .await
+        .unwrap();
+
+        let consumer = consumers.values().next().unwrap();
+        assert_eq!(consumer.get_priority_level(), 3);
+
+        let response = client_framed.next().await.unwrap().unwrap();
+        let cmd = BaseCommand::decode(&response.command[..]).unwrap();
+        assert_eq!(cmd.r#type, base_command::Type::Success as i32);
+    }
+
+    #[tokio::test]
+    async fn subscribe_priority_level_defaults_to_zero() {
+        let (mut server_framed, _client_framed, mut consumers, broker_service, message_tx) =
+            create_subscribe_test_context().await;
+        let mut next_consumer_id = 0;
+
+        handle_subscribe(
+            &mut server_framed,
+            build_subscribe_command(None),
+            &mut consumers,
+            &mut next_consumer_id,
+            broker_service,
+            "conn-2".to_string(),
+            message_tx,
+        )
+        .await
+        .unwrap();
+
+        let consumer = consumers.values().next().unwrap();
+        assert_eq!(consumer.get_priority_level(), 0);
+    }
 }

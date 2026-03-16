@@ -119,7 +119,14 @@ pub async fn handle_flow(
     let consumer = consumers.get(&flow_cmd.consumer_id)
         .ok_or_else(|| format!("Unknown consumer ID: {}", flow_cmd.consumer_id))?;
 
-    // Flow permits to consumer and trigger dispatch via Subscription
+    // Shared dispatcher reads the consumer-local permit count when selecting
+    // the next target consumer. Update it eagerly here so the dispatch
+    // triggered below does not race with an async permit update.
+    if consumer.get_sub_type() == SubscriptionType::Shared {
+        consumer.add_permits(flow_cmd.message_permits).await;
+    }
+
+    // Flow permits to dispatcher and trigger dispatch via Subscription
     let consumer_id = consumer.consumer_id;
     let subscription = consumer.get_subscription();
     let sub_guard = subscription.read().await;

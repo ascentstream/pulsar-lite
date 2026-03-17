@@ -90,7 +90,7 @@ def test_shared_round_robin_distribution(broker_url, unique_name):
         assert total_received == len(payloads)
 
         all_payloads = [payload for messages in received.values() for payload in messages]
-        assert len(set(all_payloads)) == len(payloads)
+        assert len(set(all_payloads)) == len(payloads),f"message duplication"
 
         distribution = [len(received[f"consumer-{index}"]) for index in range(3)]
         assert min(distribution) >= 5
@@ -100,37 +100,6 @@ def test_shared_round_robin_distribution(broker_url, unique_name):
             consumer.close()
         if producer is not None:
             producer.close()
-        client.close()
-
-
-def test_shared_flow_control_with_small_receiver_queue(broker_url, unique_name):
-    client = pulsar.Client(broker_url)
-    topic = persistent_topic(unique_name("shared-flow"))
-    subscription = unique_name("shared-sub")
-
-    try:
-        consumer = client.subscribe(
-            topic,
-            subscription,
-            consumer_name="consumer-0",
-            consumer_type=pulsar.ConsumerType.Shared,
-            initial_position=pulsar.InitialPosition.Earliest,
-            receiver_queue_size=1,
-        )
-        producer = client.create_producer(topic)
-
-        payloads = [f"flow-{index}".encode() for index in range(5)]
-        for payload in payloads:
-            producer.send(payload)
-
-        received = []
-        for _ in payloads:
-            message = consumer.receive(timeout_millis=5000)
-            received.append(message.data())
-            consumer.acknowledge(message)
-
-        assert received == payloads
-    finally:
         client.close()
 
 

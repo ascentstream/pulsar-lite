@@ -9,7 +9,7 @@ db_path = "./pulsar-lite.db"
 # Default number of partitions for new topics
 # 0 = non-partitioned (default, like Apache Pulsar)
 # >0 = partitioned with N partitions
-default_partitions = 2
+default_partitions = 0
 
 # Log level: trace, debug, info, warn, error
 log_level = "info"

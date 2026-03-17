@@ -308,6 +308,7 @@ impl SharedDispatcher {
         let consumer = self.consumers.remove(&consumer_id);
 
         if let Some(ref consumer) = consumer {
+            consumer.close_pending_acks();
             let pending = consumer.drain_pending_acks().await;
             let mut recovered = Vec::with_capacity(pending.len());
             {

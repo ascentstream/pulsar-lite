@@ -159,17 +159,20 @@ where
 
     // Acknowledge message (Apache Pulsar style)
     if let Some(message_id) = ack_cmd.message_id.first() {
-        let msg_id = crate::storage::MessageId {
+        // Pulsar protocol defaults non-partitioned message ids to partition = -1.
+        // Keep the protocol/broker boundary aligned so Shared ownership can be
+        // checked using the full MessageId instead of falling back to partial matching.
+        let protocol_msg_id = crate::storage::MessageId {
             ledger: message_id.ledger_id,
             entry: message_id.entry_id,
-            partition: message_id.partition.unwrap_or(0),
+            partition: message_id.partition.unwrap_or(-1),
         };
 
         // Get subscription type
         let sub_type = consumer.get_sub_type();
 
         if sub_type == SubscriptionType::Shared {
-            let ack_owner = if consumer.has_pending_ack(&msg_id).await {
+            let ack_owner = if consumer.has_pending_ack(&protocol_msg_id).await {
                 Some(consumer.clone())
             } else {
                 let subscription = consumer.get_subscription();
@@ -180,7 +183,9 @@ where
 
                 let mut owner = None;
                 for candidate in subscription_consumers {
-                    if candidate.consumer_id != consumer.consumer_id && candidate.has_pending_ack(&msg_id).await {
+                    if candidate.consumer_id != consumer.consumer_id
+                        && candidate.has_pending_ack(&protocol_msg_id).await
+                    {
                         owner = Some(candidate);
                         break;
                     }
@@ -189,27 +194,30 @@ where
             };
 
             if let Some(owner_consumer) = ack_owner {
-                owner_consumer.remove_pending_ack(&msg_id).await;
+                owner_consumer.remove_pending_ack(&protocol_msg_id).await;
                 owner_consumer.record_message_acked().await;
 
                 let mut guard = storage.lock().await;
                 let topic_name = consumer.get_topic_name();
                 let sub_name = consumer.get_subscription_name();
-                guard.ack_message_shared(&topic_name, &sub_name, msg_id)?;
+                guard.ack_message_shared(&topic_name, &sub_name, protocol_msg_id.clone())?;
             } else {
                 log::warn!(
-                    "Consumer {} attempted to ack message {}:{} without ownership; ignoring storage ack",
-                    ack_cmd.consumer_id, message_id.ledger_id, message_id.entry_id
+                    "Consumer {} attempted to ack message {}:{}:{} without ownership; ignoring storage ack",
+                    ack_cmd.consumer_id,
+                    protocol_msg_id.ledger,
+                    protocol_msg_id.entry,
+                    protocol_msg_id.partition
                 );
             }
         } else {
             // Non-Shared mode: original behavior
-            consumer.ack_message(msg_id.clone()).await;
+            consumer.ack_message(protocol_msg_id.clone()).await;
 
             let mut guard = storage.lock().await;
             let topic_name = consumer.get_topic_name();
             let sub_name = consumer.get_subscription_name();
-            guard.ack_message(&topic_name, &sub_name, msg_id)?;
+            guard.ack_message(&topic_name, &sub_name, protocol_msg_id)?;
         }
 
         log::info!("Message {}:{} acknowledged for consumer {}",

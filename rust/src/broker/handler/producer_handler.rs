@@ -10,7 +10,7 @@ use crate::protocol::codec::{PulsarFrameCodec, PulsarFrame, proto::pulsar::BaseC
 use crate::protocol::ServerCommand;
 use tokio_util::codec::Framed;
 use crate::broker::service::Producer;
-use crate::broker::broker_service::SharedBrokerService;
+use crate::broker::broker_service::{SharedBrokerService, TopicRef};
 
 /// Handle Producer command
 pub async fn handle_producer<T>(
@@ -46,7 +46,16 @@ where
     // Get or create topic (Apache Pulsar style)
     let topic = {
         let mut manager = topic_manager.write().await;
-        manager.get_or_create_topic(&producer_cmd.topic).await
+        match manager.get_or_create_topic_auto(&producer_cmd.topic).await {
+            TopicRef::NonPartitioned(topic) | TopicRef::Partition(topic) => topic,
+            TopicRef::Partitioned(_) => {
+                return Err(format!(
+                    "Producer command must target a concrete topic or partition: {}",
+                    producer_cmd.topic
+                )
+                .into())
+            }
+        }
     };
 
     // Create Producer object with Topic reference (Apache Pulsar style)

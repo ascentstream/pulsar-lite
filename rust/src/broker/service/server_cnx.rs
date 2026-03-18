@@ -279,7 +279,7 @@ where
         timeout_reason: CloseReasonKind,
     ) -> CnxResult<()> {
         // Keep-alive and explicit liveness checks reuse the same Ping path; only the timeout reason differs.
-        log::debug!(
+        log::info!(
             "Starting connection liveness check on {} using protocol version {}",
             self.connection_id,
             self.remote_protocol_version
@@ -475,6 +475,12 @@ where
         self.waiting_for_pong = false;
         self.connection_check_in_progress = None;
         self.last_activity = Instant::now();
+        log::info!(
+            "Connection {} handshake completed with protocol version {} (keep-alive enabled: {})",
+            self.connection_id,
+            self.remote_protocol_version,
+            self.supports_keep_alive()
+        );
         Ok(())
     }
 

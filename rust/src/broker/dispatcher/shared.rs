@@ -308,6 +308,7 @@ impl SharedDispatcher {
         let consumer = self.consumers.remove(&consumer_id);
 
         if let Some(ref consumer) = consumer {
+            consumer.close_pending_acks();
             let pending = consumer.drain_pending_acks().await;
             let mut recovered = Vec::with_capacity(pending.len());
             {
@@ -364,16 +365,8 @@ impl Dispatcher for SharedDispatcher {
     }
 
     fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {
-        // 1. Update the consumer's own permits
-        if let Some(consumer) = self.consumers.get(&consumer_id) {
-            // We need to spawn a task since add_permits is async
-            let consumer = consumer.clone();
-            tokio::spawn(async move {
-                consumer.add_permits(additional_permits).await;
-            });
-        }
-
-        // 2. Increase total permits atomically
+        // Consumer-local permit state is updated by the flow handler before it
+        // triggers dispatch. The dispatcher only tracks the aggregate count.
         self.total_available_permits.fetch_add(additional_permits, Ordering::Relaxed);
 
         log::info!(

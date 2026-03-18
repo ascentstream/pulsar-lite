@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::sync::{RwLock, mpsc};
 use super::topic::SubscriptionType;
@@ -73,6 +74,10 @@ pub struct Consumer {
     /// 用于 Shared 模式的消息跟踪和断开重投递
     pending_acks: Arc<RwLock<BTreeMap<MessageId, PendingAck>>>,
 
+    /// Matches native Pulsar's PendingAcksMap closed flag.
+    /// Once closing starts, no new pending ack should be tracked for this consumer.
+    pending_acks_closed: AtomicBool,
+
     /// Lower value means higher priority, consistent with native Pulsar.
     priority_level: i32,
 }
@@ -107,6 +112,7 @@ impl Consumer {
             stats: Arc::new(RwLock::new(ConsumerStats::default())),
             message_tx,
             pending_acks: Arc::new(RwLock::new(BTreeMap::new())),
+            pending_acks_closed: AtomicBool::new(false),
             priority_level,
         }
     }
@@ -212,19 +218,27 @@ impl Consumer {
     ) -> bool {
         let msg = PendingMessage { message_id: message_id.clone(), metadata, payload };
 
-        // 先发送消息到 channel
+        // Native Pulsar writes pending acks before the message is written so that
+        // disconnect/close races cannot lose ownership bookkeeping.
+        if self.get_sub_type() == SubscriptionType::Shared
+            && !self.track_message_dispatched(&message_id, redelivery_count).await
+        {
+            log::debug!(
+                "Skipping send of message {}:{} to closing consumer {}",
+                message_id.ledger, message_id.entry, self.consumer_id
+            );
+            return false;
+        }
+
         if let Err(e) = self.message_tx.send((self.consumer_id, msg)) {
             log::error!(
                 "Failed to send message {}:{} to consumer {}: {}",
                 message_id.ledger, message_id.entry, self.consumer_id, e
             );
-            // 发送失败，不记录 pending_ack，消息不会被"持有"
+            if self.get_sub_type() == SubscriptionType::Shared {
+                self.remove_pending_ack(&message_id).await;
+            }
             return false;
-        }
-
-        // 发送成功后才记录 pending ack
-        if self.get_sub_type() == SubscriptionType::Shared {
-            self.track_message_dispatched(&message_id, redelivery_count).await;
         }
 
         log::debug!(
@@ -247,8 +261,15 @@ impl Consumer {
     /// 记录消息已分发 (用于 Shared 模式)
     ///
     /// 当消息成功发送到 Consumer 后调用此方法
-    pub async fn track_message_dispatched(&self, message_id: &MessageId, redelivery_count: u32) {
+    pub async fn track_message_dispatched(&self, message_id: &MessageId, redelivery_count: u32) -> bool {
+        if self.pending_acks_closed.load(Ordering::Acquire) {
+            return false;
+        }
+
         let mut pending = self.pending_acks.write().await;
+        if self.pending_acks_closed.load(Ordering::Relaxed) {
+            return false;
+        }
         pending.insert(
             message_id.clone(),
             PendingAck {
@@ -260,6 +281,7 @@ impl Consumer {
             "Tracked message {}:{} for consumer {}",
             message_id.ledger, message_id.entry, self.consumer_id
         );
+        true
     }
 
     /// 确认消息并移除跟踪
@@ -286,6 +308,19 @@ impl Consumer {
 
     pub async fn has_pending_ack(&self, message_id: &MessageId) -> bool {
         self.pending_acks.read().await.contains_key(message_id)
+    }
+
+    pub async fn find_pending_ack_by_position(&self, ledger: u64, entry: u64) -> Option<MessageId> {
+        self.pending_acks
+            .read()
+            .await
+            .keys()
+            .find(|message_id| message_id.ledger == ledger && message_id.entry == entry)
+            .cloned()
+    }
+
+    pub fn close_pending_acks(&self) {
+        self.pending_acks_closed.store(true, Ordering::Release);
     }
 
     /// 获取所有待确认消息 (用于 disconnect recovery)

@@ -1,40 +1,40 @@
 #!/usr/bin/env python3
-"""
-Test Pulsar binary protocol server with actual Pulsar client
-"""
+"""High-level producer smoke tests against the Pulsar Lite broker."""
+
+from __future__ import annotations
 
 import pulsar
-import time
-import sys
 
-def test_producer():
-    """Test producer functionality with binary protocol server"""
+from test_support import persistent_topic
 
-    print("Connecting to Pulsar Lite binary server...")
-    client = pulsar.Client("pulsar://localhost:6650")
+
+def test_producer(broker_url, unique_name):
+    topic = persistent_topic(unique_name("binary-producer"))
+    subscription = unique_name("binary-sub")
+    client = pulsar.Client(broker_url)
 
     try:
-        print("Creating producer...")
-        producer = client.create_producer("persistent://public/default/test-topic")
+        consumer = client.subscribe(
+            topic,
+            subscription,
+            consumer_name="binary-consumer",
+            consumer_type=pulsar.ConsumerType.Shared,
+            initial_position=pulsar.InitialPosition.Earliest,
+            receiver_queue_size=1,
+        )
+        producer = client.create_producer(topic)
 
-        print("Sending messages...")
-        for i in range(5):
-            message = f"Message {i}".encode('utf-8')
-            msg_id = producer.send(message)
-            print(f"Sent message {i}: {msg_id}")
-            time.sleep(0.1)
+        payloads = [f"Message {index}".encode("utf-8") for index in range(5)]
+        message_ids = [producer.send(payload) for payload in payloads]
 
-        print("\nAll messages sent successfully!")
-        return True
+        assert all(msg_id is not None for msg_id in message_ids)
 
-    except Exception as e:
-        print(f"\nError: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+        received = []
+        for _ in payloads:
+            message = consumer.receive(timeout_millis=5000)
+            received.append(message.data())
+            consumer.acknowledge(message)
+
+        assert received == payloads
     finally:
         client.close()
-
-if __name__ == "__main__":
-    success = test_producer()
-    sys.exit(0 if success else 1)

@@ -234,11 +234,15 @@ pub async fn remove_pending_ack(&self, message_id: &MessageId) -> bool {
 - ✅ **已支持 Pending Acks 跟踪** - Shared 模式下每个 Consumer 维护自己的 `pending_acks`
 - ✅ **已支持 ack 归属校验** - 只有持有该消息的 Consumer 才会移除 pending ack 并落 storage ack
 - ✅ **已支持断开恢复所需的 pending drain** - Consumer 移除时可一次性取出全部待确认消息
+- ✅ **已对齐原生 Pulsar 的“先写 pending ack，再投递消息”时序** - Shared `send_message()` 现在会先记录 `pending_acks`，再把消息送入 consumer channel；如果 channel 发送失败，会回滚刚写入的 pending ack
+- ✅ **已修正 Shared ack ownership 的协议边界问题** - `handle_ack()` 现在会先把非分区 ack 的 `partition` 归一化为 `-1`，再继续按完整 `MessageId` 精确匹配 owner，并执行 `remove_pending_ack()` 与 `storage.ack_message_shared(...)`
+- ✅ **已补上 close/recovery 前的 pending ack 关闭语义** - Consumer 进入 remove/recovery 前会先关闭 pending ack 写入入口，避免 close 过程中继续混入新的 pending ack，行为上更接近原生 Pulsar `PendingAcksMap.forEachAndClose()`
 
 **与原生 Pulsar 的剩余差异**：
 - ℹ️ **累计确认 (cumulative ack) 不属于 Shared 模式目标** - 原生 Pulsar 中 Shared / Key_Shared 明确走 `individual ack`，累计确认只适用于 Exclusive / Failover
 - ⚠️ **无 unacked messages 计数/限流** - 还没有官方那套 per-consumer / per-subscription unacked 控制
 - ⚠️ **Pending Ack 元数据较少** - 当前只记录时间和重投递次数，未覆盖 batchSize、stickyKeyHash 等更完整信息
+- ⚠️ **storage 的 Shared assignment / ack 粒度仍偏粗** - 当前 `message_assignments`、`get_assignment_owner()`、`is_acknowledged_shared()` 等路径主要按 `entry` 建模，而原生 Pulsar 的 pending ack / replay 跟踪至少精确到 `ledgerId + entryId`
 
 ### 4.2 原生 Pulsar 确认逻辑
 
@@ -282,6 +286,41 @@ if (ackType == AckType.Cumulative) {
 - ✅ **Exclusive / Failover 支持累积确认**
 - ✅ **Shared / Key_Shared 明确走单条确认**
 
+**原生 Pulsar 在 Shared ack / recovery 上更关键的时序点**：
+
+```java
+// Consumer.java
+// 先写 pending ack，再真正发送给 consumer，避免 disconnect race
+pendingAcks.put(ledgerId, entryId, batchSize, stickyKeyHash);
+ctx.write(message);
+```
+
+```java
+// Consumer.java
+// ack 时按 ledgerId + entryId 移除 pending ack
+private void removePendingAcks(Position position) {
+    pendingAcks.remove(position.getLedgerId(), position.getEntryId());
+}
+```
+
+```java
+// PersistentDispatcherMultipleConsumers.java
+// consumer remove 时关闭 pending ack map，并把仍未确认的消息转入 replay
+consumer.getPendingAcks().forEachAndClose((ledgerId, entryId, batchSize, stickyKeyHash) -> {
+    addMessageToReplay(ledgerId, entryId, stickyKeyHash);
+});
+```
+
+**这次按原生时序对齐后解决的问题**：
+- 修复前，`pulsar-lite` Shared 路径里存在“先发消息，后写 pending ack”的窗口，ack / close / recovery 并发时容易产生竞态
+- 协议层解析层原先把“未显式携带 partition 的非分区 ack”错误地补成了 `0`，而 broker/storage 内部非分区消息一直使用 `-1`，导致按完整 `MessageId` 查 owner 时会误判“无 ownership”
+- 上述两个问题叠加时，会表现为“消息已经 ack，但 owner close 后仍被当作 pending ack 放回 replay”
+
+**本次修复涉及的关键代码**：
+- [consumer.rs](/home/xtline/code/work/pulsar-lite/rust/src/broker/service/consumer.rs)
+- [consumer_handler.rs](/home/xtline/code/work/pulsar-lite/rust/src/broker/handler/consumer_handler.rs)
+- [shared.rs](/home/xtline/code/work/pulsar-lite/rust/src/broker/dispatcher/shared.rs)
+
 **为什么这里不把 cumulative ack 作为 Shared 目标**：
 - 原生 Pulsar 在 `Subscription.isCumulativeAckMode(...)` 中只把 `Exclusive` 和 `Failover` 视为累计确认模式
 - 原生 Pulsar 在 `Subscription.isIndividualAckMode(...)` 中把 `Shared` 和 `Key_Shared` 归为单条确认模式
@@ -301,12 +340,18 @@ if (ackType == AckType.Cumulative) {
 - ✅ **优先 replay 再分发新消息** - dispatcher 先消费 `messages_to_redeliver`，再取新消息
 - ✅ **发送失败自动回队** - 分发失败的消息会重新加入 redelivery queue
 - ✅ **已 ack 消息跳过 replay** - replay 前会检查 storage 中是否已确认，避免重复恢复
+- ✅ **close/recovery 与 ack 已对齐到更安全的 Shared 时序** - Consumer remove 前先关闭 pending ack 跟踪入口，再 drain 并回收真正仍未确认的消息
 
 **与原生 Pulsar 的剩余差异**：
 - ⚠️ **重投递控制器仍是简化版** - 当前主要是 `BTreeMap<MessageId, redelivery_count>`，还不是官方 `MessageRedeliveryController`
 - ⚠️ **无 Key_Shared hash 阻塞/有序重投递能力** - 尚未实现 sticky key 维度的 replay 控制
 - ⚠️ **无显式 redelivery 命令处理** - 目前主要覆盖断连恢复和发送失败回队，尚未完整支持客户端主动触发的 redelivery
 - ⚠️ **无 ack timeout / negative ack 驱动的重投递** - 连接保持存活但长期不 ack 的场景仍未覆盖
+
+**本次修复前后的行为差异**：
+- 修复前：Shared ack 在 owner 查找失败时会直接跳过 storage ack；随后 consumer close 会把同一条消息当作 pending ack 放回 redelivery queue
+- 修复后：Shared ack 会先回查真实 tracked `MessageId`，正确清理 owner 的 pending ack，并把真实 `MessageId` 落到 storage；consumer close 时如果消息已被 ack，不会再进入 replay
+- 端到端验证上，`tests/test_shared_integration.py` 中新增的“已 ack 消息在 owner close 后不重投递”和“recovery 不重复回放已 ack 消息”场景已经通过
 
 ### 5.2 原生 Pulsar
 
@@ -354,18 +399,13 @@ total_available_permits: AtomicU32,  // 全局 permits
 
 // consumer_flow 是同步函数
 fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {
-    // permit 更新通过异步任务执行
-    let consumer = self.consumers.get(&consumer_id).cloned();
-    if let Some(consumer) = consumer {
-        consumer.add_permits(additional_permits);  // 内部使用异步任务
-    }
-    self.total_available_permits.fetch_add(additional_permits, Ordering::Relaxed);
+    
 }
 ```
 
 **特点**：
 - ✅ 简单的全局 permits 计数
-- ⚠️ `consumer_flow` 是同步函数，但 permit 更新通过异步任务执行
+- ⚠️ `consumer_flow` 是同步函数
 - ❌ **无 per-consumer unacked 限制**
 - ❌ **无 backpressure 机制**
 

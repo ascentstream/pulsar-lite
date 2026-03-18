@@ -12,6 +12,7 @@ use pulsar_lite::storage::Storage;
 use futures::SinkExt;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Duration;
 use tokio_util::codec::Framed;
@@ -43,16 +44,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize storage
     let storage = Arc::new(Mutex::new(Storage::new(&config.db_path)?));
+    let restored_partition_metadata = {
+        let guard = storage.lock().await;
+        guard.get_partitioned_topic_metadata()
+    };
 
     // Initialize broker service with configuration
-    let broker_service = Arc::new(RwLock::new(
-        BrokerService::with_config(storage.clone(), config.default_partitions)
-    ));
+    let mut broker = BrokerService::with_config(storage.clone(), config.default_partitions);
+    broker.restore_partition_metadata(restored_partition_metadata);
+    let broker_service = Arc::new(RwLock::new(broker));
     log::info!("BrokerService initialized");
 
     // Bind TCP listener
     let listener = TcpListener::bind(&config.addr).await?;
     log::info!("Server listening on {}", config.addr);
+    let advertised_broker_url = advertised_broker_url(listener.local_addr()?);
     let keep_alive_interval = Duration::from_secs(config.keep_alive_interval_secs);
     let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
     let connection_liveness_check_timeout =
@@ -80,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let storage = Arc::clone(&storage);
         let broker_service = Arc::clone(&broker_service);
+        let advertised_broker_url = advertised_broker_url.clone();
         tokio::spawn(async move {
             let _connection_permit = permit;
             if let Err(e) = handle_connection(
@@ -89,10 +96,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 keep_alive_interval,
                 handshake_timeout,
                 connection_liveness_check_timeout,
+                advertised_broker_url,
             ).await {
                 log::error!("Connection error from {}: {}", peer_addr, e);
             }
             log::info!("Connection closed from {}", peer_addr);
         });
     }
+}
+
+fn advertised_broker_url(addr: SocketAddr) -> String {
+    let host = match addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => Ipv4Addr::LOCALHOST.to_string(),
+        IpAddr::V6(ip) if ip.is_unspecified() => "::1".to_string(),
+        ip => ip.to_string(),
+    };
+    format!("pulsar://{}:{}", host, addr.port())
 }

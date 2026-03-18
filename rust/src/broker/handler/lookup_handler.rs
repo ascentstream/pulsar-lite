@@ -49,6 +49,7 @@ where
 pub async fn handle_lookup<T>(
     framed: &mut Framed<T, PulsarFrameCodec>,
     cmd: BaseCommand,
+    broker_service_url: &str,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -60,7 +61,7 @@ where
     // Return local broker URL with pulsar:// protocol
     let response = ServerCommand::LookupResponse {
         request_id: lookup_cmd.request_id,
-        broker_service_url: "pulsar://localhost:6650".to_string(),
+        broker_service_url: broker_service_url.to_string(),
     };
 
     framed.send(response).await?;

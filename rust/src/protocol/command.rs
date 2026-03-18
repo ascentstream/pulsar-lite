@@ -167,6 +167,9 @@ impl ServerCommand {
                 producer_success: Some(CommandProducerSuccess {
                     request_id: *request_id,
                     producer_name: producer_name.clone(),
+                    last_sequence_id: Some(-1),
+                    schema_version: Some(Vec::new()),
+                    producer_ready: Some(true),
                     ..Default::default()
                 }),
                 ..Default::default()

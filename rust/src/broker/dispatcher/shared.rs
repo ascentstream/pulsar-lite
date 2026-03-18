@@ -20,6 +20,11 @@ pub struct SharedDispatcher {
     /// All consumers for this shared subscription
     consumers: HashMap<u64, Arc<Consumer>>,
 
+    /// Stable consumer order used for priority-aware dispatch.
+    /// Sorted by priority level ascending (0 is highest), while preserving
+    /// insertion order within the same priority level.
+    consumer_order: Vec<u64>,
+
     /// Round-Robin index for consumer selection (atomic for thread safety)
     round_robin_index: AtomicUsize,
 
@@ -39,10 +44,115 @@ impl SharedDispatcher {
     pub fn new() -> Self {
         Self {
             consumers: HashMap::new(),
+            consumer_order: Vec::new(),
             round_robin_index: AtomicUsize::new(0),
             total_available_permits: AtomicU32::new(0),
             dispatch_in_progress: AtomicBool::new(false),
             messages_to_redeliver: Arc::new(RwLock::new(BTreeMap::new())),
+        }
+    }
+
+    fn ordered_consumers(&self) -> Vec<Arc<Consumer>> {
+        self.consumer_order
+            .iter()
+            .filter_map(|consumer_id| self.consumers.get(consumer_id).cloned())
+            .collect()
+    }
+
+    fn first_consumer_index_of_priority(
+        consumers: &[Arc<Consumer>],
+        target_priority: i32,
+    ) -> Option<usize> {
+        consumers
+            .iter()
+            .position(|consumer| consumer.get_priority_level() == target_priority)
+    }
+
+    async fn find_available_consumer_from_higher_priority(
+        &self,
+        consumers: &[Arc<Consumer>],
+        current_index: usize,
+        target_priority: i32,
+    ) -> Option<usize> {
+        for (index, consumer) in consumers.iter().enumerate().take(current_index) {
+            if consumer.get_priority_level() >= target_priority {
+                break;
+            }
+            if consumer.get_available_permits().await > 0 {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    async fn find_available_consumer_from_same_or_lower_priority(
+        &self,
+        consumers: &[Arc<Consumer>],
+        current_index: usize,
+    ) -> Option<usize> {
+        let current_consumer = &consumers[current_index];
+        let target_priority = current_consumer.get_priority_level();
+
+        if current_consumer.get_available_permits().await > 0 {
+            return Some(current_index);
+        }
+
+        let mut scan_index = current_index + 1;
+        let mut end_priority_level_index = current_index;
+        loop {
+            let scan_consumer = consumers.get(scan_index);
+            if scan_consumer.is_none()
+                || scan_consumer.unwrap().get_priority_level() != target_priority
+            {
+                end_priority_level_index = scan_index;
+                scan_index = Self::first_consumer_index_of_priority(consumers, target_priority)?;
+            } else if scan_consumer.unwrap().get_available_permits().await > 0 {
+                return Some(scan_index);
+            } else {
+                scan_index += 1;
+            }
+
+            if scan_index == current_index {
+                break;
+            }
+        }
+
+        for (index, consumer) in consumers.iter().enumerate().skip(end_priority_level_index) {
+            if consumer.get_available_permits().await > 0 {
+                return Some(index);
+            }
+        }
+
+        None
+    }
+
+    fn insert_consumer_order(&mut self, consumer_id: u64, priority_level: i32) {
+        let insert_at = self
+            .consumer_order
+            .iter()
+            .enumerate()
+            .find_map(|(index, existing_id)| {
+                let existing = self.consumers.get(existing_id)?;
+                (existing.get_priority_level() > priority_level).then_some(index)
+            })
+            .unwrap_or(self.consumer_order.len());
+        self.consumer_order.insert(insert_at, consumer_id);
+    }
+
+    fn remove_consumer_order(&mut self, consumer_id: u64) {
+        if let Some(index) = self.consumer_order.iter().position(|id| *id == consumer_id) {
+            self.consumer_order.remove(index);
+            let len = self.consumer_order.len();
+            if len == 0 {
+                self.round_robin_index.store(0, Ordering::Relaxed);
+            } else {
+                let current = self.round_robin_index.load(Ordering::Relaxed);
+                if current > index {
+                    self.round_robin_index.store(current - 1, Ordering::Relaxed);
+                } else if current >= len {
+                    self.round_robin_index.store(current % len, Ordering::Relaxed);
+                }
+            }
         }
     }
 
@@ -55,53 +165,37 @@ impl SharedDispatcher {
             return None;
         }
 
-        // Convert to vector for indexed access
-        let consumers: Vec<_> = self.consumers.values().cloned().collect();
-        let mut best_priority: Option<i32> = None;
-        let mut eligible_indices = Vec::new();
-
-        for (index, consumer) in consumers.iter().enumerate() {
-            let permits = consumer.get_available_permits().await;
-            if permits == 0 {
-                continue;
-            }
-
-            let priority = consumer.get_priority_level();
-            match best_priority {
-                Some(current_best) if priority > current_best => {}
-                Some(current_best) if priority == current_best => eligible_indices.push(index),
-                _ => {
-                    best_priority = Some(priority);
-                    eligible_indices.clear();
-                    eligible_indices.push(index);
-                }
-            }
-        }
-
-        if eligible_indices.is_empty() {
-            log::debug!("No consumer has available permits");
+        let consumers = self.ordered_consumers();
+        if consumers.is_empty() {
             return None;
         }
+        let current_index = self.round_robin_index.load(Ordering::Relaxed) % consumers.len();
+        let current_priority = consumers[current_index].get_priority_level();
 
-        let eligible_count = eligible_indices.len();
-        let start = self.round_robin_index.fetch_add(1, Ordering::Relaxed) % eligible_count;
-
-        for offset in 0..eligible_count {
-            let vector_index = eligible_indices[(start + offset) % eligible_count];
-            let consumer = consumers[vector_index].clone();
-            let permits = consumer.get_available_permits().await;            if permits > 0 {
-                log::debug!(
-                    "Priority-aware Round-Robin selected consumer {} (priority {}, index {}) with {} permits",
-                    consumer.consumer_id,
-                    consumer.get_priority_level(),
-                    vector_index,
-                    permits
-                );
-                return Some(consumer);
+        if current_priority != 0 {
+            if let Some(index) = self
+                .find_available_consumer_from_higher_priority(
+                    &consumers,
+                    current_index,
+                    current_priority,
+                )
+                .await
+            {
+                self.round_robin_index
+                    .store((index + 1) % consumers.len(), Ordering::Relaxed);
+                return Some(consumers[index].clone());
             }
         }
 
-        // No consumer has available permits
+        if let Some(index) = self
+            .find_available_consumer_from_same_or_lower_priority(&consumers, current_index)
+            .await
+        {
+            self.round_robin_index
+                .store((index + 1) % consumers.len(), Ordering::Relaxed);
+            return Some(consumers[index].clone());
+        }
+
         log::debug!("No consumer has available permits");
         None
     }
@@ -308,6 +402,7 @@ impl SharedDispatcher {
         let consumer = self.consumers.remove(&consumer_id);
 
         if let Some(ref consumer) = consumer {
+            self.remove_consumer_order(consumer_id);
             consumer.close_pending_acks();
             let pending = consumer.drain_pending_acks().await;
             let mut recovered = Vec::with_capacity(pending.len());
@@ -346,7 +441,7 @@ impl Dispatcher for SharedDispatcher {
     }
 
     fn get_consumers(&self) -> Vec<Arc<Consumer>> {
-        self.consumers.values().cloned().collect()
+        self.ordered_consumers()
     }
 
     fn add_consumer(&mut self, consumer: Arc<Consumer>) -> Result<(), String> {
@@ -356,12 +451,18 @@ impl Dispatcher for SharedDispatcher {
             return Err(format!("Consumer {} already exists", consumer_id));
         }
 
+        let priority_level = consumer.get_priority_level();
         self.consumers.insert(consumer_id, consumer);
+        self.insert_consumer_order(consumer_id, priority_level);
         Ok(())
     }
 
     fn remove_consumer(&mut self, consumer_id: u64) -> Option<Arc<Consumer>> {
-        self.consumers.remove(&consumer_id)
+        let consumer = self.consumers.remove(&consumer_id);
+        if consumer.is_some() {
+            self.remove_consumer_order(consumer_id);
+        }
+        consumer
     }
 
     fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {
@@ -471,5 +572,55 @@ mod tests {
         let second = dispatcher.get_next_available_consumer().await.unwrap().consumer_id;
 
         assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn lower_priority_consumer_only_selected_after_higher_priority_is_exhausted() {
+        let storage = create_test_storage();
+        let subscription = create_test_subscription(storage);
+        let high = create_test_consumer(1, 0, subscription.clone());
+        let low = create_test_consumer(2, 1, subscription);
+
+        high.add_permits(1).await;
+        low.add_permits(2).await;
+
+        let mut dispatcher = SharedDispatcher::new();
+        dispatcher.add_consumer(high.clone()).unwrap();
+        dispatcher.add_consumer(low.clone()).unwrap();
+
+        let first = dispatcher.get_next_available_consumer().await.unwrap();
+        assert_eq!(first.consumer_id, high.consumer_id);
+        high.use_permit().await;
+
+        let second = dispatcher.get_next_available_consumer().await.unwrap();
+        assert_eq!(second.consumer_id, low.consumer_id);
+    }
+
+    #[tokio::test]
+    async fn removing_consumer_preserves_round_robin_for_remaining_same_priority_group() {
+        let storage = create_test_storage();
+        let subscription = create_test_subscription(storage);
+        let consumer_a = create_test_consumer(1, 0, subscription.clone());
+        let consumer_b = create_test_consumer(2, 0, subscription.clone());
+        let consumer_c = create_test_consumer(3, 0, subscription);
+
+        consumer_a.add_permits(2).await;
+        consumer_b.add_permits(2).await;
+        consumer_c.add_permits(2).await;
+
+        let mut dispatcher = SharedDispatcher::new();
+        dispatcher.add_consumer(consumer_a).unwrap();
+        dispatcher.add_consumer(consumer_b.clone()).unwrap();
+        dispatcher.add_consumer(consumer_c.clone()).unwrap();
+
+        let _ = dispatcher.get_next_available_consumer().await.unwrap();
+        dispatcher.remove_consumer(1);
+
+        let first_remaining = dispatcher.get_next_available_consumer().await.unwrap().consumer_id;
+        let second_remaining = dispatcher.get_next_available_consumer().await.unwrap().consumer_id;
+
+        assert_ne!(first_remaining, second_remaining);
+        assert!(matches!(first_remaining, 2 | 3));
+        assert!(matches!(second_remaining, 2 | 3));
     }
 }

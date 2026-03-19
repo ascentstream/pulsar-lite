@@ -48,3 +48,9 @@ Thumbs.db
 tmp/
 temp/
 *.tmp
+
+# Java test workspace
+tests/java/
+
+# Pulsar metadata
+rust/pulsar-lite.metadata.json

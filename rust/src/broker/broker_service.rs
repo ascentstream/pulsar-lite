@@ -272,27 +272,21 @@ impl BrokerService {
     /// Get the base topic name from a partition name
     /// E.g., "my-topic-partition-0" -> "my-topic"
     pub fn get_base_topic_name(&self, partition_name: &str) -> Option<String> {
-        if let Some(idx) = partition_name.find("-partition-") {
-            Some(partition_name[..idx].to_string())
-        } else {
-            None
-        }
+        let (base_name, partition_index) = partition_name.rsplit_once("-partition-")?;
+        partition_index.parse::<usize>().ok()?;
+        Some(base_name.to_string())
     }
 
     /// Get partition index from partition name
     /// E.g., "my-topic-partition-0" -> 0
     pub fn get_partition_index(&self, partition_name: &str) -> Option<usize> {
-        if let Some(idx) = partition_name.find("-partition-") {
-            let index_str = &partition_name[idx + 11..]; // "-partition-" is 11 chars
-            index_str.parse::<usize>().ok()
-        } else {
-            None
-        }
+        let (_, partition_index) = partition_name.rsplit_once("-partition-")?;
+        partition_index.parse::<usize>().ok()
     }
 
     /// Check if a topic name is a partition name (e.g., "topic-partition-0")
     pub fn is_partition_name(&self, topic_name: &str) -> bool {
-        topic_name.contains("-partition-")
+        self.get_partition_index(topic_name).is_some()
     }
 
     // ==================== Statistics ====================
@@ -649,6 +643,9 @@ mod tests {
         // Test partition name detection
         assert!(manager.is_partition_name("my-topic-partition-0"));
         assert!(manager.is_partition_name("persistent://public/default/topic-partition-5"));
+        assert!(manager.is_partition_name(
+            "persistent://public/default/metadata-partition-sub-partition-2"
+        ));
         assert!(!manager.is_partition_name("my-topic"));
 
         // Test base topic name extraction
@@ -657,11 +654,23 @@ mod tests {
             manager.get_base_topic_name("persistent://public/default/topic-partition-5"),
             Some("persistent://public/default/topic".to_string())
         );
+        assert_eq!(
+            manager.get_base_topic_name(
+                "persistent://public/default/metadata-partition-sub-partition-2"
+            ),
+            Some("persistent://public/default/metadata-partition-sub".to_string())
+        );
         assert_eq!(manager.get_base_topic_name("my-topic"), None);
 
         // Test partition index extraction
         assert_eq!(manager.get_partition_index("my-topic-partition-0"), Some(0));
         assert_eq!(manager.get_partition_index("my-topic-partition-10"), Some(10));
+        assert_eq!(
+            manager.get_partition_index(
+                "persistent://public/default/metadata-partition-sub-partition-2"
+            ),
+            Some(2)
+        );
         assert_eq!(manager.get_partition_index("my-topic"), None);
     }
 

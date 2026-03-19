@@ -4,12 +4,25 @@
 from __future__ import annotations
 
 import pulsar
+import pytest
 
 from test_support import persistent_topic, receive_from_any
 
 
-def test_shared_pending_acks_disconnect_triggers_redelivery(broker_url, unique_name):
-    topic = persistent_topic(unique_name("shared-redelivery"))
+def _shared_semantics_topic(unique_name, broker_timing, prefix: str) -> str:
+    # 测试该功能要求 broker 不支持分区，所以如果发生分区会显示跳过
+    if broker_timing.get("default_partitions", 0) > 0:
+        pytest.skip(
+            "shared recovery integration tests require a non-partitioned broker; "
+            "set default_partitions = 0 before running them."
+        )
+    return persistent_topic(unique_name(prefix))
+
+
+def test_shared_pending_acks_disconnect_triggers_redelivery(
+    broker_url, broker_timing, unique_name
+):
+    topic = _shared_semantics_topic(unique_name, broker_timing, "shared-redelivery")
     subscription = unique_name("shared-sub")
     client = pulsar.Client(broker_url)
 
@@ -58,9 +71,9 @@ def test_shared_pending_acks_disconnect_triggers_redelivery(broker_url, unique_n
 
 
 def test_shared_acked_message_is_not_redelivered_after_owner_closes(
-    broker_url, unique_name
+    broker_url, broker_timing, unique_name
 ):
-    topic = persistent_topic(unique_name("shared-acked-close"))
+    topic = _shared_semantics_topic(unique_name, broker_timing, "shared-acked-close")
     subscription = unique_name("shared-sub")
     client = pulsar.Client(broker_url)
 
@@ -101,9 +114,9 @@ def test_shared_acked_message_is_not_redelivered_after_owner_closes(
 
 
 def test_shared_recovery_does_not_replay_already_acked_messages(
-    broker_url, unique_name
+    broker_url, broker_timing, unique_name
 ):
-    topic = persistent_topic(unique_name("shared-acked-recovery"))
+    topic = _shared_semantics_topic(unique_name, broker_timing, "shared-acked-recovery")
     subscription = unique_name("shared-sub")
     client = pulsar.Client(broker_url)
 

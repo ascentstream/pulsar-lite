@@ -28,6 +28,7 @@ def _load_broker_timing(config_path: Path) -> dict[str, int]:
             "keep_alive_interval_secs": 30,
             "connection_liveness_check_timeout_secs": 10,
             "handshake_timeout_secs": 30,
+            "default_partitions": 0,
         }
 
     text = config_path.read_text(encoding="utf-8")
@@ -37,6 +38,7 @@ def _load_broker_timing(config_path: Path) -> dict[str, int]:
             text, "connection_liveness_check_timeout_secs", 10
         ),
         "handshake_timeout_secs": _parse_int_setting(text, "handshake_timeout_secs", 30),
+        "default_partitions": _parse_int_setting(text, "default_partitions", 0),
     }
 
 

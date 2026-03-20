@@ -109,6 +109,9 @@ where
 
     /// Topic manager reference
     topic_manager: SharedBrokerService,
+
+    /// Advertised broker service url returned from Lookup.
+    broker_service_url: String,
 }
 
 impl<T> ServerCnx<T>
@@ -124,6 +127,7 @@ where
         keep_alive_interval: Duration,
         handshake_timeout: Duration,
         connection_liveness_check_timeout: Duration,
+        broker_service_url: String,
     ) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
 
@@ -148,6 +152,7 @@ where
             next_consumer_id: 0,
             storage,
             topic_manager,
+            broker_service_url,
         }
     }
 
@@ -491,7 +496,9 @@ where
     }
 
     async fn handle_lookup(&mut self, cmd: BaseCommand) -> CnxResult<()> {
-        handler::handle_lookup(&mut self.framed, cmd).await.map_err(to_cnx_error)
+        handler::handle_lookup(&mut self.framed, cmd, &self.broker_service_url)
+            .await
+            .map_err(to_cnx_error)
     }
 
     async fn handle_producer(&mut self, cmd: BaseCommand) -> CnxResult<()> {
@@ -574,6 +581,7 @@ pub async fn handle_connection(
     keep_alive_interval: Duration,
     handshake_timeout: Duration,
     connection_liveness_check_timeout: Duration,
+    broker_service_url: String,
 ) -> CnxResult<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -587,6 +595,7 @@ pub async fn handle_connection(
         keep_alive_interval,
         handshake_timeout,
         connection_liveness_check_timeout,
+        broker_service_url,
     );
     server_cnx.run().await
 }
@@ -616,6 +625,7 @@ mod tests {
             Duration::from_secs(30),
             Duration::from_secs(30),
             Duration::from_secs(10),
+            "pulsar://127.0.0.1:6650".to_string(),
         );
         let client_framed = Framed::new(client, PulsarFrameCodec::new());
         (server_cnx, client_framed)

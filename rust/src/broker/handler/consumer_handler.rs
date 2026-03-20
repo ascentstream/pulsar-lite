@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use crate::broker::service::{Consumer, SharedStorage};
 use crate::broker::service::consumer::PendingMessage;
 use crate::broker::service::topic::SubscriptionType;
-use crate::broker::broker_service::SharedBrokerService;
+use crate::broker::broker_service::{SharedBrokerService, TopicRef};
 
 /// Handle Subscribe command (Apache Pulsar style)
 pub async fn handle_subscribe<T>(
@@ -52,7 +52,16 @@ where
     // Get or create subscription, then create Consumer (Apache Pulsar style)
     let consumer = {
         let mut broker = broker_service.write().await;
-        let topic = broker.get_or_create_topic(&subscribe_cmd.topic).await;
+        let topic = match broker.get_or_create_topic_auto(&subscribe_cmd.topic).await {
+            TopicRef::NonPartitioned(topic) | TopicRef::Partition(topic) => topic,
+            TopicRef::Partitioned(_) => {
+                return Err(format!(
+                    "Subscribe command must target a concrete topic or partition: {}",
+                    subscribe_cmd.topic
+                )
+                .into())
+            }
+        };
         let mut topic_guard = topic.write().await;
 
         // Get or create subscription - returns Arc<RwLock<Subscription>> (Apache Pulsar style)

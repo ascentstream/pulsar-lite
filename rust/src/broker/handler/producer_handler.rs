@@ -10,25 +10,34 @@ use crate::protocol::codec::{PulsarFrameCodec, PulsarFrame, proto::pulsar::BaseC
 use crate::protocol::ServerCommand;
 use tokio_util::codec::Framed;
 use crate::broker::service::Producer;
-use crate::broker::broker_service::SharedBrokerService;
+use crate::broker::broker_service::{SharedBrokerService, TopicRef};
 
 /// Handle Producer command
 pub async fn handle_producer<T>(
     framed: &mut Framed<T, PulsarFrameCodec>,
     cmd: BaseCommand,
     producers: &mut HashMap<u64, Arc<Producer>>,
-    next_producer_id: &mut u64,
+    _next_producer_id: &mut u64,
     topic_manager: SharedBrokerService,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let producer_cmd = cmd.producer.as_ref().ok_or("Missing producer command")?;
-    log::info!("Handling Producer command: topic={}, producer_name={:?}",
-        producer_cmd.topic, producer_cmd.producer_name);
+    let producer_id = producer_cmd.producer_id;
+    log::info!(
+        "Handling Producer command: topic={}, producer_id={}, request_id={}, producer_name={:?}",
+        producer_cmd.topic,
+        producer_id,
+        producer_cmd.request_id,
+        producer_cmd.producer_name
+    );
 
-    let producer_id = *next_producer_id;
-    *next_producer_id += 1;
+    if producers.contains_key(&producer_id) {
+        return Err(
+            format!("Producer {} already exists on this connection", producer_id).into(),
+        );
+    }
 
     let producer_name = producer_cmd.producer_name
         .clone()
@@ -37,7 +46,16 @@ where
     // Get or create topic (Apache Pulsar style)
     let topic = {
         let mut manager = topic_manager.write().await;
-        manager.get_or_create_topic(&producer_cmd.topic).await
+        match manager.get_or_create_topic_auto(&producer_cmd.topic).await {
+            TopicRef::NonPartitioned(topic) | TopicRef::Partition(topic) => topic,
+            TopicRef::Partitioned(_) => {
+                return Err(format!(
+                    "Producer command must target a concrete topic or partition: {}",
+                    producer_cmd.topic
+                )
+                .into())
+            }
+        }
     };
 
     // Create Producer object with Topic reference (Apache Pulsar style)
@@ -66,7 +84,11 @@ where
     };
 
     framed.send(response).await?;
-    log::info!("Sent ProducerSuccess for producer {}", producer_id);
+    log::info!(
+        "Sent ProducerSuccess for producer {} on request {}",
+        producer_id,
+        producer_cmd.request_id
+    );
 
     Ok(())
 }

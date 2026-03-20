@@ -73,6 +73,15 @@ impl BrokerService {
         log::info!("Set default partitions to {}", partitions);
     }
 
+    /// Restore persisted partition metadata at broker startup.
+    pub fn restore_partition_metadata(&mut self, partition_metadata: HashMap<String, usize>) {
+        self.partition_metadata.extend(partition_metadata);
+        log::info!(
+            "Restored {} partitioned topic metadata entries",
+            self.partition_metadata.len()
+        );
+    }
+
     // ==================== Non-Partitioned Topic Management ====================
 
     /// Get or create a non-partitioned topic by name
@@ -81,6 +90,15 @@ impl BrokerService {
     pub async fn get_or_create_topic(&mut self, topic_name: &str) -> SharedTopic {
         if !self.topics.contains_key(topic_name) {
             log::info!("Creating new topic: {}", topic_name);
+            {
+                let mut guard = self.storage.lock().await;
+                if let Err(error) = guard.ensure_topic_metadata(topic_name, false, 0) {
+                    log::warn!(
+                        "Skipping metadata persistence for topic '{}': {}",
+                        topic_name, error
+                    );
+                }
+            }
             let topic = Topic::new(topic_name.to_string(), self.storage.clone());
             self.topics.insert(topic_name.to_string(), Arc::new(RwLock::new(topic)));
         }
@@ -132,6 +150,15 @@ impl BrokerService {
                 "Creating new partitioned topic: {} with {} partitions",
                 topic_name, partition_count
             );
+            {
+                let mut guard = self.storage.lock().await;
+                if let Err(error) = guard.ensure_topic_metadata(topic_name, true, partition_count) {
+                    log::warn!(
+                        "Skipping metadata persistence for partitioned topic '{}': {}",
+                        topic_name, error
+                    );
+                }
+            }
             let partitioned_topic = PartitionedTopic::new(
                 topic_name.to_string(),
                 partition_count,
@@ -245,27 +272,21 @@ impl BrokerService {
     /// Get the base topic name from a partition name
     /// E.g., "my-topic-partition-0" -> "my-topic"
     pub fn get_base_topic_name(&self, partition_name: &str) -> Option<String> {
-        if let Some(idx) = partition_name.find("-partition-") {
-            Some(partition_name[..idx].to_string())
-        } else {
-            None
-        }
+        let (base_name, partition_index) = partition_name.rsplit_once("-partition-")?;
+        partition_index.parse::<usize>().ok()?;
+        Some(base_name.to_string())
     }
 
     /// Get partition index from partition name
     /// E.g., "my-topic-partition-0" -> 0
     pub fn get_partition_index(&self, partition_name: &str) -> Option<usize> {
-        if let Some(idx) = partition_name.find("-partition-") {
-            let index_str = &partition_name[idx + 11..]; // "-partition-" is 11 chars
-            index_str.parse::<usize>().ok()
-        } else {
-            None
-        }
+        let (_, partition_index) = partition_name.rsplit_once("-partition-")?;
+        partition_index.parse::<usize>().ok()
     }
 
     /// Check if a topic name is a partition name (e.g., "topic-partition-0")
     pub fn is_partition_name(&self, topic_name: &str) -> bool {
-        topic_name.contains("-partition-")
+        self.get_partition_index(topic_name).is_some()
     }
 
     // ==================== Statistics ====================
@@ -622,6 +643,9 @@ mod tests {
         // Test partition name detection
         assert!(manager.is_partition_name("my-topic-partition-0"));
         assert!(manager.is_partition_name("persistent://public/default/topic-partition-5"));
+        assert!(manager.is_partition_name(
+            "persistent://public/default/metadata-partition-sub-partition-2"
+        ));
         assert!(!manager.is_partition_name("my-topic"));
 
         // Test base topic name extraction
@@ -630,11 +654,23 @@ mod tests {
             manager.get_base_topic_name("persistent://public/default/topic-partition-5"),
             Some("persistent://public/default/topic".to_string())
         );
+        assert_eq!(
+            manager.get_base_topic_name(
+                "persistent://public/default/metadata-partition-sub-partition-2"
+            ),
+            Some("persistent://public/default/metadata-partition-sub".to_string())
+        );
         assert_eq!(manager.get_base_topic_name("my-topic"), None);
 
         // Test partition index extraction
         assert_eq!(manager.get_partition_index("my-topic-partition-0"), Some(0));
         assert_eq!(manager.get_partition_index("my-topic-partition-10"), Some(10));
+        assert_eq!(
+            manager.get_partition_index(
+                "persistent://public/default/metadata-partition-sub-partition-2"
+            ),
+            Some(2)
+        );
         assert_eq!(manager.get_partition_index("my-topic"), None);
     }
 
@@ -690,5 +726,35 @@ mod tests {
         assert_eq!(manager.get_partitioned_topic_count(), 1);
         assert!(manager.has_partitioned_topic("topic1"));
         assert!(!manager.has_partitioned_topic("topic2"));
+    }
+
+    #[tokio::test]
+    async fn persisted_partition_metadata_restores_partitioned_topic_shape() {
+        let storage = create_test_storage();
+        {
+            let mut guard = storage.lock().await;
+            guard
+                .ensure_topic_metadata("persistent://public/default/restored-topic", true, 3)
+                .unwrap();
+        }
+
+        let partition_metadata = {
+            let guard = storage.lock().await;
+            guard.get_partitioned_topic_metadata()
+        };
+
+        let mut manager = BrokerService::with_config(storage.clone(), 0);
+        manager.restore_partition_metadata(partition_metadata);
+
+        assert_eq!(
+            manager.get_partition_count("persistent://public/default/restored-topic"),
+            Some(3)
+        );
+        assert!(manager.should_be_partitioned("persistent://public/default/restored-topic"));
+
+        let topic = manager
+            .get_or_create_topic_auto("persistent://public/default/restored-topic")
+            .await;
+        assert!(matches!(topic, TopicRef::Partitioned(_)));
     }
 }

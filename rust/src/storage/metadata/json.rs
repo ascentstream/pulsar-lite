@@ -1,3 +1,4 @@
+use super::traits::MetadataBackend;
 use super::types::MetadataDocument;
 use anyhow::{anyhow, Result};
 use std::fs;
@@ -87,5 +88,19 @@ impl JsonFileMetadataStore {
             )
         })?;
         Ok(())
+    }
+}
+
+impl MetadataBackend for JsonFileMetadataStore {
+    fn metadata_path(&self) -> &Path {
+        JsonFileMetadataStore::metadata_path(self)
+    }
+
+    fn load_document(&self) -> Result<Option<MetadataDocument>> {
+        JsonFileMetadataStore::load_document(self)
+    }
+
+    fn save_document(&self, document: &MetadataDocument) -> Result<()> {
+        JsonFileMetadataStore::save_document(self, document)
     }
 }

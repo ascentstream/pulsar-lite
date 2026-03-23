@@ -1,4 +1,6 @@
 mod metadata;
+mod managed_ledger;
+mod resources;
 
 use anyhow::Result;
 use log::{debug, info, warn};
@@ -6,13 +8,22 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 pub use metadata::{
-    DomainNode, JsonFileMetadataStore, MetadataDocument, MetadataFileNode, MetadataStore,
-    NamespaceMetadata, NamespaceNode, ParsedTopicName, PartitionedTopicNode,
+    DomainNode, JsonFileMetadataStore, MetadataBackend, MetadataDocument, MetadataFileNode,
+    MetadataStore, NamespaceMetadata, NamespaceNode, ParsedTopicName, PartitionedTopicNode,
     SubscriptionMetadata, SubscriptionNode, TenantMetadata, TenantNode, TopicMetadata, TopicNode,
+};
+pub use managed_ledger::{
+    InMemoryManagedCursor, InMemoryManagedLedger, InMemoryManagedLedgerFactory,
+    InMemoryManagedLedgerStorage, ManagedCursor, ManagedCursorState, ManagedLedger,
+    ManagedLedgerConfig, ManagedLedgerFactory, ManagedLedgerPosition,
+};
+pub use resources::{
+    BaseResources, NamespaceResources, PulsarResources, TenantResources, TopicResources,
 };
 
 /// 消息 ID (ledger:entry:partition)
 /// partition 默认为 -1（非分区 topic）
+/// 未来归属 managed-ledger 风格的持久化消息状态主线。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct MessageId {
     pub ledger: u64,
@@ -22,6 +33,7 @@ pub struct MessageId {
 
 /// 订阅游标状态 (Shared 模式)
 /// 实现类似 Pulsar ManagedCursor 的 mark_delete + individual_deleted_messages 模型
+/// 未来归属 managed-ledger 风格的 cursor 状态主线。
 #[derive(Debug, Clone, Default)]
 pub struct SubscriptionCursor {
     /// 连续确认前沿 (mark_delete_position)
@@ -33,8 +45,12 @@ pub struct SubscriptionCursor {
 }
 
 /// 存储引擎（基于内存，MVP 版本）
+/// 当前仍是唯一真实实现入口，后续会逐步将运行时消息状态迁入
+/// managed-ledger 风格的持久化消息状态主线，将 broker 资源语义迁入
+/// `storage::resources`。
 #[derive(Debug)]
 pub struct Storage {
+    // 运行时消息状态，未来归属 managed-ledger 风格的持久化消息状态主线
     // 内存中的 Topic 消息队列
     topics: HashMap<String, Vec<(MessageId, Vec<u8>)>>,
     // 内存中的游标缓存（订阅位置）- 用于 Exclusive 模式
@@ -49,12 +65,12 @@ pub struct Storage {
     topic_ledger_ids: HashMap<String, u64>,
     // 全局 ledger ID 计数器，用于分配新的 ledger ID
     next_ledger_id: u64,
-    // 资源元数据持久化与恢复
-    metadata: MetadataStore,
+    // 资源语义入口，对齐 PulsarResources 的聚合形状
+    resources: PulsarResources,
 }
 
 impl Storage {
-    const METADATA_VERSION: u32 = 2;
+    pub(crate) const METADATA_VERSION: u32 = 2;
 
     fn is_shared_message_acknowledged(cursor: Option<&SubscriptionCursor>, entry: u64) -> bool {
         cursor
@@ -75,9 +91,17 @@ impl Storage {
             subscription_cursors: HashMap::new(),
             topic_ledger_ids: HashMap::new(),
             next_ledger_id: 0,
-            metadata: MetadataStore::new(path)?,
+            resources: PulsarResources::new(path)?,
         };
         Ok(storage)
+    }
+
+    pub fn resources(&self) -> &PulsarResources {
+        &self.resources
+    }
+
+    pub fn resources_mut(&mut self) -> &mut PulsarResources {
+        &mut self.resources
     }
 
     /// 创建 Topic
@@ -124,7 +148,10 @@ impl Storage {
 
     /// 订阅 Topic
     pub fn subscribe(&mut self, topic: &str, subscription: &str) -> Result<()> {
-        if let Err(error) = self.ensure_subscription_metadata(topic, subscription) {
+        if let Err(error) = self
+            .resources_mut()
+            .ensure_subscription(topic, subscription, Self::METADATA_VERSION)
+        {
             warn!(
                 "Skipping metadata persistence for subscription '{}' on topic '{}': {}",
                 subscription, topic, error
@@ -446,15 +473,27 @@ mod tests {
         let mut storage = Storage::new(&db_path).unwrap();
 
         let topic = "persistent://public/default/test";
-        storage.ensure_topic_metadata(topic, true, 3).unwrap();
-        storage.ensure_topic_metadata(topic, true, 3).unwrap();
-        storage.ensure_subscription_metadata(topic, "sub").unwrap();
-        storage.ensure_subscription_metadata(topic, "sub").unwrap();
+        storage
+            .resources_mut()
+            .ensure_topic(topic, true, 3, Storage::METADATA_VERSION)
+            .unwrap();
+        storage
+            .resources_mut()
+            .ensure_topic(topic, true, 3, Storage::METADATA_VERSION)
+            .unwrap();
+        storage
+            .resources_mut()
+            .ensure_subscription(topic, "sub", Storage::METADATA_VERSION)
+            .unwrap();
+        storage
+            .resources_mut()
+            .ensure_subscription(topic, "sub", Storage::METADATA_VERSION)
+            .unwrap();
 
-        assert!(storage.has_tenant_metadata("public"));
-        assert!(storage.has_namespace_metadata("public", "default"));
-        assert!(storage.has_subscription_metadata(topic, "sub"));
-        let metadata = storage.get_topic_metadata(topic).unwrap();
+        assert!(storage.resources().has_tenant("public"));
+        assert!(storage.resources().has_namespace("public", "default"));
+        assert!(storage.resources().has_subscription(topic, "sub"));
+        let metadata = storage.resources().get_topic_metadata(topic).unwrap();
         assert!(metadata.partitioned);
         assert_eq!(metadata.partition_count, 3);
 
@@ -470,10 +509,10 @@ mod tests {
         );
 
         let reloaded = Storage::new(&db_path).unwrap();
-        let metadata = reloaded.get_topic_metadata(topic).unwrap();
+        let metadata = reloaded.resources().get_topic_metadata(topic).unwrap();
         assert!(metadata.partitioned);
         assert_eq!(metadata.partition_count, 3);
-        assert!(reloaded.has_subscription_metadata(topic, "sub"));
+        assert!(reloaded.resources().has_subscription(topic, "sub"));
     }
 
     #[test]
@@ -484,18 +523,23 @@ mod tests {
 
         let base_topic = "persistent://public/default/test";
         let partition_topic = "persistent://public/default/test-partition-0";
-        storage.ensure_topic_metadata(base_topic, true, 3).unwrap();
         storage
-            .ensure_topic_metadata(partition_topic, false, 0)
+            .resources_mut()
+            .ensure_topic(base_topic, true, 3, Storage::METADATA_VERSION)
             .unwrap();
         storage
-            .ensure_subscription_metadata(partition_topic, "sub")
+            .resources_mut()
+            .ensure_topic(partition_topic, false, 0, Storage::METADATA_VERSION)
+            .unwrap();
+        storage
+            .resources_mut()
+            .ensure_subscription(partition_topic, "sub", Storage::METADATA_VERSION)
             .unwrap();
 
-        assert!(storage.get_topic_metadata(base_topic).is_some());
-        assert!(storage.get_topic_metadata(partition_topic).is_some());
-        assert!(!storage.has_subscription_metadata(base_topic, "sub"));
-        assert!(storage.has_subscription_metadata(partition_topic, "sub"));
+        assert!(storage.resources().get_topic_metadata(base_topic).is_some());
+        assert!(storage.resources().get_topic_metadata(partition_topic).is_some());
+        assert!(!storage.resources().has_subscription(base_topic, "sub"));
+        assert!(storage.resources().has_subscription(partition_topic, "sub"));
 
         let document = storage.build_metadata_document();
         let path_key = storage.metadata_path().display().to_string();

@@ -92,7 +92,10 @@ impl BrokerService {
             log::info!("Creating new topic: {}", topic_name);
             {
                 let mut guard = self.storage.lock().await;
-                if let Err(error) = guard.ensure_topic_metadata(topic_name, false, 0) {
+                if let Err(error) = guard
+                    .resources_mut()
+                    .ensure_topic(topic_name, false, 0, Storage::METADATA_VERSION)
+                {
                     log::warn!(
                         "Skipping metadata persistence for topic '{}': {}",
                         topic_name, error
@@ -152,7 +155,12 @@ impl BrokerService {
             );
             {
                 let mut guard = self.storage.lock().await;
-                if let Err(error) = guard.ensure_topic_metadata(topic_name, true, partition_count) {
+                if let Err(error) = guard.resources_mut().ensure_topic(
+                    topic_name,
+                    true,
+                    partition_count,
+                    Storage::METADATA_VERSION,
+                ) {
                     log::warn!(
                         "Skipping metadata persistence for partitioned topic '{}': {}",
                         topic_name, error
@@ -734,13 +742,19 @@ mod tests {
         {
             let mut guard = storage.lock().await;
             guard
-                .ensure_topic_metadata("persistent://public/default/restored-topic", true, 3)
+                .resources_mut()
+                .ensure_topic(
+                    "persistent://public/default/restored-topic",
+                    true,
+                    3,
+                    Storage::METADATA_VERSION,
+                )
                 .unwrap();
         }
 
         let partition_metadata = {
             let guard = storage.lock().await;
-            guard.get_partitioned_topic_metadata()
+            guard.resources().get_partitioned_topic_metadata()
         };
 
         let mut manager = BrokerService::with_config(storage.clone(), 0);

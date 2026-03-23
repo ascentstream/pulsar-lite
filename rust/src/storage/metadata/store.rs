@@ -252,14 +252,14 @@ impl MetadataStore {
         Ok(())
     }
 
-    fn persist(&self, version: u32) -> Result<()> {
+    pub(crate) fn persist_document(&self, version: u32) -> Result<()> {
         let document = self.build_metadata_document(version);
         self.backend.save_document(&document)
     }
 
-    pub fn ensure_tenant(&mut self, tenant: &str, version: u32) -> Result<()> {
+    pub(crate) fn insert_tenant_metadata(&mut self, tenant: &str) -> bool {
         if self.tenants.contains_key(tenant) {
-            return Ok(());
+            return false;
         }
 
         self.tenants.insert(
@@ -268,15 +268,13 @@ impl MetadataStore {
                 name: tenant.to_string(),
             },
         );
-        self.persist(version)
+        true
     }
 
-    pub fn ensure_namespace(&mut self, tenant: &str, namespace: &str, version: u32) -> Result<()> {
-        self.ensure_tenant(tenant, version)?;
-
+    pub(crate) fn insert_namespace_metadata(&mut self, tenant: &str, namespace: &str) -> bool {
         let key = namespace_key(tenant, namespace);
         if self.namespaces.contains_key(&key) {
-            return Ok(());
+            return false;
         }
 
         self.namespaces.insert(
@@ -286,36 +284,19 @@ impl MetadataStore {
                 name: namespace.to_string(),
             },
         );
-        self.persist(version)
+        true
     }
 
-    pub fn ensure_topic_metadata(
-        &mut self,
-        topic: &str,
-        partitioned: bool,
-        partition_count: usize,
-        version: u32,
-    ) -> Result<()> {
-        let parsed = parse_topic_name(topic)?;
-        self.ensure_namespace(&parsed.tenant, &parsed.namespace, version)?;
-
-        let key = topic.to_string();
+    pub(crate) fn upsert_topic_metadata(&mut self, metadata: TopicMetadata) -> bool {
+        let key = metadata.full_name.clone();
         let mut changed = false;
-        let entry = self.topics_meta.entry(key.clone()).or_insert_with(|| {
+        let entry = self.topics_meta.entry(key).or_insert_with(|| {
             changed = true;
-            TopicMetadata {
-                full_name: key.clone(),
-                domain: parsed.domain.clone(),
-                tenant: parsed.tenant.clone(),
-                namespace: parsed.namespace.clone(),
-                local_name: parsed.local_name.clone(),
-                partitioned,
-                partition_count: if partitioned { partition_count } else { 0 },
-            }
+            metadata.clone()
         });
 
-        if partitioned {
-            let desired_partition_count = partition_count.max(1);
+        if metadata.partitioned {
+            let desired_partition_count = metadata.partition_count.max(1);
             if !entry.partitioned || entry.partition_count != desired_partition_count {
                 entry.partitioned = true;
                 entry.partition_count = desired_partition_count;
@@ -326,24 +307,13 @@ impl MetadataStore {
             changed = true;
         }
 
-        if changed {
-            self.persist(version)?;
-        }
-
-        Ok(())
+        changed
     }
 
-    pub fn ensure_subscription_metadata(
-        &mut self,
-        topic: &str,
-        subscription: &str,
-        version: u32,
-    ) -> Result<()> {
-        self.ensure_topic_metadata(topic, false, 0, version)?;
-
+    pub(crate) fn insert_subscription_metadata(&mut self, topic: &str, subscription: &str) -> bool {
         let key = subscription_key(topic, subscription);
         if self.subscriptions_meta.contains_key(&key) {
-            return Ok(());
+            return false;
         }
 
         self.subscriptions_meta.insert(
@@ -353,10 +323,10 @@ impl MetadataStore {
                 name: subscription.to_string(),
             },
         );
-        self.persist(version)
+        true
     }
 
-    pub fn get_partitioned_topic_metadata(&self) -> HashMap<String, usize> {
+    pub(crate) fn get_partitioned_topic_metadata(&self) -> HashMap<String, usize> {
         self.topics_meta
             .iter()
             .filter_map(|(topic, metadata)| {
@@ -367,19 +337,19 @@ impl MetadataStore {
             .collect()
     }
 
-    pub fn has_tenant_metadata(&self, tenant: &str) -> bool {
+    pub(crate) fn has_tenant_metadata(&self, tenant: &str) -> bool {
         self.tenants.contains_key(tenant)
     }
 
-    pub fn has_namespace_metadata(&self, tenant: &str, namespace: &str) -> bool {
+    pub(crate) fn has_namespace_metadata(&self, tenant: &str, namespace: &str) -> bool {
         self.namespaces.contains_key(&namespace_key(tenant, namespace))
     }
 
-    pub fn get_topic_metadata(&self, topic: &str) -> Option<&TopicMetadata> {
+    pub(crate) fn get_topic_metadata(&self, topic: &str) -> Option<&TopicMetadata> {
         self.topics_meta.get(topic)
     }
 
-    pub fn has_subscription_metadata(&self, topic: &str, subscription: &str) -> bool {
+    pub(crate) fn has_subscription_metadata(&self, topic: &str, subscription: &str) -> bool {
         self.subscriptions_meta
             .contains_key(&subscription_key(topic, subscription))
     }

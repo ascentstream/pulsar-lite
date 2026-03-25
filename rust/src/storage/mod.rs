@@ -1,21 +1,21 @@
-mod metadata;
 mod managed_ledger;
+mod metadata;
 mod resources;
 
 use anyhow::Result;
 use log::{debug, info, warn};
 use std::path::Path;
 
-pub use metadata::{
-    DomainNode, JsonFileMetadataStore, MetadataBackend, MetadataDocument, MetadataFileNode,
-    MetadataStore, NamespaceMetadata, NamespaceNode, ParsedTopicName, PartitionedTopicNode,
-    SubscriptionMetadata, SubscriptionNode, TenantMetadata, TenantNode, TopicMetadata, TopicNode,
-};
 pub use managed_ledger::{
     AssignmentStore, InMemoryManagedCursor, InMemoryManagedLedger, InMemoryManagedLedgerFactory,
     InMemoryManagedLedgerStorage, ManagedCursor, ManagedCursorState, ManagedLedger,
     ManagedLedgerConfig, ManagedLedgerFactory, ManagedLedgerPosition, ManagedLedgerStorage,
     MessageId, SubscriptionCursor,
+};
+pub use metadata::{
+    DomainNode, JsonFileMetadataStore, MetadataBackend, MetadataDocument, MetadataFileNode,
+    MetadataStore, NamespaceMetadata, NamespaceNode, ParsedTopicName, PartitionedTopicNode,
+    SubscriptionMetadata, SubscriptionNode, TenantMetadata, TenantNode, TopicMetadata, TopicNode,
 };
 pub use resources::{
     BaseResources, NamespaceResources, PulsarResources, TenantResources, TopicResources,
@@ -60,7 +60,12 @@ impl Storage {
     }
 
     /// 追加消息（严格按照 Pulsar 协议）
-    pub fn append_message(&mut self, topic: &str, partition: i32, data: &[u8]) -> Result<MessageId> {
+    pub fn append_message(
+        &mut self,
+        topic: &str,
+        partition: i32,
+        data: &[u8],
+    ) -> Result<MessageId> {
         let message_id = self.managed_ledger.append_message(topic, partition, data)?;
         debug!(
             "Message appended to {}: ledger={}, entry={}, partition={}",
@@ -71,9 +76,9 @@ impl Storage {
 
     /// 订阅 Topic
     pub fn subscribe(&mut self, topic: &str, subscription: &str) -> Result<()> {
-        if let Err(error) = self
-            .resources_mut()
-            .ensure_subscription(topic, subscription, Self::METADATA_VERSION)
+        if let Err(error) =
+            self.resources_mut()
+                .ensure_subscription(topic, subscription, Self::METADATA_VERSION)
         {
             warn!(
                 "Skipping metadata persistence for subscription '{}' on topic '{}': {}",
@@ -83,7 +88,10 @@ impl Storage {
 
         let key = format!("{}:{}", topic, subscription);
         if self.managed_ledger.subscribe(topic, subscription).is_ok() {
-            info!("Subscribed to topic {} with subscription {}", topic, subscription);
+            info!(
+                "Subscribed to topic {} with subscription {}",
+                topic, subscription
+            );
         } else {
             info!("Subscription {} already exists for topic {}", key, topic);
         }
@@ -104,7 +112,12 @@ impl Storage {
     }
 
     /// 确认消息
-    pub fn ack_message(&mut self, topic: &str, subscription: &str, message_id: MessageId) -> Result<()> {
+    pub fn ack_message(
+        &mut self,
+        topic: &str,
+        subscription: &str,
+        message_id: MessageId,
+    ) -> Result<()> {
         info!(
             "Message acknowledged for topic {} subscription {}: ledger={}, entry={}",
             topic, subscription, message_id.ledger, message_id.entry
@@ -125,7 +138,12 @@ impl Storage {
     /// 1. 如果消息在前沿之后，加入 acked_holes
     /// 2. 检查是否可以推进前沿（从 mark_delete + 1 开始的连续区间）
     /// 3. 清除分配状态
-    pub fn ack_message_shared(&mut self, topic: &str, subscription: &str, message_id: MessageId) -> Result<()> {
+    pub fn ack_message_shared(
+        &mut self,
+        topic: &str,
+        subscription: &str,
+        message_id: MessageId,
+    ) -> Result<()> {
         self.managed_ledger
             .ack_message_shared(topic, subscription, message_id)
     }
@@ -160,12 +178,21 @@ impl Storage {
     }
 
     /// 按完整 MessageId 获取消息（用于重投递）
-    pub fn get_message_by_id(&self, topic: &str, message_id: &MessageId) -> Option<(MessageId, Vec<u8>)> {
+    pub fn get_message_by_id(
+        &self,
+        topic: &str,
+        message_id: &MessageId,
+    ) -> Option<(MessageId, Vec<u8>)> {
         self.managed_ledger.get_message_by_id(topic, message_id)
     }
 
     /// 判断 Shared 模式下消息是否已经确认
-    pub fn is_acknowledged_shared(&self, topic: &str, subscription: &str, message_id: &MessageId) -> bool {
+    pub fn is_acknowledged_shared(
+        &self,
+        topic: &str,
+        subscription: &str,
+        message_id: &MessageId,
+    ) -> bool {
         self.managed_ledger
             .is_acknowledged_shared(topic, subscription, message_id)
     }
@@ -177,7 +204,12 @@ impl Storage {
     }
 
     /// 获取消息分配的 consumer_id
-    pub fn get_assignment_owner(&self, topic: &str, subscription: &str, message_id: &MessageId) -> Option<u64> {
+    pub fn get_assignment_owner(
+        &self,
+        topic: &str,
+        subscription: &str,
+        message_id: &MessageId,
+    ) -> Option<u64> {
         self.managed_ledger
             .get_assignment_owner(topic, subscription, message_id)
     }
@@ -187,8 +219,8 @@ impl Storage {
 mod tests {
     use super::*;
     use std::fs;
-    use tempfile::tempdir;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::tempdir;
 
     fn create_storage() -> Storage {
         let unique = SystemTime::now()
@@ -212,11 +244,15 @@ mod tests {
         let msg1 = storage.append_message(topic, -1, b"1").unwrap();
         let msg2 = storage.append_message(topic, -1, b"2").unwrap();
 
-        storage.ack_message_shared(topic, sub, msg2.clone()).unwrap();
+        storage
+            .ack_message_shared(topic, sub, msg2.clone())
+            .unwrap();
         assert_eq!(storage.get_mark_delete_position(topic, sub), None);
         assert!(storage.is_acknowledged_shared(topic, sub, &msg2));
 
-        storage.ack_message_shared(topic, sub, msg1.clone()).unwrap();
+        storage
+            .ack_message_shared(topic, sub, msg1.clone())
+            .unwrap();
         assert_eq!(storage.get_mark_delete_position(topic, sub), None);
         assert!(storage.is_acknowledged_shared(topic, sub, &msg1));
 
@@ -236,11 +272,20 @@ mod tests {
             storage.append_message(topic, -1, &[i]).unwrap();
         }
 
-        let msg5 = MessageId { ledger: 0, entry: 5, partition: -1 };
-        storage.ack_message_shared(topic, sub, msg5.clone()).unwrap();
+        let msg5 = MessageId {
+            ledger: 0,
+            entry: 5,
+            partition: -1,
+        };
+        storage
+            .ack_message_shared(topic, sub, msg5.clone())
+            .unwrap();
 
         assert_eq!(storage.get_mark_delete_position(topic, sub), None);
-        let next = storage.get_next_unassigned_message(topic, sub, 1).unwrap().unwrap();
+        let next = storage
+            .get_next_unassigned_message(topic, sub, 1)
+            .unwrap()
+            .unwrap();
         assert_eq!(next.0.entry, 0);
         assert!(storage.is_acknowledged_shared(topic, sub, &msg5));
     }
@@ -294,7 +339,8 @@ mod tests {
 
         let document = storage.build_metadata_document();
         let path_key = storage.metadata_path().display().to_string();
-        let topic_node = &document.resource_files[&path_key].tenants["public"].namespaces["default"]
+        let topic_node = &document.resource_files[&path_key].tenants["public"].namespaces
+            ["default"]
             .domains["persistent"]
             .topics["test"];
         assert!(topic_node.subscriptions.contains_key("sub"));
@@ -332,7 +378,10 @@ mod tests {
             .unwrap();
 
         assert!(storage.resources().get_topic_metadata(base_topic).is_some());
-        assert!(storage.resources().get_topic_metadata(partition_topic).is_some());
+        assert!(storage
+            .resources()
+            .get_topic_metadata(partition_topic)
+            .is_some());
         assert!(!storage.resources().has_subscription(base_topic, "sub"));
         assert!(storage.resources().has_subscription(partition_topic, "sub"));
 

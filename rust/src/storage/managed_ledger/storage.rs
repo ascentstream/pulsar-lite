@@ -17,7 +17,8 @@ pub trait ManagedLedgerStorage: Send + Sync {
         consumer_id: u64,
     ) -> Result<Option<(MessageId, Vec<u8>)>>;
 
-    fn ack_message(&mut self, topic: &str, subscription: &str, message_id: MessageId) -> Result<()>;
+    fn ack_message(&mut self, topic: &str, subscription: &str, message_id: MessageId)
+        -> Result<()>;
 
     fn ack_message_shared(
         &mut self,
@@ -26,32 +27,20 @@ pub trait ManagedLedgerStorage: Send + Sync {
         message_id: MessageId,
     ) -> Result<()>;
 
-    fn assign_message(
-        &mut self,
+    fn get_message_by_id(
+        &self,
         topic: &str,
-        subscription: &str,
         message_id: &MessageId,
-        consumer_id: u64,
-    );
+    ) -> Option<(MessageId, Vec<u8>)>;
 
-    fn release_assignment(
-        &mut self,
-        topic: &str,
-        subscription: &str,
-        message_id: &MessageId,
-        owner_consumer_id: u64,
-    ) -> bool;
+    fn get_messages(&self, topic: &str) -> Vec<(MessageId, Vec<u8>)>;
 
-    fn get_message_by_id(&self, topic: &str, message_id: &MessageId) -> Option<(MessageId, Vec<u8>)>;
-
-    fn is_acknowledged_shared(&self, topic: &str, subscription: &str, message_id: &MessageId) -> bool;
-
-    fn get_mark_delete_position(&self, topic: &str, subscription: &str) -> Option<u64>;
-
-    fn get_assignment_owner(
+    fn is_acknowledged_shared(
         &self,
         topic: &str,
         subscription: &str,
         message_id: &MessageId,
-    ) -> Option<u64>;
+    ) -> bool;
+
+    fn get_mark_delete_position(&self, topic: &str, subscription: &str) -> Option<u64>;
 }

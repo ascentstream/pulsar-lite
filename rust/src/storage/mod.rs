@@ -7,7 +7,7 @@ use log::{debug, info, warn};
 use std::path::Path;
 
 pub use managed_ledger::{
-    AssignmentStore, InMemoryManagedCursor, InMemoryManagedLedger, InMemoryManagedLedgerFactory,
+    InMemoryManagedCursor, InMemoryManagedLedger, InMemoryManagedLedgerFactory,
     InMemoryManagedLedgerStorage, ManagedCursor, ManagedCursorState, ManagedLedger,
     ManagedLedgerConfig, ManagedLedgerFactory, ManagedLedgerPosition, ManagedLedgerStorage,
     MessageId, SubscriptionCursor,
@@ -21,22 +21,22 @@ pub use resources::{
     BaseResources, NamespaceResources, PulsarResources, TenantResources, TopicResources,
 };
 
-/// 存储引擎（基于内存，MVP 版本）
-/// 当前仍是唯一真实实现入口，后续会逐步将运行时消息状态迁入
-/// managed-ledger 风格的持久化消息状态主线，将 broker 资源语义迁入
-/// `storage::resources`。
+/// In-memory storage engine used by the current MVP runtime.
+/// This is still the only concrete storage entry point today. Runtime message
+/// state will continue moving into the managed-ledger-style path, while broker
+/// resource semantics live under `storage::resources`.
 #[derive(Debug)]
 pub struct Storage {
-    // 资源语义入口，对齐 PulsarResources 的聚合形状
+    // Aggregated broker resource access aligned with PulsarResources.
     resources: PulsarResources,
-    // 内存版 managed-ledger 风格消息状态主线
+    // In-memory managed-ledger-style message state.
     managed_ledger: InMemoryManagedLedgerStorage,
 }
 
 impl Storage {
     pub(crate) const METADATA_VERSION: u32 = 2;
 
-    /// 创建存储
+    /// Create a new storage instance.
     pub fn new(path: &Path) -> Result<Self> {
         info!("In-memory storage initialized (MVP version)");
         let storage = Self {
@@ -54,12 +54,12 @@ impl Storage {
         &mut self.resources
     }
 
-    /// 创建 Topic
+    /// Create a topic.
     pub fn create_topic(&mut self, name: &str) -> Result<()> {
         self.managed_ledger.create_topic(name)
     }
 
-    /// 追加消息（严格按照 Pulsar 协议）
+    /// Append a message using the current Pulsar-compatible message id layout.
     pub fn append_message(
         &mut self,
         topic: &str,
@@ -74,7 +74,7 @@ impl Storage {
         Ok(message_id)
     }
 
-    /// 订阅 Topic
+    /// Create or reuse a subscription for a topic.
     pub fn subscribe(&mut self, topic: &str, subscription: &str) -> Result<()> {
         if let Err(error) =
             self.resources_mut()
@@ -99,8 +99,7 @@ impl Storage {
         Ok(())
     }
 
-    /// 获取下一条未分配的消息（用于 Shared 模式）
-    /// 返回消息和消息分配键
+    /// Return the next deliverable message for the current in-memory flow.
     pub fn get_next_unassigned_message(
         &mut self,
         topic: &str,
@@ -111,7 +110,7 @@ impl Storage {
             .get_next_unassigned_message(topic, subscription, consumer_id)
     }
 
-    /// 确认消息
+    /// Acknowledge a message under cumulative-style cursor semantics.
     pub fn ack_message(
         &mut self,
         topic: &str,
@@ -126,18 +125,18 @@ impl Storage {
             .ack_message(topic, subscription, message_id)
     }
 
-    // ==================== Shared 模式 Ack 前沿模型 ====================
+    // ==================== Shared Ack Frontier ====================
 
-    /// Shared 模式确认消息
+    /// Acknowledge a message under Shared subscription semantics.
     ///
-    /// 使用 mark_delete + acked_holes 模型：
-    /// - mark_delete: 连续确认前沿
-    /// - acked_holes: 前沿之后已确认但非连续的洞位
+    /// The current in-memory frontier uses a `mark_delete + acked_holes` model:
+    /// - `mark_delete`: current contiguous acknowledged frontier
+    /// - `acked_holes`: acknowledged entries beyond the frontier that are not
+    ///   yet part of a contiguous range
     ///
-    /// 当消息被 ack 时：
-    /// 1. 如果消息在前沿之后，加入 acked_holes
-    /// 2. 检查是否可以推进前沿（从 mark_delete + 1 开始的连续区间）
-    /// 3. 清除分配状态
+    /// When an entry is acknowledged:
+    /// 1. Non-contiguous entries are recorded in `acked_holes`
+    /// 2. The frontier advances once the next contiguous range is complete
     pub fn ack_message_shared(
         &mut self,
         topic: &str,
@@ -148,36 +147,7 @@ impl Storage {
             .ack_message_shared(topic, subscription, message_id)
     }
 
-    /// 显式建立消息 assignment
-    pub fn assign_message(
-        &mut self,
-        topic: &str,
-        subscription: &str,
-        message_id: &MessageId,
-        consumer_id: u64,
-    ) {
-        self.managed_ledger
-            .assign_message(topic, subscription, message_id, consumer_id);
-    }
-
-    /// 释放消息分配状态（带 owner 校验）
-    ///
-    /// 当 Consumer 断开时，释放其持有的消息分配状态
-    /// 如果 consumer_id 不匹配，不会释放（防止误删）
-    ///
-    /// 返回是否成功释放
-    pub fn release_assignment(
-        &mut self,
-        topic: &str,
-        subscription: &str,
-        message_id: &MessageId,
-        owner_consumer_id: u64,
-    ) -> bool {
-        self.managed_ledger
-            .release_assignment(topic, subscription, message_id, owner_consumer_id)
-    }
-
-    /// 按完整 MessageId 获取消息（用于重投递）
+    /// Look up a message by its full `MessageId`.
     pub fn get_message_by_id(
         &self,
         topic: &str,
@@ -186,7 +156,12 @@ impl Storage {
         self.managed_ledger.get_message_by_id(topic, message_id)
     }
 
-    /// 判断 Shared 模式下消息是否已经确认
+    /// Return the current in-memory message list for a topic.
+    pub fn get_messages(&self, topic: &str) -> Vec<(MessageId, Vec<u8>)> {
+        self.managed_ledger.get_messages(topic)
+    }
+
+    /// Check whether a message is already covered by the Shared ack frontier.
     pub fn is_acknowledged_shared(
         &self,
         topic: &str,
@@ -197,21 +172,10 @@ impl Storage {
             .is_acknowledged_shared(topic, subscription, message_id)
     }
 
-    /// 获取订阅的 mark_delete 位置
+    /// Return the current Shared `mark_delete` frontier for a subscription.
     pub fn get_mark_delete_position(&self, topic: &str, subscription: &str) -> Option<u64> {
         self.managed_ledger
             .get_mark_delete_position(topic, subscription)
-    }
-
-    /// 获取消息分配的 consumer_id
-    pub fn get_assignment_owner(
-        &self,
-        topic: &str,
-        subscription: &str,
-        message_id: &MessageId,
-    ) -> Option<u64> {
-        self.managed_ledger
-            .get_assignment_owner(topic, subscription, message_id)
     }
 }
 

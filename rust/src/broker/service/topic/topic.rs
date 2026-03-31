@@ -3,14 +3,26 @@
  * Manages producers and subscriptions for a specific topic
  */
 
+use bytes::Bytes;
+use crate::broker::non_persistent::NonPersistentTopicRuntime;
+use crate::broker::service::{Consumer, SharedStorage, Producer};
+use crate::storage::{NonPersistentEntry, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use crate::broker::service::{Consumer, SharedStorage, Producer};
-use super::{Subscription, SubscriptionStats, SubscriptionType};
+use super::{
+    KeySharedPolicy, Subscription, SubscriptionRuntimeMode, SubscriptionStats, SubscriptionType,
+};
 
 /// Type alias for shared subscription
 pub type SharedSubscription = Arc<RwLock<Subscription>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TopicRuntimeMode {
+    #[default]
+    PersistentStyle,
+    NonPersistent,
+}
 
 /// Topic represents a single topic in the messaging system
 /// It manages all producers and subscriptions associated with this topic
@@ -24,11 +36,22 @@ pub struct Topic {
     producers: HashMap<u64, Arc<Producer>>,
     /// Subscriptions for this topic (Apache Pulsar style - wrapped in Arc<RwLock>)
     subscriptions: HashMap<String, SharedSubscription>,
+    /// Internal topic runtime mode.
+    runtime_mode: TopicRuntimeMode,
+    /// Dedicated non-persistent topic runtime state.
+    non_persistent_runtime: Option<NonPersistentTopicRuntime>,
     /// Storage backend
     storage: SharedStorage,
 }
 
 impl Topic {
+    fn runtime_mode_from_topic_name(name: &str) -> TopicRuntimeMode {
+        match Storage::parse_topic_name(name) {
+            Ok(parsed) if parsed.domain == "non-persistent" => TopicRuntimeMode::NonPersistent,
+            _ => TopicRuntimeMode::PersistentStyle,
+        }
+    }
+
     /// Create a new topic
     ///
     /// The partition ID is automatically extracted from the topic name.
@@ -38,15 +61,44 @@ impl Topic {
         // Extract partition ID from topic name (Apache Pulsar style)
         // Format: "persistent://public/default/topic-partition-0" -> partition=0
         let partition = Self::extract_partition_from_name(&name);
+        let runtime_mode = Self::runtime_mode_from_topic_name(&name);
 
-        log::info!("Creating new topic: {} (partition={})", name, partition);
+        log::info!(
+            "Creating new topic: {} (partition={}, runtime_mode={:?})",
+            name,
+            partition,
+            runtime_mode
+        );
         Self {
             name,
             partition,
             producers: HashMap::new(),
             subscriptions: HashMap::new(),
+            runtime_mode,
+            non_persistent_runtime: None,
             storage,
         }
+    }
+
+    pub fn runtime_mode(&self) -> TopicRuntimeMode {
+        self.runtime_mode
+    }
+
+    pub fn set_runtime_mode(&mut self, mode: TopicRuntimeMode) {
+        self.runtime_mode = mode;
+    }
+
+    fn reuse_or_create_non_persistent_runtime(&mut self) {
+        if self.non_persistent_runtime.is_none() {
+            self.non_persistent_runtime = Some(NonPersistentTopicRuntime::new());
+        }
+    }
+
+    pub fn non_persistent_pending_message_count(&self) -> usize {
+        self.non_persistent_runtime
+            .as_ref()
+            .map(|runtime| runtime.pending_message_count())
+            .unwrap_or(0)
     }
 
     /// Extract partition ID from topic name
@@ -126,20 +178,43 @@ impl Topic {
         subscription_name: &str,
         sub_type: SubscriptionType,
     ) -> Result<SharedSubscription, String> {
+        self.get_or_create_subscription_with_options(
+            subscription_name,
+            sub_type,
+            HashMap::new(),
+            None,
+        )
+        .await
+    }
+
+    pub async fn get_or_create_subscription_with_options(
+        &mut self,
+        subscription_name: &str,
+        sub_type: SubscriptionType,
+        properties: HashMap<String, String>,
+        key_shared_policy: Option<KeySharedPolicy>,
+    ) -> Result<SharedSubscription, String> {
         if !self.subscriptions.contains_key(subscription_name) {
-            // Create subscription in storage
-            {
-                let mut guard = self.storage.lock().await;
-                if let Err(e) = guard.subscribe(&self.name, subscription_name) {
-                    return Err(format!("Failed to create subscription in storage: {}", e));
+            if self.runtime_mode == TopicRuntimeMode::PersistentStyle {
+                {
+                    let mut guard = self.storage.lock().await;
+                    if let Err(e) = guard.subscribe(&self.name, subscription_name) {
+                        return Err(format!("Failed to create subscription in storage: {}", e));
+                    }
                 }
             }
 
             // Create Subscription object wrapped in Arc<RwLock>
-            let subscription = Arc::new(RwLock::new(Subscription::new(
+            let subscription = Arc::new(RwLock::new(Subscription::new_with_options(
                 subscription_name.to_string(),
                 self.name.clone(),
                 sub_type,
+                match self.runtime_mode {
+                    TopicRuntimeMode::PersistentStyle => SubscriptionRuntimeMode::PersistentStyle,
+                    TopicRuntimeMode::NonPersistent => SubscriptionRuntimeMode::NonPersistent,
+                },
+                properties,
+                key_shared_policy,
                 self.storage.clone(),
             )));
             self.subscriptions.insert(subscription_name.to_string(), subscription.clone());
@@ -208,18 +283,42 @@ impl Topic {
     // ==================== Message Publishing ====================
 
     /// Publish a message to this topic
-    /// This method stores the message in the storage backend.
-    /// Call dispatch_to_subscriptions() after this to push to consumers.
+    /// Persistent-style topics store into the managed-ledger-like backend.
+    /// Non-persistent topics append only to runtime memory and avoid storage.
     pub async fn publish_message(
         &mut self,
+        metadata: Option<&[u8]>,
         payload: &[u8],
     ) -> Result<crate::storage::MessageId, Box<dyn std::error::Error>> {
-        log::debug!("Publishing message to topic '{}' partition '{}' ({} bytes)", self.name, self.partition, payload.len());
+        log::debug!(
+            "Publishing message to topic '{}' partition '{}' (metadata={} bytes, payload={} bytes)",
+            self.name,
+            self.partition,
+            metadata.map(|value| value.len()).unwrap_or(0),
+            payload.len()
+        );
 
-        // Store message in storage backend with partition info
-        let message_id = {
-            let mut guard = self.storage.lock().await;
-            guard.append_message(&self.name, self.partition, payload)?
+        let message_id = match self.runtime_mode {
+            TopicRuntimeMode::PersistentStyle => {
+                let mut guard = self.storage.lock().await;
+                guard.append_message(&self.name, self.partition, payload)?
+            }
+            TopicRuntimeMode::NonPersistent => {
+                self.reuse_or_create_non_persistent_runtime();
+                let entry = NonPersistentEntry::create(
+                    0,
+                    0,
+                    self.partition,
+                    Bytes::copy_from_slice(metadata.unwrap_or_default()),
+                    Bytes::copy_from_slice(payload),
+                );
+                self.non_persistent_runtime
+                    .as_mut()
+                    .expect("non-persistent runtime just initialized")
+                    .publish_entry(entry);
+
+                crate::storage::MessageId { ledger: 0, entry: 0, partition: self.partition }
+            }
         };
 
         log::info!("Published message {}:{}:{} to topic '{}'",
@@ -232,29 +331,70 @@ impl Topic {
     ///
     /// This should be called after publish_message() to push messages to consumers.
     /// It triggers the dispatcher for each subscription to deliver pending messages.
-    pub async fn dispatch_to_subscriptions(
-        &self
-    ) {
+    pub async fn dispatch_to_subscriptions(&mut self) {
         let subscription_count = self.subscriptions.len();
-        if subscription_count == 0 {
-            log::debug!("No subscriptions on topic '{}', skipping dispatch", self.name);
-            return;
-        }
-
-        log::debug!(
-            "Dispatching messages to {} subscription(s) on topic '{}'",
-            subscription_count, self.name
-        );
-
-        for (sub_name, subscription) in &self.subscriptions {
-            let sub_guard = subscription.read().await;
-
-            // Trigger message dispatch for this subscription
-            if let Err(e) = sub_guard.dispatch_messages().await {
-                log::error!(
-                    "Failed to dispatch message to subscription '{}' on topic '{}': {}",
-                    sub_name, self.name, e
+        match self.runtime_mode {
+            TopicRuntimeMode::PersistentStyle => {
+                if subscription_count == 0 {
+                    log::debug!("No subscriptions on topic '{}', skipping dispatch", self.name);
+                    return;
+                }
+                log::debug!(
+                    "Dispatching messages to {} subscription(s) on topic '{}' with runtime={:?}",
+                    subscription_count, self.name, self.runtime_mode
                 );
+                for (sub_name, subscription) in &self.subscriptions {
+                    let sub_guard = subscription.read().await;
+                    if let Err(e) = sub_guard.dispatch_messages().await {
+                        log::error!(
+                            "Failed to dispatch message to subscription '{}' on topic '{}': {}",
+                            sub_name, self.name, e
+                        );
+                    }
+                }
+            }
+            TopicRuntimeMode::NonPersistent => {
+                if subscription_count == 0 {
+                    let entries = self
+                        .non_persistent_runtime
+                        .as_mut()
+                        .map(|runtime| runtime.drain_published_messages())
+                        .unwrap_or_default();
+                    for entry in entries {
+                        entry.release();
+                    }
+                    log::debug!(
+                        "No subscriptions on non-persistent topic '{}', released pending entries",
+                        self.name
+                    );
+                    return;
+                }
+                log::debug!(
+                    "Dispatching messages to {} subscription(s) on topic '{}' with runtime={:?}",
+                    subscription_count, self.name, self.runtime_mode
+                );
+                let entries = self
+                    .non_persistent_runtime
+                    .as_mut()
+                    .map(|runtime| runtime.drain_published_messages())
+                    .unwrap_or_default();
+
+                for entry in entries {
+                    for (sub_name, subscription) in &self.subscriptions {
+                        let sub_guard = subscription.read().await;
+                        let duplicate = entry.retained_duplicate();
+                        if let Err(e) = sub_guard
+                            .send_non_persistent_entries(vec![duplicate])
+                            .await
+                        {
+                            log::error!(
+                                "Failed to dispatch non-persistent entry to subscription '{}' on topic '{}': {}",
+                                sub_name, self.name, e
+                            );
+                        }
+                    }
+                    entry.release();
+                }
             }
         }
     }
@@ -282,6 +422,21 @@ impl Topic {
     pub async fn is_idle(&self) -> bool {
         self.producers.is_empty() && self.get_total_consumer_count().await == 0
     }
+
+    pub async fn get_last_message_id(&self) -> Result<Option<crate::storage::MessageId>, String> {
+        match self.runtime_mode {
+            TopicRuntimeMode::PersistentStyle => Ok(self
+                .storage
+                .lock()
+                .await
+                .get_messages(&self.name)
+                .last()
+                .map(|(message_id, _)| message_id.clone())),
+            TopicRuntimeMode::NonPersistent => {
+                Err("getLastMessageId is unsupported for non-persistent topics".to_string())
+            }
+        }
+    }
 }
 
 /// Statistics for a topic
@@ -297,7 +452,9 @@ pub struct TopicStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::codec::proto::pulsar::MessageMetadata;
     use crate::storage::Storage;
+    use prost::Message;
     use std::path::Path;
     use std::sync::Arc as StdArc;
     use tokio::sync::{Mutex, RwLock, mpsc};
@@ -327,6 +484,27 @@ mod tests {
         ))
     }
 
+    fn create_test_consumer_with_rx(
+        id: u64,
+        subscription: SharedSubscription,
+    ) -> (
+        Arc<Consumer>,
+        mpsc::UnboundedReceiver<(u64, crate::broker::service::PendingMessage)>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            StdArc::new(Consumer::new(
+                id,
+                format!("consumer-{}", id),
+                subscription,
+                format!("conn-{}", id),
+                tx,
+                0,
+            )),
+            rx,
+        )
+    }
+
     #[tokio::test]
     async fn test_topic_creation() {
         let storage = create_test_storage();
@@ -335,6 +513,297 @@ mod tests {
         assert_eq!(topic.name, "test-topic");
         assert_eq!(topic.get_producer_count(), 0);
         assert_eq!(topic.get_subscription_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_non_persistent_publish_uses_runtime_only_path() {
+        let storage = create_test_storage();
+        let mut topic = Topic::new("test-topic".to_string(), storage.clone());
+        topic.set_runtime_mode(TopicRuntimeMode::NonPersistent);
+
+        let message_id = topic.publish_message(None, b"hello").await.unwrap();
+
+        assert_eq!(message_id.ledger, 0);
+        assert_eq!(message_id.entry, 0);
+        assert_eq!(topic.non_persistent_pending_message_count(), 1);
+        assert!(storage.lock().await.get_messages("test-topic").is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_non_persistent_without_subscriptions_releases_pending_entries() {
+        let storage = create_test_storage();
+        let mut topic = Topic::new("test-topic".to_string(), storage);
+        topic.set_runtime_mode(TopicRuntimeMode::NonPersistent);
+
+        topic.publish_message(None, b"hello").await.unwrap();
+        assert_eq!(topic.non_persistent_pending_message_count(), 1);
+
+        topic.dispatch_to_subscriptions().await;
+        assert_eq!(topic.non_persistent_pending_message_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_non_persistent_publish_preserves_metadata_through_dispatch() {
+        let storage = create_test_storage();
+        let mut topic = Topic::new("test-topic".to_string(), storage);
+        topic.set_runtime_mode(TopicRuntimeMode::NonPersistent);
+
+        let subscription = topic
+            .get_or_create_subscription("sub1", SubscriptionType::Exclusive)
+            .await
+            .unwrap();
+        let (consumer, mut rx) = create_test_consumer_with_rx(1, subscription.clone());
+        consumer.add_permits(1).await;
+        {
+            let mut sub_guard = subscription.write().await;
+            sub_guard.add_consumer(consumer).unwrap();
+        }
+
+        let metadata = MessageMetadata {
+            producer_name: "producer-1".to_string(),
+            sequence_id: 9,
+            ordering_key: Some(b"order-key".to_vec()),
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        let message_id = topic
+            .publish_message(Some(&metadata), b"hello")
+            .await
+            .unwrap();
+        assert_eq!(message_id.ledger, 0);
+        assert_eq!(message_id.entry, 0);
+
+        topic.dispatch_to_subscriptions().await;
+
+        let (consumer_id, pending) = rx.recv().await.expect("message dispatched");
+        assert_eq!(consumer_id, 1);
+        assert_eq!(pending.metadata, metadata);
+        assert_eq!(pending.payload, b"hello".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_non_persistent_shared_dispatch_round_robins_across_consumers() {
+        let storage = create_test_storage();
+        let mut topic = Topic::new("test-topic".to_string(), storage);
+        topic.set_runtime_mode(TopicRuntimeMode::NonPersistent);
+
+        let subscription = topic
+            .get_or_create_subscription("sub1", SubscriptionType::Shared)
+            .await
+            .unwrap();
+        let (consumer1, mut rx1) = create_test_consumer_with_rx(1, subscription.clone());
+        let (consumer2, mut rx2) = create_test_consumer_with_rx(2, subscription.clone());
+        {
+            let mut sub_guard = subscription.write().await;
+            sub_guard.add_consumer(consumer1).unwrap();
+            sub_guard.add_consumer(consumer2).unwrap();
+        }
+        let consumer1 = {
+            let sub_guard = subscription.read().await;
+            sub_guard.get_consumer(1).unwrap()
+        };
+        let consumer2 = {
+            let sub_guard = subscription.read().await;
+            sub_guard.get_consumer(2).unwrap()
+        };
+        consumer1.add_permits(1).await;
+        consumer2.add_permits(1).await;
+        {
+            let sub_guard = subscription.read().await;
+            sub_guard.consumer_flow(1, 1).await;
+            sub_guard.consumer_flow(2, 1).await;
+        }
+
+        topic.publish_message(None, b"first").await.unwrap();
+        topic.publish_message(None, b"second").await.unwrap();
+        topic.dispatch_to_subscriptions().await;
+
+        let first = rx1.recv().await.expect("consumer1 receives a message");
+        let second = rx2.recv().await.expect("consumer2 receives a message");
+
+        assert_eq!(first.0, 1);
+        assert_eq!(second.0, 2);
+        assert_eq!(first.1.payload, b"first".to_vec());
+        assert_eq!(second.1.payload, b"second".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_non_persistent_exclusive_dispatch_requires_flow_permits() {
+        let storage = create_test_storage();
+        let mut topic = Topic::new("test-topic".to_string(), storage);
+        topic.set_runtime_mode(TopicRuntimeMode::NonPersistent);
+
+        let subscription = topic
+            .get_or_create_subscription("sub1", SubscriptionType::Exclusive)
+            .await
+            .unwrap();
+        let (consumer, mut rx) = create_test_consumer_with_rx(1, subscription.clone());
+        {
+            let mut sub_guard = subscription.write().await;
+            sub_guard.add_consumer(consumer).unwrap();
+        }
+
+        topic.publish_message(None, b"blocked").await.unwrap();
+        topic.dispatch_to_subscriptions().await;
+        assert!(rx.try_recv().is_err());
+
+        let consumer = {
+            let sub_guard = subscription.read().await;
+            sub_guard.get_consumer(1).unwrap()
+        };
+        consumer.add_permits(1).await;
+        {
+            let sub_guard = subscription.read().await;
+            sub_guard.consumer_flow(1, 1).await;
+        }
+
+        topic.publish_message(None, b"allowed").await.unwrap();
+        topic.dispatch_to_subscriptions().await;
+
+        let dispatched = rx.recv().await.expect("message delivered after flow");
+        assert_eq!(dispatched.0, 1);
+        assert_eq!(dispatched.1.payload, b"allowed".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_non_persistent_failover_promotes_standby_consumer() {
+        let storage = create_test_storage();
+        let mut topic = Topic::new("test-topic".to_string(), storage);
+        topic.set_runtime_mode(TopicRuntimeMode::NonPersistent);
+
+        let subscription = topic
+            .get_or_create_subscription("sub1", SubscriptionType::Failover)
+            .await
+            .unwrap();
+        let (consumer1, mut rx1) = create_test_consumer_with_rx(1, subscription.clone());
+        let (consumer2, mut rx2) = create_test_consumer_with_rx(2, subscription.clone());
+        {
+            let mut sub_guard = subscription.write().await;
+            sub_guard.add_consumer(consumer2.clone()).unwrap();
+            sub_guard.add_consumer(consumer1.clone()).unwrap();
+        }
+
+        consumer1.add_permits(1).await;
+        {
+            let sub_guard = subscription.read().await;
+            sub_guard.consumer_flow(1, 1).await;
+        }
+
+        topic.publish_message(None, b"first").await.unwrap();
+        topic.dispatch_to_subscriptions().await;
+        let first = rx1.recv().await.expect("active failover consumer receives message");
+        assert_eq!(first.0, 1);
+        assert!(rx2.try_recv().is_err());
+
+        {
+            let mut sub_guard = subscription.write().await;
+            assert!(sub_guard.remove_consumer(1).is_some());
+        }
+
+        consumer2.add_permits(1).await;
+        {
+            let sub_guard = subscription.read().await;
+            sub_guard.consumer_flow(2, 1).await;
+        }
+
+        topic.publish_message(None, b"second").await.unwrap();
+        topic.dispatch_to_subscriptions().await;
+        let second = rx2.recv().await.expect("standby consumer is promoted");
+        assert_eq!(second.0, 2);
+        assert_eq!(second.1.payload, b"second".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_non_persistent_failover_uses_partition_selection_and_notifies_consumers() {
+        let storage = create_test_storage();
+        let mut topic = Topic::new("test-topic-partition-1".to_string(), storage);
+        topic.set_runtime_mode(TopicRuntimeMode::NonPersistent);
+
+        let subscription = topic
+            .get_or_create_subscription("sub1", SubscriptionType::Failover)
+            .await
+            .unwrap();
+        let (consumer1, mut rx1) = create_test_consumer_with_rx(1, subscription.clone());
+        let (consumer2, mut rx2) = create_test_consumer_with_rx(2, subscription.clone());
+        {
+            let mut sub_guard = subscription.write().await;
+            sub_guard.add_consumer(consumer1.clone()).unwrap();
+            sub_guard.add_consumer(consumer2.clone()).unwrap();
+        }
+
+        let stats1 = consumer1.get_stats().await;
+        let stats2 = consumer2.get_stats().await;
+        assert_eq!(stats1.active_consumer_id, Some(2));
+        assert!(!stats1.is_active_consumer);
+        assert_eq!(stats2.active_consumer_id, Some(2));
+        assert!(stats2.is_active_consumer);
+
+        consumer2.add_permits(1).await;
+        {
+            let sub_guard = subscription.read().await;
+            sub_guard.consumer_flow(2, 1).await;
+        }
+
+        topic.publish_message(None, b"first").await.unwrap();
+        topic.dispatch_to_subscriptions().await;
+        let first = rx2.recv().await.expect("partition-selected failover consumer receives");
+        assert_eq!(first.0, 2);
+        assert!(rx1.try_recv().is_err());
+
+        {
+            let mut sub_guard = subscription.write().await;
+            assert!(sub_guard.remove_consumer(2).is_some());
+        }
+
+        let stats1 = consumer1.get_stats().await;
+        assert_eq!(stats1.active_consumer_id, Some(1));
+        assert!(stats1.is_active_consumer);
+    }
+
+    #[tokio::test]
+    async fn test_non_persistent_drop_counts_are_exposed_in_subscription_stats() {
+        let storage = create_test_storage();
+        let mut topic = Topic::new("test-topic".to_string(), storage);
+        topic.set_runtime_mode(TopicRuntimeMode::NonPersistent);
+
+        let subscription = topic
+            .get_or_create_subscription("sub1", SubscriptionType::Shared)
+            .await
+            .unwrap();
+        let (consumer, _rx) = create_test_consumer_with_rx(1, subscription.clone());
+        {
+            let mut sub_guard = subscription.write().await;
+            sub_guard.add_consumer(consumer).unwrap();
+        }
+
+        topic.publish_message(None, b"drop-me").await.unwrap();
+        topic.dispatch_to_subscriptions().await;
+
+        let stats = subscription.read().await.get_stats().await;
+        assert_eq!(stats.dropped_messages, 1);
+    }
+
+    #[tokio::test]
+    async fn test_non_persistent_last_message_id_is_unsupported() {
+        let storage = create_test_storage();
+        let mut topic = Topic::new("test-topic".to_string(), storage);
+        topic.set_runtime_mode(TopicRuntimeMode::NonPersistent);
+        topic.publish_message(None, b"hello").await.unwrap();
+
+        let error = topic.get_last_message_id().await.unwrap_err();
+        assert!(error.contains("unsupported"));
+    }
+
+    #[tokio::test]
+    async fn test_non_persistent_topic_domain_sets_runtime_mode() {
+        let storage = create_test_storage();
+        let topic = Topic::new(
+            "non-persistent://public/default/test-topic".to_string(),
+            storage,
+        );
+
+        assert_eq!(topic.runtime_mode(), TopicRuntimeMode::NonPersistent);
     }
 
     #[tokio::test]

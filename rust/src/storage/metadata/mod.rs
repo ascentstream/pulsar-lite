@@ -14,8 +14,7 @@ pub use types::{
 };
 
 impl super::Storage {
-    #[cfg(test)]
-    pub(crate) fn parse_topic_name(topic: &str) -> anyhow::Result<ParsedTopicName> {
+    pub fn parse_topic_name(topic: &str) -> anyhow::Result<ParsedTopicName> {
         crate::storage::metadata::types::parse_topic_name(topic)
     }
 

@@ -24,4 +24,4 @@ pub use memory::{
     InMemoryManagedLedgerStorage,
 };
 pub use storage::ManagedLedgerStorage;
-pub use types::{ManagedLedgerPosition, MessageId};
+pub use types::{ManagedLedgerPosition, MessageId, NonPersistentEntry};

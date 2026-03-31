@@ -222,6 +222,7 @@ impl PartitionedTopic {
     pub async fn publish_message_to_partition(
         &mut self,
         partition_index: usize,
+        metadata: Option<&[u8]>,
         payload: &[u8],
     ) -> Result<crate::storage::MessageId, Box<dyn std::error::Error>> {
         if partition_index >= self.partition_count {
@@ -235,7 +236,7 @@ impl PartitionedTopic {
 
         let partition = self.partitions[partition_index].clone();
         let mut guard = partition.write().await;
-        guard.publish_message(payload).await
+        guard.publish_message(metadata, payload).await
     }
 
     // ==================== Statistics ====================

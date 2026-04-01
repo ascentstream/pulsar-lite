@@ -45,6 +45,14 @@ pub struct Config {
     /// Maximum number of connections per IP address (0 = unlimited)
     #[serde(default)]
     pub max_connections_per_ip: usize,
+
+    /// Maximum concurrent non-persistent messages per connection.
+    #[serde(default = "default_max_concurrent_non_persistent_messages_per_connection")]
+    pub max_concurrent_non_persistent_messages_per_connection: usize,
+
+    /// Maximum allowed message size in bytes.
+    #[serde(default = "default_max_message_size_bytes")]
+    pub max_message_size_bytes: usize,
 }
 
 fn default_addr() -> String {
@@ -71,6 +79,14 @@ fn default_connection_liveness_check_timeout_secs() -> u64 {
     10
 }
 
+fn default_max_concurrent_non_persistent_messages_per_connection() -> usize {
+    1000
+}
+
+fn default_max_message_size_bytes() -> usize {
+    5 * 1024 * 1024
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -83,6 +99,9 @@ impl Default for Config {
             connection_liveness_check_timeout_secs: default_connection_liveness_check_timeout_secs(),
             max_connections: 0,
             max_connections_per_ip: 0,
+            max_concurrent_non_persistent_messages_per_connection:
+                default_max_concurrent_non_persistent_messages_per_connection(),
+            max_message_size_bytes: default_max_message_size_bytes(),
         }
     }
 }
@@ -127,6 +146,11 @@ mod tests {
         assert_eq!(config.connection_liveness_check_timeout_secs, 10);
         assert_eq!(config.max_connections, 0);
         assert_eq!(config.max_connections_per_ip, 0);
+        assert_eq!(
+            config.max_concurrent_non_persistent_messages_per_connection,
+            1000
+        );
+        assert_eq!(config.max_message_size_bytes, 5 * 1024 * 1024);
     }
 
     #[test]
@@ -141,6 +165,8 @@ mod tests {
             connection_liveness_check_timeout_secs: 5,
             max_connections: 100,
             max_connections_per_ip: 8,
+            max_concurrent_non_persistent_messages_per_connection: 256,
+            max_message_size_bytes: 2048,
         };
 
         let toml_str = toml::to_string(&config).unwrap();
@@ -159,5 +185,10 @@ mod tests {
         );
         assert_eq!(parsed.max_connections, config.max_connections);
         assert_eq!(parsed.max_connections_per_ip, config.max_connections_per_ip);
+        assert_eq!(
+            parsed.max_concurrent_non_persistent_messages_per_connection,
+            config.max_concurrent_non_persistent_messages_per_connection
+        );
+        assert_eq!(parsed.max_message_size_bytes, config.max_message_size_bytes);
     }
 }

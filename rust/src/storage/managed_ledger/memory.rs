@@ -1,43 +1,315 @@
-/// Transitional in-memory managed-ledger storage shell.
-///
-/// This is intentionally kept as a pure skeleton. Runtime message and cursor
-/// behavior still lives in `storage::Storage`; this type only reserves the
-/// eventual integration point.
+use super::{
+    ack_shared, is_message_acknowledged, ManagedCursor, ManagedCursorState, ManagedLedger,
+    ManagedLedgerConfig, ManagedLedgerFactory, ManagedLedgerPosition, ManagedLedgerStorage,
+    MessageId, SubscriptionCursor,
+};
+use anyhow::Result;
+use log::debug;
+use std::collections::HashMap;
+
+/// In-memory managed-ledger style storage used by the current runtime.
 #[derive(Debug, Default)]
-pub struct InMemoryManagedLedgerStorage;
+pub struct InMemoryManagedLedgerStorage {
+    factory: InMemoryManagedLedgerFactory,
+    cursors: HashMap<String, u64>,
+    subscription_cursors: HashMap<String, SubscriptionCursor>,
+}
 
 impl InMemoryManagedLedgerStorage {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
-/// Placeholder factory type for the managed-ledger migration.
+impl ManagedLedgerStorage for InMemoryManagedLedgerStorage {
+    fn create_topic(&mut self, name: &str) -> Result<()> {
+        self.factory.ensure_ledger(name);
+        Ok(())
+    }
+
+    fn append_message(&mut self, topic: &str, partition: i32, data: &[u8]) -> Result<MessageId> {
+        Ok(self.factory.append_entry(topic, partition, data))
+    }
+
+    fn subscribe(&mut self, topic: &str, subscription: &str) -> Result<()> {
+        let key = format!("{}:{}", topic, subscription);
+        self.cursors.entry(key).or_insert(u64::MAX);
+        Ok(())
+    }
+
+    fn get_next_unassigned_message(
+        &mut self,
+        topic: &str,
+        subscription: &str,
+        _consumer_id: u64,
+    ) -> Result<Option<(MessageId, Vec<u8>)>> {
+        let cursor_key = format!("{}:{}", topic, subscription);
+        let current_entry = self.cursors.get(&cursor_key).copied().unwrap_or(u64::MAX);
+        let shared_cursor = self.subscription_cursors.get(&cursor_key);
+
+        let mut next_message = None;
+        if let Some(messages) = self.factory.messages(topic) {
+            if messages.is_empty() {
+                return Ok(None);
+            }
+
+            for (message_id, data) in messages {
+                let is_acknowledged = if shared_cursor.is_some() {
+                    is_message_acknowledged(shared_cursor, message_id.entry)
+                } else {
+                    current_entry != u64::MAX && message_id.entry <= current_entry
+                };
+
+                if is_acknowledged {
+                    continue;
+                }
+
+                next_message = Some((message_id.clone(), data.clone()));
+                break;
+            }
+        }
+
+        if let Some((message_id, data)) = next_message {
+            return Ok(Some((message_id, data)));
+        }
+
+        Ok(None)
+    }
+
+    fn ack_message(
+        &mut self,
+        topic: &str,
+        subscription: &str,
+        message_id: MessageId,
+    ) -> Result<()> {
+        let cursor_key = format!("{}:{}", topic, subscription);
+        self.cursors.insert(cursor_key, message_id.entry);
+        Ok(())
+    }
+
+    fn ack_message_shared(
+        &mut self,
+        topic: &str,
+        subscription: &str,
+        message_id: MessageId,
+    ) -> Result<()> {
+        let cursor_key = format!("{}:{}", topic, subscription);
+        let (mark_delete, holes_count) = {
+            let cursor = self
+                .subscription_cursors
+                .entry(cursor_key)
+                .or_insert_with(SubscriptionCursor::default);
+            ack_shared(cursor, message_id.entry)
+        };
+
+        debug!(
+            "Shared ack: topic={}, sub={}, entry={}, mark_delete={:?}, holes_count={}",
+            topic, subscription, message_id.entry, mark_delete, holes_count
+        );
+
+        Ok(())
+    }
+
+    fn get_message_by_id(
+        &self,
+        topic: &str,
+        message_id: &MessageId,
+    ) -> Option<(MessageId, Vec<u8>)> {
+        self.factory.get_message_by_id(topic, message_id)
+    }
+
+    fn get_messages(&self, topic: &str) -> Vec<(MessageId, Vec<u8>)> {
+        self.factory.messages(topic).cloned().unwrap_or_default()
+    }
+
+    fn is_acknowledged_shared(
+        &self,
+        topic: &str,
+        subscription: &str,
+        message_id: &MessageId,
+    ) -> bool {
+        let cursor_key = format!("{}:{}", topic, subscription);
+        is_message_acknowledged(self.subscription_cursors.get(&cursor_key), message_id.entry)
+    }
+
+    fn get_mark_delete_position(&self, topic: &str, subscription: &str) -> Option<u64> {
+        let cursor_key = format!("{}:{}", topic, subscription);
+        self.subscription_cursors.get(&cursor_key)?.mark_delete
+    }
+}
+
 #[derive(Debug, Default)]
-pub struct InMemoryManagedLedgerFactory;
+pub struct InMemoryManagedLedgerFactory {
+    ledgers: HashMap<String, InMemoryManagedLedger>,
+    next_ledger_id: u64,
+}
 
 impl InMemoryManagedLedgerFactory {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    fn ensure_ledger(&mut self, name: &str) -> &mut InMemoryManagedLedger {
+        self.ledgers.entry(name.to_string()).or_insert_with(|| {
+            let ledger_id = self.next_ledger_id;
+            self.next_ledger_id += 1;
+            InMemoryManagedLedger::new(name, ledger_id)
+        })
+    }
+
+    fn append_entry(&mut self, topic: &str, partition: i32, data: &[u8]) -> MessageId {
+        self.ensure_ledger(topic)
+            .add_entry_in_place(partition, data)
+    }
+
+    fn messages(&self, topic: &str) -> Option<&Vec<(MessageId, Vec<u8>)>> {
+        self.ledgers.get(topic).map(|ledger| &ledger.entries)
+    }
+
+    fn get_message_by_id(
+        &self,
+        topic: &str,
+        message_id: &MessageId,
+    ) -> Option<(MessageId, Vec<u8>)> {
+        let messages = self.messages(topic)?;
+        if let Some((stored_id, data)) = messages.get(message_id.entry as usize) {
+            if stored_id == message_id {
+                return Some((stored_id.clone(), data.clone()));
+            }
+        }
+
+        messages
+            .iter()
+            .find(|(stored_id, _)| stored_id == message_id)
+            .map(|(stored_id, data)| (stored_id.clone(), data.clone()))
     }
 }
 
-/// Placeholder ledger type for the managed-ledger migration.
+impl ManagedLedgerFactory for InMemoryManagedLedgerFactory {
+    type Ledger = InMemoryManagedLedger;
+
+    fn open(&mut self, name: &str, _config: &ManagedLedgerConfig) -> Result<Self::Ledger> {
+        Ok(self.ensure_ledger(name).clone())
+    }
+}
+
 #[derive(Debug, Clone, Default)]
-pub struct InMemoryManagedLedger;
+pub struct InMemoryManagedLedger {
+    name: String,
+    ledger_id: u64,
+    entries: Vec<(MessageId, Vec<u8>)>,
+}
 
 impl InMemoryManagedLedger {
-    pub fn new(_name: &str) -> Self {
-        Self
+    pub fn new(name: &str, ledger_id: u64) -> Self {
+        Self {
+            name: name.to_string(),
+            ledger_id,
+            entries: Vec::new(),
+        }
+    }
+
+    fn add_entry_in_place(&mut self, partition: i32, payload: &[u8]) -> MessageId {
+        let message_id = MessageId {
+            ledger: self.ledger_id,
+            entry: self.entries.len() as u64,
+            partition,
+        };
+        self.entries.push((message_id.clone(), payload.to_vec()));
+        message_id
     }
 }
 
-/// Placeholder cursor type for the managed-ledger migration.
+impl ManagedLedger for InMemoryManagedLedger {
+    type Cursor = InMemoryManagedCursor;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn add_entry(&mut self, payload: &[u8]) -> Result<ManagedLedgerPosition> {
+        let message_id = self.add_entry_in_place(-1, payload);
+        Ok(ManagedLedgerPosition::from(message_id))
+    }
+
+    fn open_cursor(&mut self, name: &str) -> Result<Self::Cursor> {
+        Ok(InMemoryManagedCursor::new(name))
+    }
+
+    fn read_entry(&self, position: &ManagedLedgerPosition) -> Option<&[u8]> {
+        self.entries
+            .get(position.entry_id as usize)
+            .and_then(|(message_id, data)| {
+                if message_id.ledger == position.ledger_id
+                    && message_id.entry == position.entry_id
+                    && message_id.partition == position.partition
+                {
+                    Some(data.as_slice())
+                } else {
+                    None
+                }
+            })
+    }
+}
+
 #[derive(Debug, Clone, Default)]
-pub struct InMemoryManagedCursor;
+pub struct InMemoryManagedCursor {
+    name: String,
+    state: ManagedCursorState,
+}
 
 impl InMemoryManagedCursor {
-    pub fn new(_name: &str) -> Self {
-        Self
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            state: ManagedCursorState::default(),
+        }
+    }
+}
+
+impl ManagedCursor for InMemoryManagedCursor {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn state(&self) -> &ManagedCursorState {
+        &self.state
+    }
+
+    fn mark_delete(&mut self, position: ManagedLedgerPosition) -> Result<()> {
+        self.state.mark_delete = Some(position);
+        Ok(())
+    }
+
+    fn delete_individual(&mut self, position: ManagedLedgerPosition) -> Result<()> {
+        self.state.individually_deleted_entries.insert(position);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_and_lookup_message_by_id() {
+        let mut storage = InMemoryManagedLedgerStorage::new();
+        storage
+            .create_topic("persistent://public/default/test")
+            .unwrap();
+
+        let msg0 = storage
+            .append_message("persistent://public/default/test", -1, b"0")
+            .unwrap();
+        let msg1 = storage
+            .append_message("persistent://public/default/test", -1, b"1")
+            .unwrap();
+
+        let found = storage
+            .get_message_by_id("persistent://public/default/test", &msg1)
+            .unwrap();
+        assert_eq!(found.0, msg1);
+        assert_eq!(found.1, b"1".to_vec());
+        assert_eq!(msg0.entry, 0);
     }
 }

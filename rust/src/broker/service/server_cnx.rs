@@ -87,12 +87,12 @@ where
 
     /// Consumers on this connection (consumer_id -> Consumer) (Apache Pulsar style)
     consumers: HashMap<u64, Arc<Consumer>>,
-    
+
     /// Message channel receiver - receives messages from consumers to send to client
     /// All consumers on this connection share the same channel
     message_rx: mpsc::UnboundedReceiver<(u64, PendingMessage)>,
 
-     /// Message channel sender - cloned and 
+    /// Message channel sender - cloned and
     message_tx: mpsc::UnboundedSender<(u64, PendingMessage)>,
 
     /// Connection ID (unique identifier for this connection)
@@ -165,7 +165,9 @@ where
             Some(CloseReason::ClientClosed) => "client closed connection".to_string(),
             Some(CloseReason::HandshakeTimeout) => "handshake timed out".to_string(),
             Some(CloseReason::KeepAliveTimeout) => "keep-alive timed out".to_string(),
-            Some(CloseReason::LivenessCheckTimeout) => "connection liveness check timed out".to_string(),
+            Some(CloseReason::LivenessCheckTimeout) => {
+                "connection liveness check timed out".to_string()
+            }
             Some(CloseReason::KeepAliveSendFailed) => "failed to send keep-alive ping".to_string(),
             Some(CloseReason::ProtocolError(message)) => format!("protocol error: {message}"),
             None => "normal shutdown".to_string(),
@@ -289,13 +291,10 @@ where
             self.connection_id,
             self.remote_protocol_version
         );
-        self.framed
-            .send(ServerCommand::Ping)
-            .await
-            .map_err(|e| {
-                self.set_failed(CloseReason::KeepAliveSendFailed);
-                to_cnx_error(e)
-            })?;
+        self.framed.send(ServerCommand::Ping).await.map_err(|e| {
+            self.set_failed(CloseReason::KeepAliveSendFailed);
+            to_cnx_error(e)
+        })?;
         self.waiting_for_pong = true;
         self.connection_check_in_progress = Some(ConnectionCheck {
             deadline: Instant::now() + self.connection_liveness_check_timeout,
@@ -361,29 +360,45 @@ where
         Ok(())
     }
 
-    async fn handle_command(&mut self, base_command: BaseCommand, frame: PulsarFrame) -> CnxResult<()> {
+    async fn handle_command(
+        &mut self,
+        base_command: BaseCommand,
+        frame: PulsarFrame,
+    ) -> CnxResult<()> {
         let command_type = base_command.r#type;
         let is_connect = command_type == base_command::Type::Connect as i32;
         let is_ping = command_type == base_command::Type::Ping as i32;
         let is_pong = command_type == base_command::Type::Pong as i32;
 
         if !self.handshake_completed && !is_connect && !is_ping && !is_pong {
-            return Err(to_cnx_error("received command before Connect handshake completed"));
+            return Err(to_cnx_error(
+                "received command before Connect handshake completed",
+            ));
         }
 
         if matches!(self.state, State::Failed | State::Closing | State::Closed) {
-            return Err(to_cnx_error("received command on closing/closed connection"));
+            return Err(to_cnx_error(
+                "received command on closing/closed connection",
+            ));
         }
 
         match base_command.r#type {
-            x if x == base_command::Type::Connect as i32 => self.handle_connect(base_command).await?,
+            x if x == base_command::Type::Connect as i32 => {
+                self.handle_connect(base_command).await?
+            }
             x if x == base_command::Type::PartitionedMetadata as i32 => {
                 self.handle_partition_metadata(base_command).await?
             }
             x if x == base_command::Type::Lookup as i32 => self.handle_lookup(base_command).await?,
-            x if x == base_command::Type::Producer as i32 => self.handle_producer(base_command).await?,
-            x if x == base_command::Type::Send as i32 => self.handle_send(base_command, frame).await?,
-            x if x == base_command::Type::Subscribe as i32 => self.handle_subscribe(base_command).await?,
+            x if x == base_command::Type::Producer as i32 => {
+                self.handle_producer(base_command).await?
+            }
+            x if x == base_command::Type::Send as i32 => {
+                self.handle_send(base_command, frame).await?
+            }
+            x if x == base_command::Type::Subscribe as i32 => {
+                self.handle_subscribe(base_command).await?
+            }
             x if x == base_command::Type::Flow as i32 => self.handle_flow(base_command).await?,
             x if x == base_command::Type::Ack as i32 => self.handle_ack(base_command).await?,
             x if x == base_command::Type::Ping as i32 => self.handle_ping().await?,
@@ -403,7 +418,9 @@ where
     async fn handle_keep_alive_tick(&mut self) -> CnxResult<bool> {
         match self.state {
             State::Start | State::Connecting => {
-                if !self.handshake_completed && self.last_activity.elapsed() >= self.handshake_timeout {
+                if !self.handshake_completed
+                    && self.last_activity.elapsed() >= self.handshake_timeout
+                {
                     log::warn!(
                         "Connection {} handshake timed out after {:?}, closing connection",
                         self.connection_id,
@@ -435,7 +452,8 @@ where
                 }
 
                 // Periodic keep-alive is implemented as a recurring liveness probe.
-                self.start_connection_liveness_check(CloseReasonKind::KeepAliveTimeout).await?;
+                self.start_connection_liveness_check(CloseReasonKind::KeepAliveTimeout)
+                    .await?;
             }
             State::Failed | State::Closing | State::Closed => return Ok(true),
         }
@@ -471,8 +489,9 @@ where
 
     async fn handle_connect(&mut self, cmd: BaseCommand) -> CnxResult<()> {
         self.state = State::Connecting;
-        let remote_protocol_version =
-            handler::handle_connect(&mut self.framed, cmd).await.map_err(to_cnx_error)?;
+        let remote_protocol_version = handler::handle_connect(&mut self.framed, cmd)
+            .await
+            .map_err(to_cnx_error)?;
         // The broker keeps the negotiated client protocol version and uses it to decide whether active keep-alive is supported.
         self.remote_protocol_version = remote_protocol_version;
         self.handshake_completed = true;
@@ -546,7 +565,9 @@ where
     }
 
     async fn handle_ping(&mut self) -> CnxResult<()> {
-        handler::handle_ping(&mut self.framed).await.map_err(to_cnx_error)
+        handler::handle_ping(&mut self.framed)
+            .await
+            .map_err(to_cnx_error)
     }
 
     async fn handle_pong(&mut self, cmd: BaseCommand) -> CnxResult<()> {
@@ -586,7 +607,10 @@ pub async fn handle_connection(
     use std::sync::atomic::{AtomicU64, Ordering};
     static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    let connection_id = format!("conn-{}", CONNECTION_COUNTER.fetch_add(1, Ordering::Relaxed));
+    let connection_id = format!(
+        "conn-{}",
+        CONNECTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
     let mut server_cnx = ServerCnx::new(
         socket,
         storage,
@@ -654,7 +678,10 @@ mod tests {
 
         assert_eq!(server_cnx.state, State::Connected);
         assert!(server_cnx.handshake_completed);
-        assert_eq!(server_cnx.remote_protocol_version, ProtocolVersion::V1 as i32);
+        assert_eq!(
+            server_cnx.remote_protocol_version,
+            ProtocolVersion::V1 as i32
+        );
         assert!(!server_cnx.waiting_for_pong);
     }
 
@@ -683,7 +710,11 @@ mod tests {
         assert!(!server_cnx_v0.handle_keep_alive_tick().await.unwrap());
         assert!(!server_cnx_v0.waiting_for_pong);
         assert!(server_cnx_v0.connection_check_in_progress.is_none());
-        assert!(tokio::time::timeout(Duration::from_millis(20), client_v0.next()).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), client_v0.next())
+                .await
+                .is_err()
+        );
 
         let (mut server_cnx_v1, mut client_v1) = build_test_connection();
         server_cnx_v1.state = State::Connected;

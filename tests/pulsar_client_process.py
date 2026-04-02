@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import time
 
 import pulsar
+
+READY_SENTINEL = "__PULSAR_LITE_READY__"
 
 
 def main() -> int:
@@ -13,6 +16,7 @@ def main() -> int:
     parser.add_argument("--topic", required=True)
     parser.add_argument("--subscription", required=True)
     parser.add_argument("--consumer-name", required=True)
+    parser.add_argument("--ready-file")
     args = parser.parse_args()
 
     client = pulsar.Client(args.url)
@@ -26,7 +30,8 @@ def main() -> int:
     )
 
     try:
-        print("READY", flush=True)
+        if args.ready_file:
+            Path(args.ready_file).write_text(f"{READY_SENTINEL}\n", encoding="utf-8")
         while True:
             time.sleep(1)
     finally:

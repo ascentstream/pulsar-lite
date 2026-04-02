@@ -10,14 +10,18 @@ mod cursor;
 mod factory;
 mod ledger;
 mod memory;
+mod storage;
 mod types;
 
 pub use config::ManagedLedgerConfig;
-pub use cursor::{ManagedCursor, ManagedCursorState};
+pub use cursor::{
+    ack_shared, is_message_acknowledged, ManagedCursor, ManagedCursorState, SubscriptionCursor,
+};
 pub use factory::ManagedLedgerFactory;
 pub use ledger::ManagedLedger;
 pub use memory::{
     InMemoryManagedCursor, InMemoryManagedLedger, InMemoryManagedLedgerFactory,
     InMemoryManagedLedgerStorage,
 };
-pub use types::ManagedLedgerPosition;
+pub use storage::ManagedLedgerStorage;
+pub use types::{ManagedLedgerPosition, MessageId};

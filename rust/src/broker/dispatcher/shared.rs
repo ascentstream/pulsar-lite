@@ -4,13 +4,13 @@
  * Consistent with Apache Pulsar's PersistentDispatcherMultipleConsumers
  */
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicU32, AtomicUsize, AtomicBool, Ordering};
-use crate::broker::service::{Consumer, SharedStorage};
 use crate::broker::dispatcher::Dispatcher;
 use crate::broker::service::topic::SubscriptionType;
+use crate::broker::service::{Consumer, SharedStorage};
 use crate::storage::MessageId;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 
 /// Consistent with Apache Pulsar: dispatcherMaxRoundRobinBatchSize = 20
 const DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE: u32 = 20;
@@ -150,7 +150,8 @@ impl SharedDispatcher {
                 if current > index {
                     self.round_robin_index.store(current - 1, Ordering::Relaxed);
                 } else if current >= len {
-                    self.round_robin_index.store(current % len, Ordering::Relaxed);
+                    self.round_robin_index
+                        .store(current % len, Ordering::Relaxed);
                 }
             }
         }
@@ -264,7 +265,8 @@ impl SharedDispatcher {
                     self.total_available_permits.fetch_add(1, Ordering::Relaxed);
                     log::debug!(
                         "Skipping replay for already-acked message {}:{}",
-                        msg_id.ledger, msg_id.entry
+                        msg_id.ledger,
+                        msg_id.entry
                     );
                     continue;
                 }
@@ -276,11 +278,6 @@ impl SharedDispatcher {
                 };
 
                 if let Some((message_id, payload)) = message_opt {
-                    {
-                        let mut guard = storage.lock().await;
-                        guard.assign_message(&topic, &subscription, &message_id, consumer_id);
-                    }
-
                     if consumer
                         .send_message(
                             message_id.clone(),
@@ -296,13 +293,12 @@ impl SharedDispatcher {
 
                         log::debug!(
                             "Redelivered message {}:{} to consumer {}, remaining permits={}",
-                            message_id.ledger, message_id.entry, consumer_id,
+                            message_id.ledger,
+                            message_id.entry,
+                            consumer_id,
                             self.total_available_permits.load(Ordering::Relaxed)
                         );
                     } else {
-                        let mut guard = storage.lock().await;
-                        guard.release_assignment(&topic, &subscription, &message_id, consumer_id);
-                        drop(guard);
                         self.add_to_redelivery_queue(vec![(message_id, redelivery_count + 1)]);
                         consumer.add_permits(1).await;
                         self.total_available_permits.fetch_add(1, Ordering::Relaxed);
@@ -311,25 +307,23 @@ impl SharedDispatcher {
                     // Message no longer exists (may have been deleted), restore permit
                     consumer.add_permits(1).await;
                     self.total_available_permits.fetch_add(1, Ordering::Relaxed);
-                    log::warn!("Redelivery message {}:{} not found in storage", msg_id.ledger, msg_id.entry);
+                    log::warn!(
+                        "Redelivery message {}:{} not found in storage",
+                        msg_id.ledger,
+                        msg_id.entry
+                    );
                 }
                 continue;
             }
 
             // 2. Redelivery queue empty, get new message
-            let message_opt = {
-                let mut guard = storage.lock().await;
-                guard.get_next_unassigned_message(&topic, &subscription, consumer_id)?
-            };
+            let message_opt = self
+                .get_next_dispatchable_message(storage.clone(), &topic, &subscription)
+                .await?;
 
             if let Some((message_id, payload)) = message_opt {
                 if consumer
-                    .send_message(
-                        message_id.clone(),
-                        Vec::new(),
-                        payload.clone(),
-                        0,
-                    )
+                    .send_message(message_id.clone(), Vec::new(), payload.clone(), 0)
                     .await
                 {
                     consumer.record_message_dispatched(payload.len()).await;
@@ -341,9 +335,6 @@ impl SharedDispatcher {
                         self.total_available_permits.load(Ordering::Relaxed)
                     );
                 } else {
-                    let mut guard = storage.lock().await;
-                    guard.release_assignment(&topic, &subscription, &message_id, consumer_id);
-                    drop(guard);
                     self.add_to_redelivery_queue(vec![(message_id, 0)]);
                     consumer.add_permits(1).await;
                     self.total_available_permits.fetch_add(1, Ordering::Relaxed);
@@ -352,7 +343,7 @@ impl SharedDispatcher {
                 // No more messages, restore permit
                 consumer.add_permits(1).await;
                 self.total_available_permits.fetch_add(1, Ordering::Relaxed);
-                log::debug!("No more unassigned messages");
+                log::debug!("No more dispatchable messages");
                 break;
             }
         }
@@ -360,7 +351,8 @@ impl SharedDispatcher {
         if dispatched > 0 {
             log::info!(
                 "Batch dispatch completed: dispatched={} (redelivered={}), remaining_permits={}",
-                dispatched, redelivered,
+                dispatched,
+                redelivered,
                 self.total_available_permits.load(Ordering::Relaxed)
             );
         }
@@ -382,7 +374,8 @@ impl SharedDispatcher {
 
         log::debug!(
             "Added {} messages to redelivery queue, total={}",
-            redeliver.len() - count_before, redeliver.len()
+            redeliver.len() - count_before,
+            redeliver.len()
         );
     }
 
@@ -392,12 +385,53 @@ impl SharedDispatcher {
         redeliver.pop_first()
     }
 
-    pub async fn remove_consumer_with_recovery(
-        &mut self,
-        consumer_id: u64,
+    /// Check if message is pending ack by any consumer
+    async fn is_message_pending(&self, message_id: &MessageId) -> bool {
+        for consumer in self.ordered_consumers() {
+            if consumer.has_pending_ack(message_id).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get next dispatchable message from storage
+    async fn get_next_dispatchable_message(
+        &self,
         storage: SharedStorage,
         topic: &str,
         subscription: &str,
+    ) -> Result<Option<(MessageId, Vec<u8>)>, Box<dyn std::error::Error + Send + Sync>> {
+        let messages = {
+            let guard = storage.lock().await;
+            guard.get_messages(topic)
+        };
+
+        for (message_id, payload) in messages {
+            let already_acked = {
+                let guard = storage.lock().await;
+                guard.is_acknowledged_shared(topic, subscription, &message_id)
+            };
+            if already_acked {
+                continue;
+            }
+
+            if self.is_message_pending(&message_id).await {
+                continue;
+            }
+
+            return Ok(Some((message_id, payload)));
+        }
+
+        Ok(None)
+    }
+
+    pub async fn remove_consumer_with_recovery(
+        &mut self,
+        consumer_id: u64,
+        _storage: SharedStorage,
+        _topic: &str,
+        _subscription: &str,
     ) -> Option<Arc<Consumer>> {
         let consumer = self.consumers.remove(&consumer_id);
 
@@ -406,12 +440,8 @@ impl SharedDispatcher {
             consumer.close_pending_acks();
             let pending = consumer.drain_pending_acks().await;
             let mut recovered = Vec::with_capacity(pending.len());
-            {
-                let mut guard = storage.lock().await;
-                for (message_id, pending_ack) in pending {
-                    guard.release_assignment(topic, subscription, &message_id, consumer_id);
-                    recovered.push((message_id, pending_ack.redelivery_count));
-                }
+            for (message_id, pending_ack) in pending {
+                recovered.push((message_id, pending_ack.redelivery_count));
             }
             self.add_to_redelivery_queue(recovered);
 
@@ -468,7 +498,8 @@ impl Dispatcher for SharedDispatcher {
     fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {
         // Consumer-local permit state is updated by the flow handler before it
         // triggers dispatch. The dispatcher only tracks the aggregate count.
-        self.total_available_permits.fetch_add(additional_permits, Ordering::Relaxed);
+        self.total_available_permits
+            .fetch_add(additional_permits, Ordering::Relaxed);
 
         log::info!(
             "Consumer {} flowed {} permits, total={}",
@@ -482,7 +513,7 @@ impl Dispatcher for SharedDispatcher {
         &self,
         storage: SharedStorage,
         topic: String,
-        subscription: String
+        subscription: String,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Prevent reentrant dispatching
         if self.dispatch_in_progress.swap(true, Ordering::Relaxed) {
@@ -490,7 +521,9 @@ impl Dispatcher for SharedDispatcher {
             return Ok(());
         }
 
-        let result = self.dispatch_messages_batch(storage, topic, subscription).await;
+        let result = self
+            .dispatch_messages_batch(storage, topic, subscription)
+            .await;
 
         // Reset flag
         self.dispatch_in_progress.store(false, Ordering::Relaxed);
@@ -508,7 +541,9 @@ mod tests {
     use tokio::sync::{mpsc, Mutex, RwLock};
 
     fn create_test_storage() -> SharedStorage {
-        Arc::new(Mutex::new(Storage::new(Path::new("/tmp/test-shared-dispatcher-storage")).unwrap()))
+        Arc::new(Mutex::new(
+            Storage::new(Path::new("/tmp/test-shared-dispatcher-storage")).unwrap(),
+        ))
     }
 
     fn create_test_subscription(storage: SharedStorage) -> Arc<RwLock<Subscription>> {
@@ -568,8 +603,16 @@ mod tests {
         dispatcher.add_consumer(consumer_a).unwrap();
         dispatcher.add_consumer(consumer_b).unwrap();
 
-        let first = dispatcher.get_next_available_consumer().await.unwrap().consumer_id;
-        let second = dispatcher.get_next_available_consumer().await.unwrap().consumer_id;
+        let first = dispatcher
+            .get_next_available_consumer()
+            .await
+            .unwrap()
+            .consumer_id;
+        let second = dispatcher
+            .get_next_available_consumer()
+            .await
+            .unwrap()
+            .consumer_id;
 
         assert_ne!(first, second);
     }
@@ -616,8 +659,16 @@ mod tests {
         let _ = dispatcher.get_next_available_consumer().await.unwrap();
         dispatcher.remove_consumer(1);
 
-        let first_remaining = dispatcher.get_next_available_consumer().await.unwrap().consumer_id;
-        let second_remaining = dispatcher.get_next_available_consumer().await.unwrap().consumer_id;
+        let first_remaining = dispatcher
+            .get_next_available_consumer()
+            .await
+            .unwrap()
+            .consumer_id;
+        let second_remaining = dispatcher
+            .get_next_available_consumer()
+            .await
+            .unwrap()
+            .consumer_id;
 
         assert_ne!(first_remaining, second_remaining);
         assert!(matches!(first_remaining, 2 | 3));

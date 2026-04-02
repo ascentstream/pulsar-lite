@@ -3,12 +3,11 @@
  * Inspired by Apache Pulsar's Consumer design
  */
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
-use tokio::sync::{RwLock, mpsc};
+
 use super::topic::SubscriptionType;
+use super::{PendingAck, PendingAcksMap};
+use tokio::sync::{mpsc, RwLock};
 
 /// Forward declaration for Subscription type
 use super::topic::Subscription;
@@ -25,15 +24,6 @@ pub struct ConsumerStats {
     pub messages_acked: u64,
     /// Available permits (flow control)
     pub available_permits: u32,
-}
-
-/// 待确认消息信息 (用于 Shared 模式)
-#[derive(Debug, Clone)]
-pub struct PendingAck {
-    /// 分发时间
-    pub dispatched_at: Instant,
-    /// 重投递次数
-    pub redelivery_count: u32,
 }
 
 /// Pending message waiting to be sent to consumer
@@ -70,13 +60,8 @@ pub struct Consumer {
     /// This avoids circular dependency between Consumer and ServerCnx
     message_tx: mpsc::UnboundedSender<(u64, PendingMessage)>,
 
-    /// 待确认消息 (ledger_id, entry_id) -> PendingAck
-    /// 用于 Shared 模式的消息跟踪和断开重投递
-    pending_acks: Arc<RwLock<BTreeMap<MessageId, PendingAck>>>,
-
-    /// Matches native Pulsar's PendingAcksMap closed flag.
-    /// Once closing starts, no new pending ack should be tracked for this consumer.
-    pending_acks_closed: AtomicBool,
+    ///  Pending message tracking
+    pending_acks: Arc<PendingAcksMap>,
 
     /// Lower value means higher priority, consistent with native Pulsar.
     priority_level: i32,
@@ -89,7 +74,10 @@ impl std::fmt::Debug for Consumer {
             .field("consumer_name", &self.consumer_name)
             .field("connection_id", &self.connection_id)
             .field("priority_level", &self.priority_level)
-            .field("subscription", &self.subscription.try_read().map(|s| s.name.clone()))
+            .field(
+                "subscription",
+                &self.subscription.try_read().map(|s| s.name.clone()),
+            )
             .finish()
     }
 }
@@ -111,8 +99,7 @@ impl Consumer {
             connection_id,
             stats: Arc::new(RwLock::new(ConsumerStats::default())),
             message_tx,
-            pending_acks: Arc::new(RwLock::new(BTreeMap::new())),
-            pending_acks_closed: AtomicBool::new(false),
+            pending_acks: Arc::new(PendingAcksMap::new()),
             priority_level,
         }
     }
@@ -175,7 +162,8 @@ impl Consumer {
     /// Get subscription name (convenience method)
     pub fn get_subscription_name(&self) -> String {
         // Use try_read to avoid blocking, fallback to empty string if locked
-        self.subscription.try_read()
+        self.subscription
+            .try_read()
             .map(|s| s.name.clone())
             .unwrap_or_default()
     }
@@ -183,14 +171,16 @@ impl Consumer {
     /// Get topic name (convenience method)
     pub fn get_topic_name(&self) -> String {
         // Use try_read to avoid blocking, fallback to empty string if locked
-        self.subscription.try_read()
+        self.subscription
+            .try_read()
             .map(|s| s.topic.clone())
             .unwrap_or_default()
     }
 
     /// Get subscription type (convenience method)
     pub fn get_sub_type(&self) -> SubscriptionType {
-        self.subscription.try_read()
+        self.subscription
+            .try_read()
             .map(|s| s.sub_type)
             .unwrap_or(SubscriptionType::Exclusive)
     }
@@ -216,16 +206,24 @@ impl Consumer {
         payload: Vec<u8>,
         redelivery_count: u32,
     ) -> bool {
-        let msg = PendingMessage { message_id: message_id.clone(), metadata, payload };
+        let msg = PendingMessage {
+            message_id: message_id.clone(),
+            metadata,
+            payload,
+        };
 
         // Native Pulsar writes pending acks before the message is written so that
         // disconnect/close races cannot lose ownership bookkeeping.
         if self.get_sub_type() == SubscriptionType::Shared
-            && !self.track_message_dispatched(&message_id, redelivery_count).await
+            && !self
+                .track_message_dispatched(&message_id, redelivery_count)
+                .await
         {
             log::debug!(
                 "Skipping send of message {}:{} to closing consumer {}",
-                message_id.ledger, message_id.entry, self.consumer_id
+                message_id.ledger,
+                message_id.entry,
+                self.consumer_id
             );
             return false;
         }
@@ -233,7 +231,10 @@ impl Consumer {
         if let Err(e) = self.message_tx.send((self.consumer_id, msg)) {
             log::error!(
                 "Failed to send message {}:{} to consumer {}: {}",
-                message_id.ledger, message_id.entry, self.consumer_id, e
+                message_id.ledger,
+                message_id.entry,
+                self.consumer_id,
+                e
             );
             if self.get_sub_type() == SubscriptionType::Shared {
                 self.remove_pending_ack(&message_id).await;
@@ -243,14 +244,21 @@ impl Consumer {
 
         log::debug!(
             "Sent message {}:{} to consumer {} via channel",
-            message_id.ledger, message_id.entry, self.consumer_id
+            message_id.ledger,
+            message_id.entry,
+            self.consumer_id
         );
         true
     }
 
     /// Legacy method - now just calls send_message
     /// Kept for backward compatibility with dispatcher
-    pub async fn enqueue_message(&self, message_id: MessageId, metadata: Vec<u8>, payload: Vec<u8>) -> bool {
+    pub async fn enqueue_message(
+        &self,
+        message_id: MessageId,
+        metadata: Vec<u8>,
+        payload: Vec<u8>,
+    ) -> bool {
         self.send_message(message_id, metadata, payload, 0).await
     }
 
@@ -258,30 +266,27 @@ impl Consumer {
     // Pending Acks Tracking (Shared Mode)
     // ========================================
 
-    /// 记录消息已分发 (用于 Shared 模式)
-    ///
-    /// 当消息成功发送到 Consumer 后调用此方法
-    pub async fn track_message_dispatched(&self, message_id: &MessageId, redelivery_count: u32) -> bool {
-        if self.pending_acks_closed.load(Ordering::Acquire) {
-            return false;
+    /// Track pending ack ownership before the message is handed off to the connection.
+    pub async fn track_message_dispatched(
+        &self,
+        message_id: &MessageId,
+        redelivery_count: u32,
+    ) -> bool {
+        let tracked = self
+            .pending_acks
+            .add_pending_ack(message_id.clone(), redelivery_count)
+            .await;
+
+        if tracked {
+            log::debug!(
+                "Tracked message {}:{} for consumer {}",
+                message_id.ledger,
+                message_id.entry,
+                self.consumer_id
+            );
         }
 
-        let mut pending = self.pending_acks.write().await;
-        if self.pending_acks_closed.load(Ordering::Relaxed) {
-            return false;
-        }
-        pending.insert(
-            message_id.clone(),
-            PendingAck {
-                dispatched_at: Instant::now(),
-                redelivery_count,
-            },
-        );
-        log::debug!(
-            "Tracked message {}:{} for consumer {}",
-            message_id.ledger, message_id.entry, self.consumer_id
-        );
-        true
+        tracked
     }
 
     /// 确认消息并移除跟踪
@@ -290,55 +295,47 @@ impl Consumer {
     /// - true: 消息确实由该 Consumer 持有并成功移除
     /// - false: 消息不属于该 Consumer（可能是别的 Consumer 的消息或已重投递）
     pub async fn remove_pending_ack(&self, message_id: &MessageId) -> bool {
-        let mut pending = self.pending_acks.write().await;
-        if pending.remove(message_id).is_some() {
+        if self.pending_acks.remove(message_id).await.is_some() {
             log::debug!(
                 "Acked tracked message {}:{} for consumer {}",
-                message_id.ledger, message_id.entry, self.consumer_id
+                message_id.ledger,
+                message_id.entry,
+                self.consumer_id
             );
             true
         } else {
             log::warn!(
                 "Consumer {} attempted to ack message {}:{} not in pending_acks",
-                self.consumer_id, message_id.ledger, message_id.entry
+                self.consumer_id,
+                message_id.ledger,
+                message_id.entry
             );
             false
         }
     }
 
     pub async fn has_pending_ack(&self, message_id: &MessageId) -> bool {
-        self.pending_acks.read().await.contains_key(message_id)
+        self.pending_acks.contains(message_id).await
     }
 
     pub async fn find_pending_ack_by_position(&self, ledger: u64, entry: u64) -> Option<MessageId> {
-        self.pending_acks
-            .read()
-            .await
-            .keys()
-            .find(|message_id| message_id.ledger == ledger && message_id.entry == entry)
-            .cloned()
+        self.pending_acks.find_by_position(ledger, entry).await
     }
 
     pub fn close_pending_acks(&self) {
-        self.pending_acks_closed.store(true, Ordering::Release);
+        self.pending_acks.close();
     }
 
     /// 获取所有待确认消息 (用于 disconnect recovery)
     ///
     /// 返回所有 pending messages 的 ID 和信息
     pub async fn drain_pending_acks(&self) -> Vec<(MessageId, PendingAck)> {
-        let mut pending = self.pending_acks.write().await;
-        let drained = pending
-            .iter()
-            .map(|(message_id, ack)| (message_id.clone(), ack.clone()))
-            .collect::<Vec<_>>();
-        pending.clear();
-        drained
+        self.pending_acks.drain().await
     }
 
     /// 获取待确认消息数量
     pub async fn pending_ack_count(&self) -> usize {
-        self.pending_acks.read().await.len()
+        self.pending_acks.len().await
     }
 
     pub fn get_priority_level(&self) -> i32 {
@@ -369,7 +366,12 @@ impl Consumer {
     /// 1. Records the acknowledgment in stats
     /// 2. (Future) Updates subscription cursor
     pub async fn ack_message(&self, message_id: crate::storage::MessageId) {
-        log::debug!("Consumer {} acking message {}:{}", self.consumer_id, message_id.ledger, message_id.entry);
+        log::debug!(
+            "Consumer {} acking message {}:{}",
+            self.consumer_id,
+            message_id.ledger,
+            message_id.entry
+        );
 
         // Record in stats
         self.record_message_acked().await;
@@ -397,15 +399,17 @@ impl std::hash::Hash for Consumer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::topic::Subscription;
     use super::super::SharedStorage;
+    use super::*;
     use crate::storage::Storage;
     use std::path::Path;
     use tokio::sync::Mutex;
 
     fn create_test_storage() -> SharedStorage {
-        Arc::new(Mutex::new(Storage::new(Path::new("/tmp/test-consumer-storage")).unwrap()))
+        Arc::new(Mutex::new(
+            Storage::new(Path::new("/tmp/test-consumer-storage")).unwrap(),
+        ))
     }
 
     fn create_test_subscription() -> Arc<RwLock<Subscription>> {
@@ -491,7 +495,11 @@ mod tests {
         assert_eq!(consumer.get_available_permits().await, 10);
 
         // Test ack
-        let msg_id = crate::storage::MessageId { ledger: 1, entry: 1, partition: -1 };
+        let msg_id = crate::storage::MessageId {
+            ledger: 1,
+            entry: 1,
+            partition: -1,
+        };
         consumer.ack_message(msg_id).await;
 
         let stats = consumer.get_stats().await;
@@ -512,8 +520,16 @@ mod tests {
         );
 
         // Send message via channel
-        let msg_id = MessageId { ledger: 1, entry: 1, partition: -1 };
-        assert!(consumer.send_message(msg_id.clone(), vec![9, 9], b"test-payload".to_vec(), 0).await);
+        let msg_id = MessageId {
+            ledger: 1,
+            entry: 1,
+            partition: -1,
+        };
+        assert!(
+            consumer
+                .send_message(msg_id.clone(), vec![9, 9], b"test-payload".to_vec(), 0)
+                .await
+        );
 
         // Verify message was sent through channel with consumer_id
         let (consumer_id, received) = rx.recv().await.unwrap();
@@ -528,8 +544,16 @@ mod tests {
     async fn test_pending_ack_tracking_and_drain() {
         let subscription = create_test_subscription();
         let consumer = create_test_consumer(7, "test-consumer", subscription, "conn-7");
-        let msg1 = MessageId { ledger: 1, entry: 1, partition: -1 };
-        let msg2 = MessageId { ledger: 1, entry: 2, partition: -1 };
+        let msg1 = MessageId {
+            ledger: 1,
+            entry: 1,
+            partition: -1,
+        };
+        let msg2 = MessageId {
+            ledger: 1,
+            entry: 2,
+            partition: -1,
+        };
 
         consumer.track_message_dispatched(&msg1, 0).await;
         consumer.track_message_dispatched(&msg2, 2).await;

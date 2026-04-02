@@ -1,10 +1,10 @@
 use super::{
-    ack_shared, is_message_acknowledged, AssignmentStore, ManagedCursor, ManagedCursorState,
-    ManagedLedger, ManagedLedgerConfig, ManagedLedgerFactory, ManagedLedgerPosition,
-    ManagedLedgerStorage, MessageId, SubscriptionCursor,
+    ack_shared, is_message_acknowledged, ManagedCursor, ManagedCursorState, ManagedLedger,
+    ManagedLedgerConfig, ManagedLedgerFactory, ManagedLedgerPosition, ManagedLedgerStorage,
+    MessageId, SubscriptionCursor,
 };
 use anyhow::Result;
-use log::{debug, warn};
+use log::debug;
 use std::collections::HashMap;
 
 /// In-memory managed-ledger style storage used by the current runtime.
@@ -13,7 +13,6 @@ pub struct InMemoryManagedLedgerStorage {
     factory: InMemoryManagedLedgerFactory,
     cursors: HashMap<String, u64>,
     subscription_cursors: HashMap<String, SubscriptionCursor>,
-    assignments: AssignmentStore,
 }
 
 impl InMemoryManagedLedgerStorage {
@@ -42,7 +41,7 @@ impl ManagedLedgerStorage for InMemoryManagedLedgerStorage {
         &mut self,
         topic: &str,
         subscription: &str,
-        consumer_id: u64,
+        _consumer_id: u64,
     ) -> Result<Option<(MessageId, Vec<u8>)>> {
         let cursor_key = format!("{}:{}", topic, subscription);
         let current_entry = self.cursors.get(&cursor_key).copied().unwrap_or(u64::MAX);
@@ -65,31 +64,26 @@ impl ManagedLedgerStorage for InMemoryManagedLedgerStorage {
                     continue;
                 }
 
-                if self
-                    .assignments
-                    .get_assignment_owner(topic, subscription, message_id)
-                    .is_none()
-                {
-                    next_message = Some((message_id.clone(), data.clone()));
-                    break;
-                }
+                next_message = Some((message_id.clone(), data.clone()));
+                break;
             }
         }
 
         if let Some((message_id, data)) = next_message {
-            self.assignments
-                .assign_message(topic, subscription, &message_id, consumer_id);
             return Ok(Some((message_id, data)));
         }
 
         Ok(None)
     }
 
-    fn ack_message(&mut self, topic: &str, subscription: &str, message_id: MessageId) -> Result<()> {
+    fn ack_message(
+        &mut self,
+        topic: &str,
+        subscription: &str,
+        message_id: MessageId,
+    ) -> Result<()> {
         let cursor_key = format!("{}:{}", topic, subscription);
         self.cursors.insert(cursor_key, message_id.entry);
-        self.assignments
-            .clear_assignment(topic, subscription, &message_id);
         Ok(())
     }
 
@@ -108,9 +102,6 @@ impl ManagedLedgerStorage for InMemoryManagedLedgerStorage {
             ack_shared(cursor, message_id.entry)
         };
 
-        self.assignments
-            .clear_assignment(topic, subscription, &message_id);
-
         debug!(
             "Shared ack: topic={}, sub={}, entry={}, mark_delete={:?}, holes_count={}",
             topic, subscription, message_id.entry, mark_delete, holes_count
@@ -119,76 +110,31 @@ impl ManagedLedgerStorage for InMemoryManagedLedgerStorage {
         Ok(())
     }
 
-    fn assign_message(
-        &mut self,
+    fn get_message_by_id(
+        &self,
         topic: &str,
-        subscription: &str,
         message_id: &MessageId,
-        consumer_id: u64,
-    ) {
-        self.assignments
-            .assign_message(topic, subscription, message_id, consumer_id);
-    }
-
-    fn release_assignment(
-        &mut self,
-        topic: &str,
-        subscription: &str,
-        message_id: &MessageId,
-        owner_consumer_id: u64,
-    ) -> bool {
-        let released = self.assignments.release_assignment(
-            topic,
-            subscription,
-            message_id,
-            owner_consumer_id,
-        );
-
-        if !released {
-            if let Some(assigned_consumer) = self
-                .assignments
-                .get_assignment_owner(topic, subscription, message_id)
-            {
-                warn!(
-                    "Assignment owner mismatch: topic={}, sub={}, entry={}, expected={}, actual={}",
-                    topic, subscription, message_id.entry, owner_consumer_id, assigned_consumer
-                );
-            }
-        } else {
-            debug!(
-                "Released assignment: topic={}, sub={}, entry={}, consumer={}",
-                topic, subscription, message_id.entry, owner_consumer_id
-            );
-        }
-
-        released
-    }
-
-    fn get_message_by_id(&self, topic: &str, message_id: &MessageId) -> Option<(MessageId, Vec<u8>)> {
+    ) -> Option<(MessageId, Vec<u8>)> {
         self.factory.get_message_by_id(topic, message_id)
     }
 
-    fn is_acknowledged_shared(&self, topic: &str, subscription: &str, message_id: &MessageId) -> bool {
+    fn get_messages(&self, topic: &str) -> Vec<(MessageId, Vec<u8>)> {
+        self.factory.messages(topic).cloned().unwrap_or_default()
+    }
+
+    fn is_acknowledged_shared(
+        &self,
+        topic: &str,
+        subscription: &str,
+        message_id: &MessageId,
+    ) -> bool {
         let cursor_key = format!("{}:{}", topic, subscription);
-        is_message_acknowledged(
-            self.subscription_cursors.get(&cursor_key),
-            message_id.entry,
-        )
+        is_message_acknowledged(self.subscription_cursors.get(&cursor_key), message_id.entry)
     }
 
     fn get_mark_delete_position(&self, topic: &str, subscription: &str) -> Option<u64> {
         let cursor_key = format!("{}:{}", topic, subscription);
         self.subscription_cursors.get(&cursor_key)?.mark_delete
-    }
-
-    fn get_assignment_owner(
-        &self,
-        topic: &str,
-        subscription: &str,
-        message_id: &MessageId,
-    ) -> Option<u64> {
-        self.assignments
-            .get_assignment_owner(topic, subscription, message_id)
     }
 }
 
@@ -212,14 +158,19 @@ impl InMemoryManagedLedgerFactory {
     }
 
     fn append_entry(&mut self, topic: &str, partition: i32, data: &[u8]) -> MessageId {
-        self.ensure_ledger(topic).add_entry_in_place(partition, data)
+        self.ensure_ledger(topic)
+            .add_entry_in_place(partition, data)
     }
 
     fn messages(&self, topic: &str) -> Option<&Vec<(MessageId, Vec<u8>)>> {
         self.ledgers.get(topic).map(|ledger| &ledger.entries)
     }
 
-    fn get_message_by_id(&self, topic: &str, message_id: &MessageId) -> Option<(MessageId, Vec<u8>)> {
+    fn get_message_by_id(
+        &self,
+        topic: &str,
+        message_id: &MessageId,
+    ) -> Option<(MessageId, Vec<u8>)> {
         let messages = self.messages(topic)?;
         if let Some((stored_id, data)) = messages.get(message_id.entry as usize) {
             if stored_id == message_id {
@@ -343,7 +294,9 @@ mod tests {
     #[test]
     fn append_and_lookup_message_by_id() {
         let mut storage = InMemoryManagedLedgerStorage::new();
-        storage.create_topic("persistent://public/default/test").unwrap();
+        storage
+            .create_topic("persistent://public/default/test")
+            .unwrap();
 
         let msg0 = storage
             .append_message("persistent://public/default/test", -1, b"0")

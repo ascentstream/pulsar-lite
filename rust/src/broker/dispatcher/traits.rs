@@ -4,10 +4,10 @@
  * Each subscription type (Exclusive, Shared, Failover) implements this trait
  */
 
-use std::sync::Arc;
-use std::future::Future;
-use crate::broker::service::{Consumer, SharedStorage};
 use crate::broker::service::topic::SubscriptionType;
+use crate::broker::service::{Consumer, SharedStorage};
+use std::future::Future;
+use std::sync::Arc;
 
 /// Dispatcher trait - interface for message dispatchers
 pub trait Dispatcher: Send + Sync {
@@ -51,6 +51,6 @@ pub trait Dispatcher: Send + Sync {
         &self,
         storage: SharedStorage,
         topic: String,
-        subscription: String
+        subscription: String,
     ) -> impl Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send;
 }

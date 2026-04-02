@@ -9,7 +9,6 @@ mod config;
 mod cursor;
 mod factory;
 mod ledger;
-mod assignment;
 mod memory;
 mod storage;
 mod types;
@@ -20,7 +19,6 @@ pub use cursor::{
 };
 pub use factory::ManagedLedgerFactory;
 pub use ledger::ManagedLedger;
-pub use assignment::AssignmentStore;
 pub use memory::{
     InMemoryManagedCursor, InMemoryManagedLedger, InMemoryManagedLedgerFactory,
     InMemoryManagedLedgerStorage,

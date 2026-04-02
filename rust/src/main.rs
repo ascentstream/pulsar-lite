@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage = Arc::new(Mutex::new(Storage::new(&config.db_path)?));
     let restored_partition_metadata = {
         let guard = storage.lock().await;
-        guard.get_partitioned_topic_metadata()
+        guard.resources().get_partitioned_topic_metadata()
     };
 
     // Initialize broker service with configuration

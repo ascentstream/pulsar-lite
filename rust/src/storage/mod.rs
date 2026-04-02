@@ -1,11 +1,29 @@
-use anyhow::{anyhow, Result};
+mod metadata;
+mod managed_ledger;
+mod resources;
+
+use anyhow::Result;
 use log::{debug, info, warn};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeSet, HashMap};
+use std::path::Path;
+
+pub use metadata::{
+    DomainNode, JsonFileMetadataStore, MetadataBackend, MetadataDocument, MetadataFileNode,
+    MetadataStore, NamespaceMetadata, NamespaceNode, ParsedTopicName, PartitionedTopicNode,
+    SubscriptionMetadata, SubscriptionNode, TenantMetadata, TenantNode, TopicMetadata, TopicNode,
+};
+pub use managed_ledger::{
+    InMemoryManagedCursor, InMemoryManagedLedger, InMemoryManagedLedgerFactory,
+    InMemoryManagedLedgerStorage, ManagedCursor, ManagedCursorState, ManagedLedger,
+    ManagedLedgerConfig, ManagedLedgerFactory, ManagedLedgerPosition,
+};
+pub use resources::{
+    BaseResources, NamespaceResources, PulsarResources, TenantResources, TopicResources,
+};
 
 /// 消息 ID (ledger:entry:partition)
 /// partition 默认为 -1（非分区 topic）
+/// 未来归属 managed-ledger 风格的持久化消息状态主线。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct MessageId {
     pub ledger: u64,
@@ -15,6 +33,7 @@ pub struct MessageId {
 
 /// 订阅游标状态 (Shared 模式)
 /// 实现类似 Pulsar ManagedCursor 的 mark_delete + individual_deleted_messages 模型
+/// 未来归属 managed-ledger 风格的 cursor 状态主线。
 #[derive(Debug, Clone, Default)]
 pub struct SubscriptionCursor {
     /// 连续确认前沿 (mark_delete_position)
@@ -25,91 +44,13 @@ pub struct SubscriptionCursor {
     pub acked_holes: BTreeSet<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct TenantMetadata {
-    pub name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct NamespaceMetadata {
-    pub tenant: String,
-    pub name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct TopicMetadata {
-    pub full_name: String,
-    pub domain: String,
-    pub tenant: String,
-    pub namespace: String,
-    pub local_name: String,
-    pub partitioned: bool,
-    pub partition_count: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct SubscriptionMetadata {
-    pub topic: String,
-    pub name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedTopicName {
-    pub domain: String,
-    pub tenant: String,
-    pub namespace: String,
-    pub local_name: String,
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct MetadataDocument {
-    pub version: u32,
-    #[serde(flatten)]
-    pub resource_files: BTreeMap<String, MetadataFileNode>,
-    pub partitioned_topics: BTreeMap<String, PartitionedTopicNode>,
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct MetadataFileNode {
-    #[serde(flatten)]
-    pub tenants: BTreeMap<String, TenantNode>,
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct TenantNode {
-    #[serde(flatten)]
-    pub namespaces: BTreeMap<String, NamespaceNode>,
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct NamespaceNode {
-    #[serde(flatten)]
-    pub domains: BTreeMap<String, DomainNode>,
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct DomainNode {
-    #[serde(flatten)]
-    pub topics: BTreeMap<String, TopicNode>,
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct TopicNode {
-    #[serde(default)]
-    pub subscriptions: BTreeMap<String, SubscriptionNode>,
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct SubscriptionNode {}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct PartitionedTopicNode {
-    pub partitions: usize,
-}
-
 /// 存储引擎（基于内存，MVP 版本）
+/// 当前仍是唯一真实实现入口，后续会逐步将运行时消息状态迁入
+/// managed-ledger 风格的持久化消息状态主线，将 broker 资源语义迁入
+/// `storage::resources`。
 #[derive(Debug)]
 pub struct Storage {
+    // 运行时消息状态，未来归属 managed-ledger 风格的持久化消息状态主线
     // 内存中的 Topic 消息队列
     topics: HashMap<String, Vec<(MessageId, Vec<u8>)>>,
     // 内存中的游标缓存（订阅位置）- 用于 Exclusive 模式
@@ -124,20 +65,12 @@ pub struct Storage {
     topic_ledger_ids: HashMap<String, u64>,
     // 全局 ledger ID 计数器，用于分配新的 ledger ID
     next_ledger_id: u64,
-    // Metadata 持久化文件路径
-    metadata_path: PathBuf,
-    // Tenant metadata
-    tenants: HashMap<String, TenantMetadata>,
-    // Namespace metadata, keyed by tenant/namespace
-    namespaces: HashMap<String, NamespaceMetadata>,
-    // Topic metadata keyed by full topic name
-    topics_meta: HashMap<String, TopicMetadata>,
-    // Subscription metadata keyed by topic:subscription
-    subscriptions_meta: HashMap<String, SubscriptionMetadata>,
+    // 资源语义入口，对齐 PulsarResources 的聚合形状
+    resources: PulsarResources,
 }
 
 impl Storage {
-    const METADATA_VERSION: u32 = 2;
+    pub(crate) const METADATA_VERSION: u32 = 2;
 
     fn is_shared_message_acknowledged(cursor: Option<&SubscriptionCursor>, entry: u64) -> bool {
         cursor
@@ -148,492 +81,27 @@ impl Storage {
             .unwrap_or(false)
     }
 
-    fn metadata_path_from_db_path(path: &Path) -> PathBuf {
-        path.with_extension("metadata.json")
-    }
-
-    pub fn parse_topic_name(topic: &str) -> Result<ParsedTopicName> {
-        let (domain, rest) = topic
-            .split_once("://")
-            .ok_or_else(|| anyhow!("Invalid topic name '{}': missing domain", topic))?;
-        
-        // 对元数据做持久化，所以目前这边需要的 domian是 persistent 的
-        if domain != "persistent" {
-            return Err(anyhow!(
-                "Invalid topic name '{}': only persistent:// topics are supported",
-                topic
-            ));
-        }
-
-        let mut parts = rest.splitn(3, '/');
-        let tenant = parts
-            .next()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("Invalid topic name '{}': missing tenant", topic))?;
-        let namespace = parts
-            .next()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("Invalid topic name '{}': missing namespace", topic))?;
-        let local_name = parts
-            .next()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("Invalid topic name '{}': missing local topic name", topic))?;
-
-        Ok(ParsedTopicName {
-            domain: domain.to_string(),
-            tenant: tenant.to_string(),
-            namespace: namespace.to_string(),
-            local_name: local_name.to_string(),
-        })
-    }
-
-    fn namespace_key(tenant: &str, namespace: &str) -> String {
-        format!("{tenant}/{namespace}")
-    }
-
-    fn logical_topic_name(topic: &str) -> String {
-        let Ok(parsed) = Self::parse_topic_name(topic) else {
-            return topic.to_string();
-        };
-
-        let Some((base_local_name, suffix)) = parsed.local_name.rsplit_once("-partition-") else {
-            return topic.to_string();
-        };
-        if suffix.parse::<usize>().is_err() {
-            return topic.to_string();
-        }
-
-        format!(
-            "{}://{}/{}/{}",
-            parsed.domain, parsed.tenant, parsed.namespace, base_local_name
-        )
-    }
-
-    fn subscription_key(topic: &str, subscription: &str) -> String {
-        format!("{topic}:{subscription}")
-    }
-
-    fn build_metadata_document(&self) -> MetadataDocument {
-        let path_key = self.metadata_path.display().to_string();
-        let mut file_node = MetadataFileNode::default();
-
-        for tenant in self.tenants.values() {
-            file_node.tenants.entry(tenant.name.clone()).or_default();
-        }
-
-        for namespace in self.namespaces.values() {
-            file_node
-                .tenants
-                .entry(namespace.tenant.clone())
-                .or_default()
-                .namespaces
-                .entry(namespace.name.clone())
-                .or_default();
-        }
-
-        for topic in self.topics_meta.values() {
-            if topic.partitioned {
-                continue;
-            }
-
-            let parsed = match Self::parse_topic_name(&topic.full_name) {
-                Ok(parsed) => parsed,
-                Err(error) => {
-                    warn!(
-                        "Skipping topic metadata '{}' while building document: {}",
-                        topic.full_name, error
-                    );
-                    continue;
-                }
-            };
-
-            file_node
-                .tenants
-                .entry(parsed.tenant.clone())
-                .or_default()
-                .namespaces
-                .entry(parsed.namespace.clone())
-                .or_default()
-                .domains
-                .entry(parsed.domain.clone())
-                .or_default()
-                .topics
-                .entry(parsed.local_name.clone())
-                .or_default();
-        }
-
-        for subscription in self.subscriptions_meta.values() {
-            let parsed = match Self::parse_topic_name(&subscription.topic) {
-                Ok(parsed) => parsed,
-                Err(error) => {
-                    warn!(
-                        "Skipping subscription metadata '{}:{}' while building document: {}",
-                        subscription.topic, subscription.name, error
-                    );
-                    continue;
-                }
-            };
-
-            file_node
-                .tenants
-                .entry(parsed.tenant.clone())
-                .or_default()
-                .namespaces
-                .entry(parsed.namespace.clone())
-                .or_default()
-                .domains
-                .entry(parsed.domain.clone())
-                .or_default()
-                .topics
-                .entry(parsed.local_name.clone())
-                .or_default()
-                .subscriptions
-                .entry(subscription.name.clone())
-                .or_default();
-        }
-
-        let mut partitioned_topics = BTreeMap::new();
-        for topic in self.topics_meta.values() {
-            if !topic.partitioned {
-                continue;
-            }
-
-            let logical_topic = Self::logical_topic_name(&topic.full_name);
-            partitioned_topics
-                .entry(logical_topic)
-                .or_insert_with(|| PartitionedTopicNode {
-                    partitions: topic.partition_count.max(1),
-                });
-        }
-
-        let mut resource_files = BTreeMap::new();
-        resource_files.insert(path_key, file_node);
-
-        MetadataDocument {
-            version: Self::METADATA_VERSION,
-            resource_files,
-            partitioned_topics,
-        }
-    }
-
-    fn apply_metadata_document(&mut self, document: MetadataDocument) -> Result<()> {
-        self.tenants.clear();
-        self.namespaces.clear();
-        self.topics_meta.clear();
-        self.subscriptions_meta.clear();
-
-        for file_node in document.resource_files.into_values() {
-            for (tenant_name, tenant_node) in file_node.tenants {
-                self.tenants.insert(
-                    tenant_name.clone(),
-                    TenantMetadata {
-                        name: tenant_name.clone(),
-                    },
-                );
-
-                for (namespace_name, namespace_node) in tenant_node.namespaces {
-                    self.namespaces.insert(
-                        Self::namespace_key(&tenant_name, &namespace_name),
-                        NamespaceMetadata {
-                            tenant: tenant_name.clone(),
-                            name: namespace_name.clone(),
-                        },
-                    );
-
-                    for (domain_name, domain_node) in namespace_node.domains {
-                        for (topic_name, topic_node) in domain_node.topics {
-                            let full_name = format!(
-                                "{}://{}/{}/{}",
-                                domain_name, tenant_name, namespace_name, topic_name
-                            );
-                            let parsed = Self::parse_topic_name(&full_name).map_err(|error| {
-                                anyhow!(
-                                    "Invalid topic in metadata resources '{}': {}",
-                                    full_name, error
-                                )
-                            })?;
-
-                            self.topics_meta.insert(
-                                full_name.clone(),
-                                TopicMetadata {
-                                    full_name: full_name.clone(),
-                                    domain: parsed.domain,
-                                    tenant: parsed.tenant,
-                                    namespace: parsed.namespace,
-                                    local_name: parsed.local_name,
-                                    partitioned: false,
-                                    partition_count: 0,
-                                },
-                            );
-
-                            for subscription_name in topic_node.subscriptions.into_keys() {
-                                self.subscriptions_meta.insert(
-                                    Self::subscription_key(&full_name, &subscription_name),
-                                    SubscriptionMetadata {
-                                        topic: full_name.clone(),
-                                        name: subscription_name,
-                                    },
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        for (logical_topic, partitioned_topic) in document.partitioned_topics {
-            if partitioned_topic.partitions == 0 {
-                return Err(anyhow!(
-                    "Invalid partitioned topic metadata '{}': partitions must be greater than 0",
-                    logical_topic
-                ));
-            }
-
-            let parsed = Self::parse_topic_name(&logical_topic).map_err(|error| {
-                anyhow!(
-                    "Invalid partitioned topic metadata '{}': {}",
-                    logical_topic, error
-                )
-            })?;
-
-            self.tenants.insert(
-                parsed.tenant.clone(),
-                TenantMetadata {
-                    name: parsed.tenant.clone(),
-                },
-            );
-            self.namespaces.insert(
-                Self::namespace_key(&parsed.tenant, &parsed.namespace),
-                NamespaceMetadata {
-                    tenant: parsed.tenant.clone(),
-                    name: parsed.namespace.clone(),
-                },
-            );
-
-            let entry = self.topics_meta.entry(logical_topic.clone()).or_insert(TopicMetadata {
-                full_name: logical_topic.clone(),
-                domain: parsed.domain,
-                tenant: parsed.tenant,
-                namespace: parsed.namespace,
-                local_name: parsed.local_name,
-                partitioned: true,
-                partition_count: partitioned_topic.partitions,
-            });
-            entry.partitioned = true;
-            entry.partition_count = partitioned_topic.partitions;
-        }
-
-        Ok(())
-    }
-
-    fn load_metadata_from_disk(&mut self) -> Result<()> {
-        if !self.metadata_path.exists() {
-            return Ok(());
-        }
-
-        let content = fs::read_to_string(&self.metadata_path).map_err(|error| {
-            anyhow!(
-                "Failed to read metadata file '{}': {error}",
-                self.metadata_path.display()
-            )
-        })?;
-        let raw: serde_json::Value = serde_json::from_str(&content).map_err(|error| {
-            anyhow!(
-                "Failed to parse metadata file '{}': {error}",
-                self.metadata_path.display()
-            )
-        })?;
-
-        if raw.get("tenants").is_some()
-            || raw.get("namespaces").is_some()
-            || raw.get("topics").is_some()
-            || raw.get("subscriptions").is_some()
-        {
-            return Err(anyhow!(
-                "Failed to parse metadata file '{}': old flat MetadataSnapshot format is no longer supported; delete the metadata file and recreate resources",
-                self.metadata_path.display()
-            ));
-        }
-
-        let document: MetadataDocument = serde_json::from_value(raw).map_err(|error| {
-            anyhow!(
-                "Failed to parse metadata file '{}': {error}",
-                self.metadata_path.display()
-            )
-        })?;
-        self.apply_metadata_document(document)?;
-        Ok(())
-    }
-
-    fn persist_metadata_to_disk(&self) -> Result<()> {
-        if let Some(parent) = self.metadata_path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                anyhow!(
-                    "Failed to create metadata directory '{}': {error}",
-                    parent.display()
-                )
-            })?;
-        }
-
-        let document = self.build_metadata_document();
-        let serialized = serde_json::to_string_pretty(&document)?;
-        let tmp_path = self.metadata_path.with_extension("metadata.json.tmp");
-        fs::write(&tmp_path, serialized).map_err(|error| {
-            anyhow!(
-                "Failed to write temporary metadata file '{}': {error}",
-                tmp_path.display()
-            )
-        })?;
-        fs::rename(&tmp_path, &self.metadata_path).map_err(|error| {
-            anyhow!(
-                "Failed to replace metadata file '{}' with '{}': {error}",
-                self.metadata_path.display(),
-                tmp_path.display()
-            )
-        })?;
-        Ok(())
-    }
-
-    pub fn ensure_tenant(&mut self, tenant: &str) -> Result<()> {
-        if self.tenants.contains_key(tenant) {
-            return Ok(());
-        }
-
-        self.tenants.insert(
-            tenant.to_string(),
-            TenantMetadata {
-                name: tenant.to_string(),
-            },
-        );
-        self.persist_metadata_to_disk()
-    }
-
-    pub fn ensure_namespace(&mut self, tenant: &str, namespace: &str) -> Result<()> {
-        self.ensure_tenant(tenant)?;
-
-        let key = Self::namespace_key(tenant, namespace);
-        if self.namespaces.contains_key(&key) {
-            return Ok(());
-        }
-
-        self.namespaces.insert(
-            key,
-            NamespaceMetadata {
-                tenant: tenant.to_string(),
-                name: namespace.to_string(),
-            },
-        );
-        self.persist_metadata_to_disk()
-    }
-
-    pub fn ensure_topic_metadata(
-        &mut self,
-        topic: &str,
-        partitioned: bool,
-        partition_count: usize,
-    ) -> Result<()> {
-        let parsed = Self::parse_topic_name(topic)?;
-        self.ensure_namespace(&parsed.tenant, &parsed.namespace)?;
-
-        let key = topic.to_string();
-        let mut changed = false;
-        let entry = self.topics_meta.entry(key.clone()).or_insert_with(|| {
-            changed = true;
-            TopicMetadata {
-                full_name: key.clone(),
-                domain: parsed.domain.clone(),
-                tenant: parsed.tenant.clone(),
-                namespace: parsed.namespace.clone(),
-                local_name: parsed.local_name.clone(),
-                partitioned,
-                partition_count: if partitioned { partition_count } else { 0 },
-            }
-        });
-
-        if partitioned {
-            let desired_partition_count = partition_count.max(1);
-            if !entry.partitioned || entry.partition_count != desired_partition_count {
-                entry.partitioned = true;
-                entry.partition_count = desired_partition_count;
-                changed = true;
-            }
-        } else if !entry.partitioned && entry.partition_count != 0 {
-            entry.partition_count = 0;
-            changed = true;
-        }
-
-        if changed {
-            self.persist_metadata_to_disk()?;
-        }
-
-        Ok(())
-    }
-
-    pub fn ensure_subscription_metadata(&mut self, topic: &str, subscription: &str) -> Result<()> {
-        self.ensure_topic_metadata(topic, false, 0)?;
-
-        let key = Self::subscription_key(topic, subscription);
-        if self.subscriptions_meta.contains_key(&key) {
-            return Ok(());
-        }
-
-        self.subscriptions_meta.insert(
-            key,
-            SubscriptionMetadata {
-                topic: topic.to_string(),
-                name: subscription.to_string(),
-            },
-        );
-        self.persist_metadata_to_disk()
-    }
-
-    pub fn get_partitioned_topic_metadata(&self) -> HashMap<String, usize> {
-        self.topics_meta
-            .iter()
-            .filter_map(|(topic, metadata)| {
-                metadata
-                    .partitioned
-                    .then_some((topic.clone(), metadata.partition_count))
-            })
-            .collect()
-    }
-
-    pub fn has_tenant_metadata(&self, tenant: &str) -> bool {
-        self.tenants.contains_key(tenant)
-    }
-
-    pub fn has_namespace_metadata(&self, tenant: &str, namespace: &str) -> bool {
-        self.namespaces
-            .contains_key(&Self::namespace_key(tenant, namespace))
-    }
-
-    pub fn get_topic_metadata(&self, topic: &str) -> Option<&TopicMetadata> {
-        self.topics_meta.get(topic)
-    }
-
-    pub fn has_subscription_metadata(&self, topic: &str, subscription: &str) -> bool {
-        self.subscriptions_meta
-            .contains_key(&Self::subscription_key(topic, subscription))
-    }
-
     /// 创建存储
     pub fn new(path: &Path) -> Result<Self> {
         info!("In-memory storage initialized (MVP version)");
-        let mut storage = Self {
+        let storage = Self {
             topics: HashMap::new(),
             cursors: HashMap::new(),
             message_assignments: HashMap::new(),
             subscription_cursors: HashMap::new(),
             topic_ledger_ids: HashMap::new(),
             next_ledger_id: 0,
-            metadata_path: Self::metadata_path_from_db_path(path),
-            tenants: HashMap::new(),
-            namespaces: HashMap::new(),
-            topics_meta: HashMap::new(),
-            subscriptions_meta: HashMap::new(),
+            resources: PulsarResources::new(path)?,
         };
-        storage.load_metadata_from_disk()?;
         Ok(storage)
+    }
+
+    pub fn resources(&self) -> &PulsarResources {
+        &self.resources
+    }
+
+    pub fn resources_mut(&mut self) -> &mut PulsarResources {
+        &mut self.resources
     }
 
     /// 创建 Topic
@@ -680,7 +148,10 @@ impl Storage {
 
     /// 订阅 Topic
     pub fn subscribe(&mut self, topic: &str, subscription: &str) -> Result<()> {
-        if let Err(error) = self.ensure_subscription_metadata(topic, subscription) {
+        if let Err(error) = self
+            .resources_mut()
+            .ensure_subscription(topic, subscription, Self::METADATA_VERSION)
+        {
             warn!(
                 "Skipping metadata persistence for subscription '{}' on topic '{}': {}",
                 subscription, topic, error
@@ -920,6 +391,7 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::tempdir;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1001,20 +473,32 @@ mod tests {
         let mut storage = Storage::new(&db_path).unwrap();
 
         let topic = "persistent://public/default/test";
-        storage.ensure_topic_metadata(topic, true, 3).unwrap();
-        storage.ensure_topic_metadata(topic, true, 3).unwrap();
-        storage.ensure_subscription_metadata(topic, "sub").unwrap();
-        storage.ensure_subscription_metadata(topic, "sub").unwrap();
+        storage
+            .resources_mut()
+            .ensure_topic(topic, true, 3, Storage::METADATA_VERSION)
+            .unwrap();
+        storage
+            .resources_mut()
+            .ensure_topic(topic, true, 3, Storage::METADATA_VERSION)
+            .unwrap();
+        storage
+            .resources_mut()
+            .ensure_subscription(topic, "sub", Storage::METADATA_VERSION)
+            .unwrap();
+        storage
+            .resources_mut()
+            .ensure_subscription(topic, "sub", Storage::METADATA_VERSION)
+            .unwrap();
 
-        assert!(storage.has_tenant_metadata("public"));
-        assert!(storage.has_namespace_metadata("public", "default"));
-        assert!(storage.has_subscription_metadata(topic, "sub"));
-        let metadata = storage.get_topic_metadata(topic).unwrap();
+        assert!(storage.resources().has_tenant("public"));
+        assert!(storage.resources().has_namespace("public", "default"));
+        assert!(storage.resources().has_subscription(topic, "sub"));
+        let metadata = storage.resources().get_topic_metadata(topic).unwrap();
         assert!(metadata.partitioned);
         assert_eq!(metadata.partition_count, 3);
 
         let document = storage.build_metadata_document();
-        let path_key = storage.metadata_path.display().to_string();
+        let path_key = storage.metadata_path().display().to_string();
         let topic_node = &document.resource_files[&path_key].tenants["public"].namespaces["default"]
             .domains["persistent"]
             .topics["test"];
@@ -1025,10 +509,10 @@ mod tests {
         );
 
         let reloaded = Storage::new(&db_path).unwrap();
-        let metadata = reloaded.get_topic_metadata(topic).unwrap();
+        let metadata = reloaded.resources().get_topic_metadata(topic).unwrap();
         assert!(metadata.partitioned);
         assert_eq!(metadata.partition_count, 3);
-        assert!(reloaded.has_subscription_metadata(topic, "sub"));
+        assert!(reloaded.resources().has_subscription(topic, "sub"));
     }
 
     #[test]
@@ -1039,25 +523,30 @@ mod tests {
 
         let base_topic = "persistent://public/default/test";
         let partition_topic = "persistent://public/default/test-partition-0";
-        storage.ensure_topic_metadata(base_topic, true, 3).unwrap();
         storage
-            .ensure_topic_metadata(partition_topic, false, 0)
+            .resources_mut()
+            .ensure_topic(base_topic, true, 3, Storage::METADATA_VERSION)
             .unwrap();
         storage
-            .ensure_subscription_metadata(partition_topic, "sub")
+            .resources_mut()
+            .ensure_topic(partition_topic, false, 0, Storage::METADATA_VERSION)
+            .unwrap();
+        storage
+            .resources_mut()
+            .ensure_subscription(partition_topic, "sub", Storage::METADATA_VERSION)
             .unwrap();
 
-        assert!(storage.get_topic_metadata(base_topic).is_some());
-        assert!(storage.get_topic_metadata(partition_topic).is_some());
-        assert!(!storage.has_subscription_metadata(base_topic, "sub"));
-        assert!(storage.has_subscription_metadata(partition_topic, "sub"));
+        assert!(storage.resources().get_topic_metadata(base_topic).is_some());
+        assert!(storage.resources().get_topic_metadata(partition_topic).is_some());
+        assert!(!storage.resources().has_subscription(base_topic, "sub"));
+        assert!(storage.resources().has_subscription(partition_topic, "sub"));
 
         let document = storage.build_metadata_document();
-        let path_key = storage.metadata_path.display().to_string();
+        let path_key = storage.metadata_path().display().to_string();
         let topics = &document.resource_files[&path_key].tenants["public"].namespaces["default"]
             .domains["persistent"]
             .topics;
-        assert!(topics.contains_key("test"));
+        assert!(!topics.contains_key("test"));
         assert!(topics.contains_key("test-partition-0"));
         assert!(topics["test-partition-0"].subscriptions.contains_key("sub"));
         assert_eq!(

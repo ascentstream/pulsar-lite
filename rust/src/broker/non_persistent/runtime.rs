@@ -1,15 +1,16 @@
 /*
- * Non-persistent runtime foundation
+ * Non-persistent runtime placeholders
  *
- * This layer deliberately keeps only topic/subscription runtime state.
- * Dispatcher-driven delivery is added in a later step so this PR can stay
- * focused on domain and runtime split without pulling protocol wiring along.
+ * These placeholders allow the broker runtime to grow a dedicated
+ * non-persistent path without changing the protocol/topic naming layer first.
  */
 
+use crate::broker::non_persistent::NonPersistentDispatcherEnum;
 use crate::broker::service::topic::{KeySharedPolicy, SubscriptionType};
 use crate::broker::service::Consumer;
 use crate::storage::NonPersistentEntry;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 #[derive(Debug, Default)]
@@ -31,13 +32,7 @@ impl NonPersistentTopicRuntime {
     }
 
     pub fn drain_published_messages(&mut self) -> Vec<NonPersistentEntry> {
-        if self.published_messages.is_empty() {
-            return Vec::new();
-        }
-
-        std::mem::take(&mut self.published_messages)
-            .into_iter()
-            .collect()
+        self.published_messages.drain(..).collect()
     }
 }
 
@@ -49,8 +44,7 @@ pub struct NonPersistentSubscriptionRuntime {
     properties: HashMap<String, String>,
     key_shared_policy: Option<KeySharedPolicy>,
     is_fenced: bool,
-    consumers: BTreeMap<u64, Arc<Consumer>>,
-    active_consumer_id: Option<u64>,
+    dispatcher: Option<NonPersistentDispatcherEnum>,
 }
 
 impl NonPersistentSubscriptionRuntime {
@@ -68,53 +62,88 @@ impl NonPersistentSubscriptionRuntime {
             properties,
             key_shared_policy,
             is_fenced: false,
-            consumers: BTreeMap::new(),
-            active_consumer_id: None,
+            dispatcher: None,
         }
     }
 
-    fn refresh_active_consumer(&mut self) {
-        self.active_consumer_id = match self.sub_type {
-            SubscriptionType::Failover => self.consumers.first_key_value().map(|(id, _)| *id),
-            _ => None,
-        };
+    fn reuse_or_create_dispatcher(&mut self) {
+        let requires_rebuild = self.dispatcher.as_ref().is_some_and(|dispatcher| {
+            !dispatcher.is_consumer_connected()
+                && (dispatcher.get_type() != self.sub_type
+                    || !dispatcher.has_same_key_shared_policy(self.key_shared_policy.as_ref()))
+        });
+
+        if requires_rebuild {
+            self.dispatcher = None;
+        }
+
+        if self.dispatcher.is_none() {
+            self.dispatcher = Some(NonPersistentDispatcherEnum::new(
+                self.sub_type,
+                self.topic_name.clone(),
+                self.partition_index,
+                self.key_shared_policy.clone(),
+            ));
+        }
     }
 
     pub fn add_consumer(&mut self, consumer: Arc<Consumer>) -> Result<(), String> {
         if self.is_fenced {
             return Err("Subscription is fenced".to_string());
         }
-
-        if matches!(self.sub_type, SubscriptionType::Exclusive) && !self.consumers.is_empty() {
-            return Err("Exclusive subscription already has a consumer".to_string());
+        self.reuse_or_create_dispatcher();
+        let dispatcher = self
+            .dispatcher
+            .as_mut()
+            .ok_or_else(|| "Failed to create non-persistent dispatcher".to_string())?;
+        if dispatcher.is_consumer_connected()
+            && (dispatcher.get_type() != self.sub_type
+                || !dispatcher.has_same_key_shared_policy(consumer.key_shared_policy().as_ref()))
+        {
+            return Err("Consumer is incompatible with the current dispatcher".to_string());
         }
-
-        self.consumers.insert(consumer.consumer_id, consumer);
-        self.refresh_active_consumer();
-        Ok(())
+        dispatcher.add_consumer(consumer)
     }
 
     pub fn remove_consumer(&mut self, consumer_id: u64) -> Option<Arc<Consumer>> {
-        let removed = self.consumers.remove(&consumer_id);
-        self.refresh_active_consumer();
-        removed
+        let consumer = self
+            .dispatcher
+            .as_mut()
+            .and_then(|dispatcher| dispatcher.remove_consumer(consumer_id));
+
+        if self
+            .dispatcher
+            .as_ref()
+            .is_some_and(|dispatcher| !dispatcher.is_consumer_connected())
+        {
+            self.dispatcher = None;
+        }
+
+        consumer
     }
 
     pub fn get_consumer(&self, consumer_id: u64) -> Option<Arc<Consumer>> {
-        self.consumers.get(&consumer_id).cloned()
+        self.dispatcher.as_ref()?.get_consumer(consumer_id)
     }
 
     pub fn get_consumers(&self) -> Vec<Arc<Consumer>> {
-        self.consumers.values().cloned().collect()
+        self.dispatcher
+            .as_ref()
+            .map(|dispatcher| dispatcher.get_consumers())
+            .unwrap_or_default()
     }
 
     pub fn get_active_consumer(&self) -> Option<Arc<Consumer>> {
-        self.active_consumer_id
-            .and_then(|consumer_id| self.get_consumer(consumer_id))
+        self.dispatcher
+            .as_ref()
+            .and_then(|dispatcher| dispatcher.get_active_consumer())
     }
 
     pub fn has_consumers(&self) -> bool {
-        !self.consumers.is_empty()
+        self.dispatcher
+            .as_ref()
+            .map(|dispatcher| dispatcher.is_consumer_connected())
+            .unwrap_or(false)
     }
 
     pub fn is_fenced(&self) -> bool {
@@ -129,14 +158,6 @@ impl NonPersistentSubscriptionRuntime {
         self.key_shared_policy.as_ref()
     }
 
-    pub fn topic_name(&self) -> &str {
-        &self.topic_name
-    }
-
-    pub fn partition_index(&self) -> i32 {
-        self.partition_index
-    }
-
     pub fn fence(&mut self) {
         self.is_fenced = true;
     }
@@ -146,20 +167,28 @@ impl NonPersistentSubscriptionRuntime {
     }
 
     pub fn dropped_messages(&self) -> u64 {
-        0
+        self.dispatcher
+            .as_ref()
+            .map(|dispatcher| dispatcher.dropped_messages())
+            .unwrap_or(0)
     }
 
-    pub fn consumer_flow(&self, _consumer_id: u64, _additional_permits: u32) {
-        // Delivery wiring is intentionally deferred. Foundation PR only keeps
-        // runtime state and capability boundaries in place.
+    pub fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {
+        if let Some(dispatcher) = &self.dispatcher {
+            dispatcher.consumer_flow(consumer_id, additional_permits);
+        }
     }
 
     pub async fn send_messages(
         &self,
         entries: Vec<NonPersistentEntry>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        for entry in entries {
-            entry.release();
+        if let Some(dispatcher) = &self.dispatcher {
+            dispatcher.send_messages(entries).await?;
+        } else {
+            for entry in entries {
+                entry.release();
+            }
         }
         Ok(())
     }

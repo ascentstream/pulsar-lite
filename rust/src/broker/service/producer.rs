@@ -77,10 +77,15 @@ impl Producer {
     /// 3. Delegates to Topic.publish_message()
     pub async fn publish_message(
         &self,
+        metadata: Option<&[u8]>,
         payload: &[u8],
     ) -> Result<crate::storage::MessageId, Box<dyn std::error::Error>> {
-        log::debug!("Producer {} publishing message ({} bytes)",
-            self.producer_id, payload.len());
+        log::debug!(
+            "Producer {} publishing message (metadata={} bytes, payload={} bytes)",
+            self.producer_id,
+            metadata.map(|value| value.len()).unwrap_or(0),
+            payload.len()
+        );
 
         // TODO: Add validation logic here (Apache Pulsar style):
         // - Checksum verification
@@ -94,10 +99,15 @@ impl Producer {
 
         // Lock topic and publish (Apache Pulsar style)
         let mut topic = self.topic.write().await;
-        let message_id = topic.publish_message(payload).await?;
+        let message_id = topic.publish_message(metadata, payload).await?;
 
-        log::info!("Producer {} published message {}:{} to topic '{}'",
-            self.producer_id, message_id.ledger, message_id.entry, topic.name);
+        log::info!(
+            "Producer {} published message {}:{} to topic '{}'",
+            self.producer_id,
+            message_id.ledger,
+            message_id.entry,
+            topic.name
+        );
 
         Ok(message_id)
     }
@@ -125,7 +135,8 @@ impl Producer {
     /// Get topic name (convenience method)
     pub fn get_topic_name(&self) -> String {
         // Use try_read to avoid blocking, fallback to empty string if locked
-        self.topic.try_read()
+        self.topic
+            .try_read()
             .map(|t| t.name.clone())
             .unwrap_or_default()
     }
@@ -148,16 +159,16 @@ impl std::hash::Hash for Producer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::topic::Topic;
+    use super::*;
     use crate::storage::Storage;
     use std::path::Path;
-    use tokio::sync::Mutex;
     use std::sync::Arc as StdArc;
+    use tokio::sync::Mutex;
 
     fn create_test_topic() -> Arc<RwLock<Topic>> {
         let storage = StdArc::new(Mutex::new(
-            Storage::new(Path::new("/tmp/test-producer-storage")).unwrap()
+            Storage::new(Path::new("/tmp/test-producer-storage")).unwrap(),
         ));
         Arc::new(RwLock::new(Topic::new("test-topic".to_string(), storage)))
     }
@@ -165,12 +176,7 @@ mod tests {
     #[tokio::test]
     async fn test_producer_stats() {
         let topic = create_test_topic();
-        let producer = Producer::new(
-            1,
-            "test-producer".to_string(),
-            topic,
-            "conn-1".to_string(),
-        );
+        let producer = Producer::new(1, "test-producer".to_string(), topic, "conn-1".to_string());
 
         // Record some messages
         producer.record_message_sent(100).await;

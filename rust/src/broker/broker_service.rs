@@ -771,4 +771,52 @@ mod tests {
             .await;
         assert!(matches!(topic, TopicRef::Partitioned(_)));
     }
+
+    #[tokio::test]
+    async fn non_persistent_topic_domain_uses_non_persistent_runtime() {
+        let storage = create_test_storage();
+        let mut manager = BrokerService::with_config(storage, 0);
+
+        let topic_ref = manager
+            .get_or_create_topic_auto("non-persistent://public/default/np-topic")
+            .await;
+
+        match topic_ref {
+            TopicRef::NonPartitioned(topic) => {
+                let guard = topic.read().await;
+                assert_eq!(
+                    guard.runtime_mode(),
+                    crate::broker::service::topic::TopicRuntimeMode::NonPersistent
+                );
+            }
+            other => panic!("expected non-partitioned topic, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_persistent_partitioned_topics_inherit_non_persistent_runtime() {
+        let storage = create_test_storage();
+        let mut manager = BrokerService::with_config(storage, 2);
+
+        let topic_ref = manager
+            .get_or_create_topic_auto("non-persistent://public/default/np-topic")
+            .await;
+
+        match topic_ref {
+            TopicRef::Partitioned(topic) => {
+                let guard = topic.read().await;
+                let partition = guard.get_partition(0).expect("partition 0");
+                let partition_guard = partition.read().await;
+                assert_eq!(
+                    partition_guard.runtime_mode(),
+                    crate::broker::service::topic::TopicRuntimeMode::NonPersistent
+                );
+                assert_eq!(
+                    partition_guard.name,
+                    "non-persistent://public/default/np-topic-partition-0"
+                );
+            }
+            other => panic!("expected partitioned topic, got {other:?}"),
+        }
+    }
 }

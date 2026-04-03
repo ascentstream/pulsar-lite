@@ -10,7 +10,7 @@ pub use managed_ledger::{
     InMemoryManagedCursor, InMemoryManagedLedger, InMemoryManagedLedgerFactory,
     InMemoryManagedLedgerStorage, ManagedCursor, ManagedCursorState, ManagedLedger,
     ManagedLedgerConfig, ManagedLedgerFactory, ManagedLedgerPosition, ManagedLedgerStorage,
-    MessageId, SubscriptionCursor,
+    MessageId, NonPersistentEntry, SubscriptionCursor,
 };
 pub use metadata::{
     DomainNode, JsonFileMetadataStore, MetadataBackend, MetadataDocument, MetadataFileNode,
@@ -264,10 +264,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_topic_name_accepts_non_persistent_names() {
+        let parsed = Storage::parse_topic_name("non-persistent://public/default/test").unwrap();
+        assert_eq!(parsed.domain, "non-persistent");
+        assert_eq!(parsed.tenant, "public");
+        assert_eq!(parsed.namespace, "default");
+        assert_eq!(parsed.local_name, "test");
+    }
+
+    #[test]
     fn parse_topic_name_rejects_invalid_names() {
         assert!(Storage::parse_topic_name("public/default/test").is_err());
-        assert!(Storage::parse_topic_name("non-persistent://public/default/test").is_err());
         assert!(Storage::parse_topic_name("persistent://public/default").is_err());
+        assert!(Storage::parse_topic_name("other://public/default/test").is_err());
     }
 
     #[test]

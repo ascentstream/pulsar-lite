@@ -3,11 +3,11 @@
  * Defines server-side commands for Pulsar protocol
  */
 
-// Import generated protobuf types
 use super::codec::proto::pulsar::{
     base_command, BaseCommand, CommandAckResponse, CommandConnected, CommandConsumerStatsResponse,
     CommandError, CommandLookupTopicResponse, CommandMessage, CommandPartitionedTopicMetadataResponse,
-    CommandPing, CommandPong, CommandProducerSuccess, CommandSendReceipt, CommandSuccess, MessageIdData,
+    CommandPing, CommandPong, CommandProducerSuccess, CommandSendError, CommandSendReceipt, CommandSuccess,
+    MessageIdData, ServerError,
     command_lookup_topic_response, command_partitioned_topic_metadata_response,
 };
 use prost::Message;
@@ -33,6 +33,12 @@ pub enum ServerCommand {
         ledger_id: u64,
         entry_id: u64,
         partition: i32,
+    },
+    SendError {
+        producer_id: u64,
+        sequence_id: u64,
+        error: ServerError,
+        message: String,
     },
     Success {
         request_id: u64,
@@ -138,6 +144,21 @@ impl ServerCommand {
                         ..Default::default()
                     }),
                     ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ServerCommand::SendError {
+                producer_id,
+                sequence_id,
+                error,
+                message,
+            } => BaseCommand {
+                r#type: Type::SendError as i32,
+                send_error: Some(CommandSendError {
+                    producer_id: *producer_id,
+                    sequence_id: *sequence_id,
+                    error: *error as i32,
+                    message: message.clone(),
                 }),
                 ..Default::default()
             },

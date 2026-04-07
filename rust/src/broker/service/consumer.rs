@@ -3,7 +3,10 @@
  * Inspired by Apache Pulsar's Consumer design
  */
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering},
+    Arc,
+};
 
 use super::topic::SubscriptionType;
 use super::{PendingAck, PendingAcksMap};
@@ -11,6 +14,7 @@ use tokio::sync::{mpsc, RwLock};
 
 /// Forward declaration for Subscription type
 use super::topic::Subscription;
+use super::topic::KeySharedPolicy;
 use crate::storage::MessageId;
 
 /// Consumer statistics
@@ -24,6 +28,10 @@ pub struct ConsumerStats {
     pub messages_acked: u64,
     /// Available permits (flow control)
     pub available_permits: u32,
+    /// Current active consumer id observed by this consumer for failover subscriptions.
+    pub active_consumer_id: Option<u64>,
+    /// Whether this consumer is currently the active consumer.
+    pub is_active_consumer: bool,
 }
 
 /// Pending message waiting to be sent to consumer
@@ -54,6 +62,7 @@ pub struct Consumer {
 
     /// Statistics
     stats: Arc<RwLock<ConsumerStats>>,
+    available_permits: AtomicU32,
 
     /// Message sender channel - sends messages to ServerCnx for delivery
     /// Format: (consumer_id, PendingMessage)
@@ -65,6 +74,10 @@ pub struct Consumer {
 
     /// Lower value means higher priority, consistent with native Pulsar.
     priority_level: i32,
+    key_shared_policy: Option<KeySharedPolicy>,
+    /// Failover active-consumer view, updated by dispatcher notifications.
+    active_consumer_id: AtomicI64,
+    is_active_consumer: AtomicBool,
 }
 
 impl std::fmt::Debug for Consumer {
@@ -92,38 +105,67 @@ impl Consumer {
         message_tx: mpsc::UnboundedSender<(u64, PendingMessage)>,
         priority_level: i32,
     ) -> Self {
+        Self::new_with_options(
+            consumer_id,
+            consumer_name,
+            subscription,
+            connection_id,
+            message_tx,
+            priority_level,
+            None,
+        )
+    }
+
+    pub fn new_with_options(
+        consumer_id: u64,
+        consumer_name: String,
+        subscription: Arc<RwLock<Subscription>>,
+        connection_id: String,
+        message_tx: mpsc::UnboundedSender<(u64, PendingMessage)>,
+        priority_level: i32,
+        key_shared_policy: Option<KeySharedPolicy>,
+    ) -> Self {
         Self {
             consumer_id,
             consumer_name,
             subscription,
             connection_id,
             stats: Arc::new(RwLock::new(ConsumerStats::default())),
+            available_permits: AtomicU32::new(0),
             message_tx,
             pending_acks: Arc::new(PendingAcksMap::new()),
             priority_level,
+            key_shared_policy,
+            active_consumer_id: AtomicI64::new(-1),
+            is_active_consumer: AtomicBool::new(false),
         }
     }
 
     /// Update permits (flow control)
     pub async fn add_permits(&self, permits: u32) {
-        let mut stats = self.stats.write().await;
-        stats.available_permits += permits;
+        self.available_permits.fetch_add(permits, Ordering::Relaxed);
     }
 
     /// Use one permit when dispatching a message
     pub async fn use_permit(&self) -> bool {
-        let mut stats = self.stats.write().await;
-        if stats.available_permits > 0 {
-            stats.available_permits -= 1;
-            true
-        } else {
-            false
+        let mut current = self.available_permits.load(Ordering::Relaxed);
+        while current > 0 {   
+            match self.available_permits.compare_exchange(
+                current,
+                current - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
         }
+        false
     }
 
     /// Get available permits
     pub async fn get_available_permits(&self) -> u32 {
-        self.stats.read().await.available_permits
+        self.available_permits.load(Ordering::Relaxed)
     }
 
     /// Record message dispatched to this consumer
@@ -141,7 +183,12 @@ impl Consumer {
 
     /// Get current statistics
     pub async fn get_stats(&self) -> ConsumerStats {
-        self.stats.read().await.clone()
+        let mut stats = self.stats.read().await.clone();
+        stats.available_permits = self.available_permits.load(Ordering::Relaxed);
+        let active_consumer_id = self.active_consumer_id.load(Ordering::Relaxed);
+        stats.active_consumer_id = (active_consumer_id >= 0).then_some(active_consumer_id as u64);
+        stats.is_active_consumer = self.is_active_consumer.load(Ordering::Relaxed);
+        stats
     }
 
     /// Get consumer ID
@@ -187,7 +234,7 @@ impl Consumer {
 
     /// Check if consumer has available permits
     pub async fn has_permits(&self) -> bool {
-        self.stats.read().await.available_permits > 0
+        self.available_permits.load(Ordering::Relaxed) > 0
     }
 
     // ========================================
@@ -214,7 +261,10 @@ impl Consumer {
 
         // Native Pulsar writes pending acks before the message is written so that
         // disconnect/close races cannot lose ownership bookkeeping.
-        if self.get_sub_type() == SubscriptionType::Shared
+        if matches!(
+            self.get_sub_type(),
+            SubscriptionType::Shared | SubscriptionType::KeyShared
+        )
             && !self
                 .track_message_dispatched(&message_id, redelivery_count)
                 .await
@@ -236,7 +286,10 @@ impl Consumer {
                 self.consumer_id,
                 e
             );
-            if self.get_sub_type() == SubscriptionType::Shared {
+            if matches!(
+                self.get_sub_type(),
+                SubscriptionType::Shared | SubscriptionType::KeyShared
+            ) {
                 self.remove_pending_ack(&message_id).await;
             }
             return false;
@@ -249,6 +302,24 @@ impl Consumer {
             self.consumer_id
         );
         true
+    }
+
+    pub async fn send_messages_batch(
+        &self,
+        messages: Vec<(MessageId, Vec<u8>, Vec<u8>, u32)>,
+    ) -> usize {
+        let mut sent = 0;
+        for (message_id, metadata, payload, redelivery_count) in messages {
+            if self
+                .send_message(message_id, metadata, payload, redelivery_count)
+                .await
+            {
+                sent += 1;
+            } else {
+                break;
+            }
+        }
+        sent
     }
 
     /// Legacy method - now just calls send_message
@@ -340,6 +411,26 @@ impl Consumer {
 
     pub fn get_priority_level(&self) -> i32 {
         self.priority_level
+    }
+
+    pub fn key_shared_policy(&self) -> Option<KeySharedPolicy> {
+        self.key_shared_policy.clone()
+    }
+
+    pub fn available_permits_now(&self) -> u32 {
+        self.available_permits.load(Ordering::Relaxed)
+    }
+
+    pub fn notify_active_consumer_change(&self, active_consumer_id: u64) {
+        self.active_consumer_id
+            .store(active_consumer_id as i64, Ordering::Relaxed);
+        self.is_active_consumer
+            .store(self.consumer_id == active_consumer_id, Ordering::Relaxed);
+    }
+
+    pub fn clear_active_consumer(&self) {
+        self.active_consumer_id.store(-1, Ordering::Relaxed);
+        self.is_active_consumer.store(false, Ordering::Relaxed);
     }
 
     // ========================================

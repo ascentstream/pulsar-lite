@@ -236,7 +236,7 @@ impl PartitionedTopic {
 
         let partition = self.partitions[partition_index].clone();
         let mut guard = partition.write().await;
-        guard.publish_message_with_metadata(metadata, payload).await
+        guard.publish_message(metadata, payload).await
     }
 
     // ==================== Statistics ====================

@@ -18,7 +18,7 @@ use super::{Consumer, Producer, SharedStorage};
 use crate::broker::broker_service::SharedBrokerService;
 use crate::broker::handler;
 use crate::protocol::codec::{
-    proto::pulsar::{base_command, BaseCommand, ProtocolVersion},
+    proto::pulsar::{base_command, BaseCommand, ProtocolVersion, ServerError},
     PulsarFrame, PulsarFrameCodec,
 };
 use crate::protocol::ServerCommand;
@@ -109,6 +109,11 @@ where
 
     /// Topic manager reference
     topic_manager: SharedBrokerService,
+    /// Connection-local non-persistent publish slots.
+    non_persistent_pending_messages: usize,
+    max_non_persistent_pending_messages: usize,
+    /// Maximum message size accepted by the broker.
+    max_message_size: usize,
 
     /// Advertised broker service url returned from Lookup.
     broker_service_url: String,
@@ -127,6 +132,8 @@ where
         keep_alive_interval: Duration,
         handshake_timeout: Duration,
         connection_liveness_check_timeout: Duration,
+        max_non_persistent_pending_messages: usize,
+        max_message_size: usize,
         broker_service_url: String,
     ) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
@@ -152,6 +159,9 @@ where
             next_consumer_id: 0,
             storage,
             topic_manager,
+            non_persistent_pending_messages: 0,
+            max_non_persistent_pending_messages,
+            max_message_size,
             broker_service_url,
         }
     }
@@ -533,9 +543,77 @@ where
     }
 
     async fn handle_send(&mut self, cmd: BaseCommand, frame: PulsarFrame) -> CnxResult<()> {
-        handler::handle_send(&mut self.framed, cmd, frame, &self.producers)
+        let send_cmd = cmd
+            .send
+            .as_ref()
+            .ok_or_else(|| to_cnx_error("Missing send command"))?;
+        let producer = self
+            .producers
+            .get(&send_cmd.producer_id)
+            .cloned()
+            .ok_or_else(|| {
+                to_cnx_error(format!("Unknown producer ID: {}", send_cmd.producer_id))
+            })?;
+
+        let topic = producer.get_topic();
+        let is_non_persistent = {
+            let topic_guard = topic.read().await;
+            topic_guard.runtime_mode()
+                == crate::broker::service::topic::TopicRuntimeMode::NonPersistent
+        };
+
+        let message_size = frame
+            .metadata
+            .as_ref()
+            .map(|value| value.len())
+            .unwrap_or(0)
+            + frame.payload.len();
+        if message_size > self.max_message_size {
+            self.framed
+                .send(ServerCommand::SendError {
+                    producer_id: send_cmd.producer_id,
+                    sequence_id: send_cmd.sequence_id,
+                    error: ServerError::NotAllowedError,
+                    message: format!(
+                        "Exceed maximum message size: {} > {}",
+                        message_size, self.max_message_size
+                    ),
+                })
+                .await
+                .map_err(to_cnx_error)?;
+            return Ok(());
+        }
+
+        if is_non_persistent
+            && self.non_persistent_pending_messages >= self.max_non_persistent_pending_messages
+        {
+            self.framed
+                .send(ServerCommand::SendReceipt {
+                    producer_id: send_cmd.producer_id,
+                    sequence_id: send_cmd.sequence_id,
+                    ledger_id: u64::MAX,
+                    entry_id: u64::MAX,
+                    partition: -1,
+                })
+                .await
+                .map_err(to_cnx_error)?;
+            return Ok(());
+        }
+
+        if is_non_persistent {
+            self.non_persistent_pending_messages += 1;
+        }
+
+        let result = handler::handle_send(&mut self.framed, cmd, frame, &self.producers)
             .await
-            .map_err(to_cnx_error)
+            .map_err(to_cnx_error);
+
+        if is_non_persistent {
+            self.non_persistent_pending_messages =
+                self.non_persistent_pending_messages.saturating_sub(1);
+        }
+
+        result
     }
 
     async fn handle_subscribe(&mut self, cmd: BaseCommand) -> CnxResult<()> {
@@ -602,6 +680,8 @@ pub async fn handle_connection(
     keep_alive_interval: Duration,
     handshake_timeout: Duration,
     connection_liveness_check_timeout: Duration,
+    max_non_persistent_pending_messages: usize,
+    max_message_size: usize,
     broker_service_url: String,
 ) -> CnxResult<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -619,6 +699,8 @@ pub async fn handle_connection(
         keep_alive_interval,
         handshake_timeout,
         connection_liveness_check_timeout,
+        max_non_persistent_pending_messages,
+        max_message_size,
         broker_service_url,
     );
     server_cnx.run().await
@@ -627,10 +709,14 @@ pub async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::broker::broker_service::BrokerService;
-    use crate::protocol::codec::proto::pulsar::{CommandConnect, CommandPing};
+    use crate::broker::broker_service::{BrokerService, TopicRef};
+    use crate::broker::service::{topic::TopicRuntimeMode, Producer};
+    use crate::protocol::codec::proto::pulsar::{
+        base_command, BaseCommand, CommandConnect, CommandPing, CommandSend,
+    };
     use crate::storage::Storage;
     use std::path::Path;
+    use std::sync::Arc;
     use tokio::io::{duplex, DuplexStream};
     use tokio::sync::{Mutex, RwLock};
 
@@ -649,6 +735,8 @@ mod tests {
             Duration::from_secs(30),
             Duration::from_secs(30),
             Duration::from_secs(10),
+            1000,
+            5 * 1024 * 1024,
             "pulsar://127.0.0.1:6650".to_string(),
         );
         let client_framed = Framed::new(client, PulsarFrameCodec::new());
@@ -665,6 +753,46 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    fn send_command(producer_id: u64, sequence_id: u64) -> BaseCommand {
+        BaseCommand {
+            r#type: base_command::Type::Send as i32,
+            send: Some(CommandSend {
+                producer_id,
+                sequence_id,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    async fn attach_non_persistent_producer(
+        server_cnx: &mut ServerCnx<DuplexStream>,
+        topic_name: &str,
+        producer_id: u64,
+    ) -> Arc<Producer> {
+        let topic = {
+            let mut broker = server_cnx.topic_manager.write().await;
+            match broker.get_or_create_topic_auto(topic_name).await {
+                TopicRef::NonPartitioned(topic) | TopicRef::Partition(topic) => topic,
+                TopicRef::Partitioned(_) => panic!("expected concrete topic"),
+            }
+        };
+
+        topic
+            .write()
+            .await
+            .set_runtime_mode(TopicRuntimeMode::NonPersistent);
+        let producer = Arc::new(Producer::new(
+            producer_id,
+            format!("producer-{producer_id}"),
+            topic.clone(),
+            server_cnx.connection_id.clone(),
+        ));
+        topic.write().await.add_producer(producer.clone()).unwrap();
+        server_cnx.producers.insert(producer_id, producer.clone());
+        producer
     }
 
     #[tokio::test]
@@ -776,5 +904,79 @@ mod tests {
             .expect("decoded pong frame");
         let cmd = BaseCommand::decode(&frame.command[..]).unwrap();
         assert_eq!(cmd.r#type, base_command::Type::Pong as i32);
+    }
+
+    #[tokio::test]
+    async fn non_persistent_send_too_large_returns_send_error() {
+        let (mut server_cnx, mut client) = build_test_connection();
+        server_cnx.max_message_size = 4;
+        attach_non_persistent_producer(
+            &mut server_cnx,
+            "non-persistent://public/default/non-persistent-limit-topic",
+            7,
+        )
+        .await;
+
+        server_cnx
+            .handle_send(
+                send_command(7, 11),
+                PulsarFrame {
+                    command: vec![],
+                    metadata: Some(vec![1, 2]),
+                    payload: vec![3, 4, 5],
+                    checksum: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let frame = client.next().await.unwrap().unwrap();
+        let cmd = BaseCommand::decode(&frame.command[..]).unwrap();
+        assert_eq!(cmd.r#type, base_command::Type::SendError as i32);
+        let send_error = cmd.send_error.expect("send error payload");
+        assert_eq!(send_error.producer_id, 7);
+        assert_eq!(send_error.sequence_id, 11);
+        assert_eq!(
+            send_error.error,
+            crate::protocol::codec::proto::pulsar::ServerError::NotAllowedError as i32
+        );
+        assert!(send_error.message.contains("Exceed maximum message size"));
+    }
+
+    #[tokio::test]
+    async fn non_persistent_send_limit_returns_negative_send_receipt() {
+        let (mut server_cnx, mut client) = build_test_connection();
+        server_cnx.max_non_persistent_pending_messages = 0;
+        server_cnx.non_persistent_pending_messages = 0;
+        attach_non_persistent_producer(
+            &mut server_cnx,
+            "non-persistent://public/default/non-persistent-slot-topic",
+            8,
+        )
+        .await;
+
+        server_cnx
+            .handle_send(
+                send_command(8, 12),
+                PulsarFrame {
+                    command: vec![],
+                    metadata: None,
+                    payload: vec![1, 2, 3],
+                    checksum: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let frame = client.next().await.unwrap().unwrap();
+        let cmd = BaseCommand::decode(&frame.command[..]).unwrap();
+        assert_eq!(cmd.r#type, base_command::Type::SendReceipt as i32);
+        let send_receipt = cmd.send_receipt.expect("send receipt payload");
+        let message_id = send_receipt.message_id.expect("message id");
+        assert_eq!(send_receipt.producer_id, 8);
+        assert_eq!(send_receipt.sequence_id, 12);
+        assert_eq!(message_id.ledger_id, u64::MAX);
+        assert_eq!(message_id.entry_id, u64::MAX);
+        assert_eq!(message_id.partition, Some(-1));
     }
 }

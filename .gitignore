@@ -53,4 +53,4 @@ temp/
 tests/java/
 
 # Pulsar metadata
-rust/pulsar-lite.metadata.json
+rust/*.metadata.json

@@ -41,6 +41,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.max_connections,
         config.max_connections_per_ip
     );
+    log::info!(
+        "Non-persistent limits: max_concurrent_per_connection={}, max_message_size={}B",
+        config.max_concurrent_non_persistent_messages_per_connection,
+        config.max_message_size_bytes
+    );
 
     // Initialize storage
     let storage = Arc::new(Mutex::new(Storage::new(&config.db_path)?));
@@ -96,6 +101,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 keep_alive_interval,
                 handshake_timeout,
                 connection_liveness_check_timeout,
+                config.max_concurrent_non_persistent_messages_per_connection,
+                config.max_message_size_bytes,
                 advertised_broker_url,
             ).await {
                 log::error!("Connection error from {}: {}", peer_addr, e);

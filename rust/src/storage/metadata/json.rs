@@ -73,7 +73,7 @@ impl JsonFileMetadataStore {
         }
 
         let serialized = serde_json::to_string_pretty(document)?;
-        let tmp_path = self.metadata_path.with_extension("metadata.json.tmp");
+        let tmp_path = PathBuf::from(format!("{}.tmp",self.metadata_path.display()));
         fs::write(&tmp_path, serialized).map_err(|error| {
             anyhow!(
                 "Failed to write temporary metadata file '{}': {error}",

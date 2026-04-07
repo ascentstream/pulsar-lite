@@ -88,9 +88,9 @@ pub fn parse_topic_name(topic: &str) -> Result<ParsedTopicName> {
         .split_once("://")
         .ok_or_else(|| anyhow!("Invalid topic name '{}': missing domain", topic))?;
 
-    if domain != "persistent" {
+    if domain != "persistent" && domain != "non-persistent" {
         return Err(anyhow!(
-            "Invalid topic name '{}': only persistent:// topics are supported",
+            "Invalid topic name '{}': only persistent:// and non-persistent:// topics are supported",
             topic
         ));
     }

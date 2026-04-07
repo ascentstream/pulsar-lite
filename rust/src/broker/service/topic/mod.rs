@@ -3,11 +3,15 @@
  * Provides topic management functionality
  */
 
+mod partitioned_topic;
 mod subscription;
 mod topic;
-mod partitioned_topic;
 
-pub use subscription::{Subscription, SubscriptionStats, SubscriptionType};
-pub use topic::{Topic, TopicStats, SharedSubscription};
-pub use partitioned_topic::{PartitionedTopic, PartitionedTopicStats, PartitionStats, SharedPartitionedTopic};
-
+pub use partitioned_topic::{
+    PartitionStats, PartitionedTopic, PartitionedTopicStats, SharedPartitionedTopic,
+};
+pub use subscription::{
+    KeySharedHashRange, KeySharedMode, KeySharedPolicy, Subscription, SubscriptionRuntimeMode,
+    SubscriptionStats, SubscriptionType,
+};
+pub use topic::{SharedSubscription, Topic, TopicRuntimeMode, TopicStats};

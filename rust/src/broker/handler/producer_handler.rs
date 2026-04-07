@@ -3,14 +3,14 @@
  * Handles producer-related commands: Producer, Send, CloseProducer
  */
 
+use crate::broker::broker_service::{SharedBrokerService, TopicRef};
+use crate::broker::service::Producer;
+use crate::protocol::codec::{proto::pulsar::BaseCommand, PulsarFrame, PulsarFrameCodec};
+use crate::protocol::ServerCommand;
 use futures::SinkExt;
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::protocol::codec::{PulsarFrameCodec, PulsarFrame, proto::pulsar::BaseCommand};
-use crate::protocol::ServerCommand;
 use tokio_util::codec::Framed;
-use crate::broker::service::Producer;
-use crate::broker::broker_service::{SharedBrokerService, TopicRef};
 
 /// Handle Producer command
 pub async fn handle_producer<T>(
@@ -34,12 +34,11 @@ where
     );
 
     if producers.contains_key(&producer_id) {
-        return Err(
-            format!("Producer {} already exists on this connection", producer_id).into(),
-        );
+        return Err(format!("Producer {} already exists on this connection", producer_id).into());
     }
 
-    let producer_name = producer_cmd.producer_name
+    let producer_name = producer_cmd
+        .producer_name
         .clone()
         .unwrap_or_else(|| format!("producer-{}", producer_id));
 
@@ -103,30 +102,41 @@ pub async fn handle_send<T>(
     framed: &mut Framed<T, PulsarFrameCodec>,
     cmd: BaseCommand,
     frame: PulsarFrame,
-    producers: &HashMap<u64, Arc<Producer>>
+    producers: &HashMap<u64, Arc<Producer>>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let send_cmd = cmd.send.as_ref().ok_or("Missing send command")?;
-    log::debug!("Handling Send command: producer_id={}, sequence_id={}",
-        send_cmd.producer_id, send_cmd.sequence_id);
+    log::debug!(
+        "Handling Send command: producer_id={}, sequence_id={}",
+        send_cmd.producer_id,
+        send_cmd.sequence_id
+    );
 
-    let producer = producers.get(&send_cmd.producer_id)
+    let producer = producers
+        .get(&send_cmd.producer_id)
         .ok_or_else(|| format!("Unknown producer ID: {}", send_cmd.producer_id))?
         .clone();
 
     // Publish message directly through Producer (Apache Pulsar style)
-    let message_id = producer.publish_message(&frame.payload).await?;
+    let message_id = producer
+        .publish_message(frame.metadata.as_deref(), &frame.payload)
+        .await?;
 
-    log::debug!("Stored message {}:{}:{} for topic '{}'",
-        message_id.ledger, message_id.entry, message_id.partition, producer.get_topic_name());
+    log::debug!(
+        "Stored message {}:{}:{} for topic '{}'",
+        message_id.ledger,
+        message_id.entry,
+        message_id.partition,
+        producer.get_topic_name()
+    );
 
     // Push mode: Dispatch message to all subscriptions immediately
     // This is consistent with Apache Pulsar's behavior
     {
         let topic = producer.get_topic();
-        let topic_guard = topic.read().await;
+        let mut topic_guard = topic.write().await;
         topic_guard.dispatch_to_subscriptions().await;
     }
 
@@ -155,9 +165,15 @@ pub async fn handle_close_producer<T>(
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let close_cmd = cmd.close_producer.as_ref().ok_or("Missing close producer command")?;
-    log::info!("Handling CloseProducer command: producer_id={}, request_id={}",
-        close_cmd.producer_id, close_cmd.request_id);
+    let close_cmd = cmd
+        .close_producer
+        .as_ref()
+        .ok_or("Missing close producer command")?;
+    log::info!(
+        "Handling CloseProducer command: producer_id={}, request_id={}",
+        close_cmd.producer_id,
+        close_cmd.request_id
+    );
 
     // Remove producer from connection tracking
     if let Some(producer) = producers.remove(&close_cmd.producer_id) {
@@ -165,12 +181,21 @@ where
         let topic = producer.get_topic();
         let mut topic_guard = topic.write().await;
         topic_guard.remove_producer(producer.get_producer_id());
-        log::info!("Removed producer {} from topic '{}' in Topic",
-            producer.get_producer_id(), topic_guard.name);
-        log::info!("Closed producer {} ({})",
-            producer.get_producer_id(), producer.get_producer_name());
+        log::info!(
+            "Removed producer {} from topic '{}' in Topic",
+            producer.get_producer_id(),
+            topic_guard.name
+        );
+        log::info!(
+            "Closed producer {} ({})",
+            producer.get_producer_id(),
+            producer.get_producer_name()
+        );
     } else {
-        log::warn!("Attempted to close unknown producer {}", close_cmd.producer_id);
+        log::warn!(
+            "Attempted to close unknown producer {}",
+            close_cmd.producer_id
+        );
     }
 
     // Send Success response
@@ -179,7 +204,10 @@ where
     };
 
     framed.send(response).await?;
-    log::info!("Sent Success response for CloseProducer request {}", close_cmd.request_id);
+    log::info!(
+        "Sent Success response for CloseProducer request {}",
+        close_cmd.request_id
+    );
 
     Ok(())
 }

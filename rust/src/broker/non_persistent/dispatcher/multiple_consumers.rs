@@ -191,6 +191,7 @@ mod tests {
     use bytes::Bytes;
     use std::path::Path;
     use std::sync::Arc;
+    use std::time::Instant;
     use tokio::sync::{mpsc, Mutex, RwLock};
 
     fn create_test_storage() -> SharedStorage {
@@ -252,5 +253,47 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert_eq!(dispatcher.dropped_messages(), 1);
         assert_eq!(consumer.get_available_permits().await, 1);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn perf_baseline_shared_dispatcher_32_consumers_10k_entries() {
+        const CONSUMER_COUNT: usize = 32;
+        const ENTRY_COUNT: usize = 10_000;
+
+        let subscription = create_test_subscription();
+        let mut dispatcher = NonPersistentDispatcherMultipleConsumers::new();
+        let mut _receivers = Vec::with_capacity(CONSUMER_COUNT);
+
+        for consumer_id in 0..CONSUMER_COUNT as u64 {
+            let (consumer, rx) = create_test_consumer(consumer_id, subscription.clone());
+            _receivers.push(rx);
+            consumer.add_permits(ENTRY_COUNT as u32).await;
+            dispatcher.consumer_flow(consumer.consumer_id, ENTRY_COUNT as u32);
+            dispatcher.add_consumer(consumer).unwrap();
+        }
+
+        // 构造消息
+        let entries: Vec<_> = (0..ENTRY_COUNT)
+            .map(|entry_id| {
+                NonPersistentEntry::create(
+                    1,
+                    entry_id as u64,
+                    -1,
+                    Bytes::new(),
+                    Bytes::from(format!("shared-{entry_id}")),
+                )
+            })
+            .collect();
+
+        let start = Instant::now();
+        dispatcher.send_messages(entries).await.unwrap();
+        let elapsed = start.elapsed();
+
+        println!(
+            "PERF baseline shared dispatcher: consumers={CONSUMER_COUNT}, entries={ENTRY_COUNT}, elapsed_ms={}",
+            elapsed.as_millis()
+        );
+        assert_eq!(dispatcher.dropped_messages(), 0);
     }
 }

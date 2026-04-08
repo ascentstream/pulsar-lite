@@ -326,6 +326,7 @@ mod tests {
     use crate::storage::Storage;
     use bytes::Bytes;
     use std::path::Path;
+    use std::time::Instant;
     use tokio::sync::{mpsc, Mutex, RwLock};
 
     fn create_test_storage() -> crate::broker::service::SharedStorage {
@@ -338,6 +339,17 @@ mod tests {
         consumer_id: u64,
         key_shared_policy: Option<KeySharedPolicy>,
     ) -> Arc<Consumer> {
+        let (consumer, _rx) = create_consumer_with_rx(consumer_id, key_shared_policy);
+        consumer
+    }
+
+    fn create_consumer_with_rx(
+        consumer_id: u64,
+        key_shared_policy: Option<KeySharedPolicy>,
+    ) -> (
+        Arc<Consumer>,
+        mpsc::UnboundedReceiver<(u64, crate::broker::service::PendingMessage)>,
+    ) {
         let subscription = Arc::new(RwLock::new(Subscription::new_with_options(
             "sub".to_string(),
             "non-persistent://public/default/key-shared".to_string(),
@@ -347,16 +359,19 @@ mod tests {
             key_shared_policy.clone(),
             create_test_storage(),
         )));
-        let (tx, _rx) = mpsc::unbounded_channel();
-        Arc::new(Consumer::new_with_options(
-            consumer_id,
-            format!("consumer-{consumer_id}"),
-            subscription,
-            "conn".to_string(),
-            tx,
-            0,
-            key_shared_policy,
-        ))
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Arc::new(Consumer::new_with_options(
+                consumer_id,
+                format!("consumer-{consumer_id}"),
+                subscription,
+                "conn".to_string(),
+                tx,
+                0,
+                key_shared_policy,
+            )),
+            rx,
+        )
     }
 
     fn metadata_with_partition_key(key: &str) -> Vec<u8> {
@@ -419,5 +434,118 @@ mod tests {
             Bytes::from_static(b"payload"),
         );
         let _ = entry;
+    }
+
+    fn sticky_ranges_for_slot(slot: usize, total: usize) -> Vec<KeySharedHashRange> {
+        const RANGE_MAX: i32 = (2 << 15) - 1;
+        let total = total as i32;
+        let slot = slot as i32;
+        let start = (slot * (RANGE_MAX + 1)) / total;
+        let end = (((slot + 1) * (RANGE_MAX + 1)) / total) - 1;
+        vec![KeySharedHashRange { start, end }]
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn perf_baseline_key_shared_auto_split_32_consumers_10k_entries() {
+        const CONSUMER_COUNT: usize = 32;
+        const ENTRY_COUNT: usize = 10_000;
+
+        let mut dispatcher = NonPersistentStickyKeyDispatcher::new(Some(KeySharedPolicy {
+            mode: KeySharedMode::AutoSplit,
+            ranges: Vec::new(),
+            allow_out_of_order_delivery: false,
+        }));
+        let mut _receivers = Vec::with_capacity(CONSUMER_COUNT);
+
+        for consumer_id in 0..CONSUMER_COUNT as u64 {
+            let (consumer, rx) = create_consumer_with_rx(
+                consumer_id,
+                Some(KeySharedPolicy {
+                    mode: KeySharedMode::AutoSplit,
+                    ranges: Vec::new(),
+                    allow_out_of_order_delivery: false,
+                }),
+            );
+            _receivers.push(rx);
+            consumer.add_permits(ENTRY_COUNT as u32).await;
+            dispatcher.consumer_flow(consumer.consumer_id, ENTRY_COUNT as u32);
+            dispatcher.add_consumer(consumer).unwrap();
+        }
+
+        let entries: Vec<_> = (0..ENTRY_COUNT)
+            .map(|entry_id| {
+                let key = format!("auto-split-key-{}", entry_id % 128);
+                NonPersistentEntry::create(
+                    1,
+                    entry_id as u64,
+                    -1,
+                    Bytes::from(metadata_with_partition_key(&key)),
+                    Bytes::from(format!("auto-split-{entry_id}")),
+                )
+            })
+            .collect();
+
+        let start = Instant::now();
+        dispatcher.send_messages(entries).await.unwrap();
+        let elapsed = start.elapsed();
+
+        println!(
+            "PERF baseline key-shared auto-split: consumers={CONSUMER_COUNT}, entries={ENTRY_COUNT}, elapsed_ms={}",
+            elapsed.as_millis()
+        );
+        assert_eq!(dispatcher.dropped_messages(), 0);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn perf_baseline_key_shared_sticky_32_consumers_10k_entries() {
+        const CONSUMER_COUNT: usize = 32;
+        const ENTRY_COUNT: usize = 10_000;
+
+        let mut dispatcher = NonPersistentStickyKeyDispatcher::new(Some(KeySharedPolicy {
+            mode: KeySharedMode::Sticky,
+            ranges: Vec::new(),
+            allow_out_of_order_delivery: false,
+        }));
+        let mut _receivers = Vec::with_capacity(CONSUMER_COUNT);
+
+        for consumer_id in 0..CONSUMER_COUNT as u64 {
+            let (consumer, rx) = create_consumer_with_rx(
+                consumer_id,
+                Some(KeySharedPolicy {
+                    mode: KeySharedMode::Sticky,
+                    ranges: sticky_ranges_for_slot(consumer_id as usize, CONSUMER_COUNT),
+                    allow_out_of_order_delivery: false,
+                }),
+            );
+            _receivers.push(rx);
+            consumer.add_permits(ENTRY_COUNT as u32).await;
+            dispatcher.consumer_flow(consumer.consumer_id, ENTRY_COUNT as u32);
+            dispatcher.add_consumer(consumer).unwrap();
+        }
+
+        let entries: Vec<_> = (0..ENTRY_COUNT)
+            .map(|entry_id| {
+                let key = format!("sticky-key-{}", entry_id % 128);
+                NonPersistentEntry::create(
+                    1,
+                    entry_id as u64,
+                    -1,
+                    Bytes::from(metadata_with_partition_key(&key)),
+                    Bytes::from(format!("sticky-{entry_id}")),
+                )
+            })
+            .collect();
+
+        let start = Instant::now();
+        dispatcher.send_messages(entries).await.unwrap();
+        let elapsed = start.elapsed();
+
+        println!(
+            "PERF baseline key-shared sticky: consumers={CONSUMER_COUNT}, entries={ENTRY_COUNT}, elapsed_ms={}",
+            elapsed.as_millis()
+        );
+        assert_eq!(dispatcher.dropped_messages(), 0);
     }
 }

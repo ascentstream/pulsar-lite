@@ -407,6 +407,15 @@ mod tests {
         .encode_to_vec()
     }
 
+    fn metadata_with_ordering_key_padding(key: &str, padding: usize) -> Vec<u8> {
+        MessageMetadata {
+            producer_name: "m".repeat(padding),
+            ordering_key: Some(key.as_bytes().to_vec()),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
     #[tokio::test]
     async fn sticky_mode_uses_consumer_hash_ranges() {
         let mut dispatcher = NonPersistentStickyKeyDispatcher::new(Some(KeySharedPolicy {
@@ -572,6 +581,67 @@ mod tests {
 
         println!(
             "PERF baseline key-shared sticky: consumers={CONSUMER_COUNT}, entries={ENTRY_COUNT}, elapsed_ms={}",
+            elapsed.as_millis()
+        );
+        assert_eq!(dispatcher.dropped_messages(), 0);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn perf_copy_path_key_shared_auto_split_32_consumers_10k_entries_4k_payload() {
+        const CONSUMER_COUNT: usize = 32;
+        const ENTRY_COUNT: usize = 10_000;
+        const KEY_COUNT: usize = 128;
+        const METADATA_PADDING: usize = 256;
+        const PAYLOAD_SIZE: usize = 4096;
+
+        let mut dispatcher = NonPersistentStickyKeyDispatcher::new(Some(KeySharedPolicy {
+            mode: KeySharedMode::AutoSplit,
+            ranges: Vec::new(),
+            allow_out_of_order_delivery: false,
+        }));
+        let mut _receivers = Vec::with_capacity(CONSUMER_COUNT);
+
+        for consumer_id in 0..CONSUMER_COUNT as u64 {
+            let (consumer, rx) = create_consumer_with_rx(
+                consumer_id,
+                Some(KeySharedPolicy {
+                    mode: KeySharedMode::AutoSplit,
+                    ranges: Vec::new(),
+                    allow_out_of_order_delivery: false,
+                }),
+            );
+            _receivers.push(rx);
+            consumer.add_permits(ENTRY_COUNT as u32).await;
+            dispatcher.consumer_flow(consumer.consumer_id, ENTRY_COUNT as u32);
+            dispatcher.add_consumer(consumer).unwrap();
+        }
+
+        let metadata_templates: Vec<_> = (0..KEY_COUNT)
+            .map(|key_id| {
+                let key = format!("copy-path-key-{key_id}");
+                Bytes::from(metadata_with_ordering_key_padding(&key, METADATA_PADDING))
+            })
+            .collect();
+        let payload = Bytes::from(vec![b'p'; PAYLOAD_SIZE]);
+        let entries: Vec<_> = (0..ENTRY_COUNT)
+            .map(|entry_id| {
+                NonPersistentEntry::create(
+                    1,
+                    entry_id as u64,
+                    -1,
+                    metadata_templates[entry_id % KEY_COUNT].clone(),
+                    payload.clone(),
+                )
+            })
+            .collect();
+
+        let start = Instant::now();
+        dispatcher.send_messages(entries).await.unwrap();
+        let elapsed = start.elapsed();
+
+        println!(
+            "PERF copy-path key-shared auto-split: consumers={CONSUMER_COUNT}, entries={ENTRY_COUNT}, metadata_padding={METADATA_PADDING}, payload_bytes={PAYLOAD_SIZE}, elapsed_ms={}",
             elapsed.as_millis()
         );
         assert_eq!(dispatcher.dropped_messages(), 0);

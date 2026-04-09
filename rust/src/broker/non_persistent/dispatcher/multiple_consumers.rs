@@ -9,7 +9,8 @@ use std::sync::{
 
 #[derive(Debug, Default)]
 pub struct NonPersistentDispatcherMultipleConsumers {
-    consumers: HashMap<u64, Arc<Consumer>>,
+    consumers_by_id: HashMap<u64, Arc<Consumer>>,
+    ordered_consumers: Vec<Arc<Consumer>>,
     next_consumer_index: AtomicUsize,
     total_available_permits: AtomicU32,
     dropped_messages: AtomicU64,
@@ -25,29 +26,41 @@ impl NonPersistentDispatcherMultipleConsumers {
     }
 
     pub fn is_consumer_connected(&self) -> bool {
-        !self.consumers.is_empty()
+        !self.consumers_by_id.is_empty()
     }
 
     pub fn get_consumers(&self) -> Vec<Arc<Consumer>> {
-        self.consumers.values().cloned().collect()
+        self.consumers_by_id.values().cloned().collect()
+    }
+
+    pub fn get_consumer(&self, consumer_id: u64) -> Option<Arc<Consumer>> {
+        self.consumers_by_id.get(&consumer_id).cloned()
+    }
+
+    fn rebuild_ordered_consumers(&mut self) {
+        let mut consumers: Vec<_> = self.consumers_by_id.values().cloned().collect();
+        consumers.sort_by_key(|consumer| (consumer.get_priority_level(), consumer.consumer_id));
+        self.ordered_consumers = consumers;
     }
 
     pub fn add_consumer(&mut self, consumer: Arc<Consumer>) -> Result<(), String> {
-        if self.consumers.contains_key(&consumer.consumer_id) {
+        if self.consumers_by_id.contains_key(&consumer.consumer_id) {
             return Err(format!(
                 "Consumer {} already exists in non-persistent shared dispatcher",
                 consumer.consumer_id
             ));
         }
-        self.consumers.insert(consumer.consumer_id, consumer);
+        self.consumers_by_id.insert(consumer.consumer_id, consumer);
+        self.rebuild_ordered_consumers();
         Ok(())
     }
 
     pub fn remove_consumer(&mut self, consumer_id: u64) -> Option<Arc<Consumer>> {
-        let consumer = self.consumers.remove(&consumer_id);
+        let consumer = self.consumers_by_id.remove(&consumer_id);
         if let Some(consumer) = &consumer {
             self.subtract_total_permits(consumer.available_permits_now());
         }
+        self.rebuild_ordered_consumers();
         consumer
     }
 
@@ -79,18 +92,18 @@ impl NonPersistentDispatcherMultipleConsumers {
         );
     }
 
-    async fn get_next_available_consumer(&self) -> Option<Arc<Consumer>> {
-        if self.consumers.is_empty() {
+    fn get_next_available_consumer(&self) -> Option<Arc<Consumer>> {
+        if self.ordered_consumers.is_empty() {
             return None;
         }
 
-        let mut consumers: Vec<_> = self.consumers.values().cloned().collect();
-        consumers.sort_by_key(|consumer| (consumer.get_priority_level(), consumer.consumer_id));
+        let start =
+            self.next_consumer_index.fetch_add(1, Ordering::Relaxed) % self.ordered_consumers.len();
 
-        let start = self.next_consumer_index.fetch_add(1, Ordering::Relaxed) % consumers.len();
-        for offset in 0..consumers.len() {
-            let consumer = consumers[(start + offset) % consumers.len()].clone();
-            if consumer.has_permits().await {
+        for offset in 0..self.ordered_consumers.len() {
+            let consumer =
+                self.ordered_consumers[(start + offset) % self.ordered_consumers.len()].clone();
+            if consumer.available_permits_now() > 0 {
                 return Some(consumer);
             }
         }
@@ -105,9 +118,7 @@ impl NonPersistentDispatcherMultipleConsumers {
         let mut pending_entries = entries.into_iter();
         while let Some(entry) = pending_entries.next() {
             if self.total_available_permits.load(Ordering::Relaxed) == 0 {
-                log::debug!(
-                    "Dropping non-persistent shared entry due to zero aggregate permits"
-                );
+                log::debug!("Dropping non-persistent shared entry due to zero aggregate permits");
                 self.record_drop(1);
                 entry.release();
                 while let Some(remaining) = pending_entries.next() {
@@ -117,7 +128,7 @@ impl NonPersistentDispatcherMultipleConsumers {
                 continue;
             }
 
-            let Some(consumer) = self.get_next_available_consumer().await else {
+            let Some(consumer) = self.get_next_available_consumer() else {
                 log::debug!("Dropping non-persistent shared entry due to no available consumer");
                 self.record_drop(1);
                 entry.release();
@@ -167,9 +178,7 @@ impl NonPersistentDispatcherMultipleConsumers {
                 }
             }
             if sent < attempted {
-                consumer
-                    .add_permits((attempted - sent) as u32)
-                    .await;
+                consumer.add_permits((attempted - sent) as u32).await;
             }
             if sent < attempted {
                 self.record_drop((attempted - sent) as u64);
@@ -191,6 +200,7 @@ mod tests {
     use bytes::Bytes;
     use std::path::Path;
     use std::sync::Arc;
+    use std::time::Instant;
     use tokio::sync::{mpsc, Mutex, RwLock};
 
     fn create_test_storage() -> SharedStorage {
@@ -252,5 +262,47 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert_eq!(dispatcher.dropped_messages(), 1);
         assert_eq!(consumer.get_available_permits().await, 1);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn perf_baseline_shared_dispatcher_32_consumers_10k_entries() {
+        const CONSUMER_COUNT: usize = 32;
+        const ENTRY_COUNT: usize = 10_000;
+
+        let subscription = create_test_subscription();
+        let mut dispatcher = NonPersistentDispatcherMultipleConsumers::new();
+        let mut _receivers = Vec::with_capacity(CONSUMER_COUNT);
+
+        for consumer_id in 0..CONSUMER_COUNT as u64 {
+            let (consumer, rx) = create_test_consumer(consumer_id, subscription.clone());
+            _receivers.push(rx);
+            consumer.add_permits(ENTRY_COUNT as u32).await;
+            dispatcher.consumer_flow(consumer.consumer_id, ENTRY_COUNT as u32);
+            dispatcher.add_consumer(consumer).unwrap();
+        }
+
+        // 构造消息
+        let entries: Vec<_> = (0..ENTRY_COUNT)
+            .map(|entry_id| {
+                NonPersistentEntry::create(
+                    1,
+                    entry_id as u64,
+                    -1,
+                    Bytes::new(),
+                    Bytes::from(format!("shared-{entry_id}")),
+                )
+            })
+            .collect();
+
+        let start = Instant::now();
+        dispatcher.send_messages(entries).await.unwrap();
+        let elapsed = start.elapsed();
+
+        println!(
+            "PERF baseline shared dispatcher: consumers={CONSUMER_COUNT}, entries={ENTRY_COUNT}, elapsed_ms={}",
+            elapsed.as_millis()
+        );
+        assert_eq!(dispatcher.dropped_messages(), 0);
     }
 }

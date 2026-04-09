@@ -24,6 +24,7 @@ cargo test perf_baseline --manifest-path rust/Cargo.toml -- --ignored --nocaptur
 - 这是一组 benchmark 风格的 ignored tests
 - 当前不作为 CI 阈值，只用于记录优化前后相对差异
 - 对比对象是 `pulsar-lite` 优化前 vs 优化后，不是原生 Pulsar
+- Shared dispatcher 的当前结果额外使用了 `5` 次预热 + `10` 次正式运行的方式采样，并采用“去掉最高值和最低值后对剩余 `8` 次求平均”的统计方式
 
 ## 基线场景
 
@@ -66,8 +67,10 @@ cargo test perf_baseline --manifest-path rust/Cargo.toml -- --ignored --nocaptur
 
 ### Shared dispatcher
 
-- 当前结果：consumers=`32`，entries=`10_000`：`17 ms`
-- 说明：目前 Shared 结果与本轮测试记录小一点，尚未观察到稳定且明显的正向收益
+- 当前结果：consumers=`32`，entries=`10_000`：`19.00 ms`
+- 统计方法：预热 `5` 次，正式运行 `10` 次，去掉最高值和最低值后，对剩余 `8` 次取平均
+- 正式运行样本（ms）：`19, 21, 19, 20, 18, 18, 18, 18, 22, 19`
+- 说明：Shared 结果存在一定波动，本轮按去极值平均后仍未观察到稳定且明显的正向收益
 
 ### KeyShared AutoSplit
 
@@ -84,7 +87,7 @@ cargo test perf_baseline --manifest-path rust/Cargo.toml -- --ignored --nocaptur
 
 - Shared dispatcher
 
-Shared 当前结果仍为 `17 ms`，未观察到明显改善。原因是本轮 Shared 优化主要消除了 consumer 选择阶段的重复 `collect + sort` 开销，但当前 perf baseline 计时范围覆盖的是整个 `send_messages()` 路径，而 Shared 每条消息仍然需要执行 permit 消耗、metadata/payload 拷贝、pending ack 跟踪以及逐条 channel send。这些 per-message 成本目前仍占主要比例，因此仅优化 selection path 后，整体耗时变化不明显。
+Shared 当前按去极值平均后的结果为 `19.00 ms`，仍未观察到明显改善。原因是本轮 Shared 优化主要消除了 consumer 选择阶段的重复 `collect + sort` 开销，但当前 perf baseline 计时范围覆盖的是整个 `send_messages()` 路径，而 Shared 每条消息仍然需要执行 permit 消耗、metadata/payload 拷贝、pending ack 跟踪以及逐条 channel send。这些 per-message 成本目前仍占主要比例，因此仅优化 selection path 后，整体耗时变化不明显。
 
 - KeyShared AutoSplit
 

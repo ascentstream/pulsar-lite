@@ -378,21 +378,36 @@ impl Topic {
                     .as_mut()
                     .map(|runtime| runtime.drain_published_messages())
                     .unwrap_or_default();
+                let subscriptions: Vec<_> = self
+                    .subscriptions
+                    .iter()
+                    .map(|(sub_name, subscription)| (sub_name.clone(), subscription.clone()))
+                    .collect();
+
+                let mut entries_by_subscription = Vec::with_capacity(subscriptions.len());
+                for _ in 0..subscriptions.len() {
+                    entries_by_subscription.push(Vec::with_capacity(entries.len()));
+                }
+
+                for entry in &entries {
+                    for subscription_entries in &mut entries_by_subscription {
+                        subscription_entries.push(entry.retained_duplicate());
+                    }
+                }
+
+                for ((sub_name, subscription), subscription_entries) in
+                    subscriptions.into_iter().zip(entries_by_subscription.into_iter())
+                {
+                    let sub_guard = subscription.read().await;
+                    if let Err(e) = sub_guard.send_non_persistent_entries(subscription_entries).await {
+                        log::error!(
+                            "Failed to dispatch non-persistent entries to subscription '{}' on topic '{}': {}",
+                            sub_name, self.name, e
+                        );
+                    }
+                }
 
                 for entry in entries {
-                    for (sub_name, subscription) in &self.subscriptions {
-                        let sub_guard = subscription.read().await;
-                        let duplicate = entry.retained_duplicate();
-                        if let Err(e) = sub_guard
-                            .send_non_persistent_entries(vec![duplicate])
-                            .await
-                        {
-                            log::error!(
-                                "Failed to dispatch non-persistent entry to subscription '{}' on topic '{}': {}",
-                                sub_name, self.name, e
-                            );
-                        }
-                    }
                     entry.release();
                 }
             }
@@ -627,6 +642,63 @@ mod tests {
         assert_eq!(second.0, 2);
         assert_eq!(first.1.payload, b"first".to_vec());
         assert_eq!(second.1.payload, b"second".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_non_persistent_dispatch_batches_entries_per_subscription() {
+        let storage = create_test_storage();
+        let mut topic = Topic::new("test-topic".to_string(), storage);
+        topic.set_runtime_mode(TopicRuntimeMode::NonPersistent);
+
+        let subscription1 = topic
+            .get_or_create_subscription("sub1", SubscriptionType::Exclusive)
+            .await
+            .unwrap();
+        let subscription2 = topic
+            .get_or_create_subscription("sub2", SubscriptionType::Exclusive)
+            .await
+            .unwrap();
+
+        let (consumer1, mut rx1) = create_test_consumer_with_rx(1, subscription1.clone());
+        let (consumer2, mut rx2) = create_test_consumer_with_rx(2, subscription2.clone());
+
+        consumer1.add_permits(2).await;
+        consumer2.add_permits(2).await;
+
+        {
+            let mut sub_guard = subscription1.write().await;
+            sub_guard.add_consumer(consumer1).unwrap();
+        }
+        {
+            let mut sub_guard = subscription2.write().await;
+            sub_guard.add_consumer(consumer2).unwrap();
+        }
+        {
+            let sub_guard = subscription1.read().await;
+            sub_guard.consumer_flow(1, 2).await;
+        }
+        {
+            let sub_guard = subscription2.read().await;
+            sub_guard.consumer_flow(2, 2).await;
+        }
+
+        topic.publish_message(None, b"first").await.unwrap();
+        topic.publish_message(None, b"second").await.unwrap();
+        topic.dispatch_to_subscriptions().await;
+
+        let sub1_first = rx1.recv().await.expect("sub1 gets first message");
+        let sub1_second = rx1.recv().await.expect("sub1 gets second message");
+        let sub2_first = rx2.recv().await.expect("sub2 gets first message");
+        let sub2_second = rx2.recv().await.expect("sub2 gets second message");
+
+        assert_eq!(sub1_first.0, 1);
+        assert_eq!(sub1_second.0, 1);
+        assert_eq!(sub2_first.0, 2);
+        assert_eq!(sub2_second.0, 2);
+        assert_eq!(sub1_first.1.payload, b"first".to_vec());
+        assert_eq!(sub1_second.1.payload, b"second".to_vec());
+        assert_eq!(sub2_first.1.payload, b"first".to_vec());
+        assert_eq!(sub2_second.1.payload, b"second".to_vec());
     }
 
     #[tokio::test]

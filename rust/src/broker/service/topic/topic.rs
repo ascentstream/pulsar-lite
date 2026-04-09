@@ -457,6 +457,7 @@ mod tests {
     use prost::Message;
     use std::path::Path;
     use std::sync::Arc as StdArc;
+    use std::time::Instant;
     use tokio::sync::{Mutex, RwLock, mpsc};
 
     fn create_test_storage() -> SharedStorage {
@@ -626,6 +627,66 @@ mod tests {
         assert_eq!(second.0, 2);
         assert_eq!(first.1.payload, b"first".to_vec());
         assert_eq!(second.1.payload, b"second".to_vec());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn perf_non_persistent_shared_topic_dispatch_1_subscription_2_consumers_10k_entries() {
+        const ENTRY_COUNT: usize = 10_000;
+
+        let storage = create_test_storage();
+        let mut topic = Topic::new("test-topic".to_string(), storage);
+        topic.set_runtime_mode(TopicRuntimeMode::NonPersistent);
+
+        let subscription = topic
+            .get_or_create_subscription("sub1", SubscriptionType::Shared)
+            .await
+            .unwrap();
+        let (consumer1, mut rx1) = create_test_consumer_with_rx(1, subscription.clone());
+        let (consumer2, mut rx2) = create_test_consumer_with_rx(2, subscription.clone());
+        {
+            let mut sub_guard = subscription.write().await;
+            sub_guard.add_consumer(consumer1.clone()).unwrap();
+            sub_guard.add_consumer(consumer2.clone()).unwrap();
+        }
+
+        consumer1.add_permits(ENTRY_COUNT as u32).await;
+        consumer2.add_permits(ENTRY_COUNT as u32).await;
+        {
+            let sub_guard = subscription.read().await;
+            sub_guard.consumer_flow(1, ENTRY_COUNT as u32).await;
+            sub_guard.consumer_flow(2, ENTRY_COUNT as u32).await;
+        }
+
+        for entry_id in 0..ENTRY_COUNT {
+            let payload = format!("shared-topic-{entry_id}");
+            topic.publish_message(None, payload.as_bytes()).await.unwrap();
+        }
+
+        assert_eq!(topic.non_persistent_pending_message_count(), ENTRY_COUNT);
+
+        let start = Instant::now();
+        topic.dispatch_to_subscriptions().await;
+        let elapsed = start.elapsed();
+
+        println!(
+            "PERF non-persistent shared topic dispatch: subscriptions=1, consumers=2, entries={ENTRY_COUNT}, elapsed_ms={}",
+            elapsed.as_millis()
+        );
+
+        let mut received = 0;
+        while rx1.try_recv().is_ok() {
+            received += 1;
+        }
+        while rx2.try_recv().is_ok() {
+            received += 1;
+        }
+
+        assert_eq!(received, ENTRY_COUNT);
+        assert_eq!(topic.non_persistent_pending_message_count(), 0);
+
+        let stats = subscription.read().await.get_stats().await;
+        assert_eq!(stats.dropped_messages, 0);
     }
 
     #[tokio::test]

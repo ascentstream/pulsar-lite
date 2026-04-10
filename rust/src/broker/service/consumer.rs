@@ -3,6 +3,7 @@
  * Inspired by Apache Pulsar's Consumer design
  */
 
+use bytes::Bytes;
 use std::sync::{
     atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering},
     Arc,
@@ -40,9 +41,9 @@ pub struct PendingMessage {
     /// Message ID
     pub message_id: MessageId,
     /// Encoded Pulsar MessageMetadata
-    pub metadata: Vec<u8>,
+    pub metadata: Bytes,
     /// Message payload
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
 }
 
 /// Consumer - represents a consumer connection
@@ -249,8 +250,8 @@ impl Consumer {
     pub async fn send_message(
         &self,
         message_id: MessageId,
-        metadata: Vec<u8>,
-        payload: Vec<u8>,
+        metadata: Bytes,
+        payload: Bytes,
         redelivery_count: u32,
     ) -> bool {
         let msg = PendingMessage {
@@ -306,7 +307,7 @@ impl Consumer {
 
     pub async fn send_messages_batch(
         &self,
-        messages: Vec<(MessageId, Vec<u8>, Vec<u8>, u32)>,
+        messages: Vec<(MessageId, Bytes, Bytes, u32)>,
     ) -> usize {
         let mut sent = 0;
         for (message_id, metadata, payload, redelivery_count) in messages {
@@ -327,8 +328,8 @@ impl Consumer {
     pub async fn enqueue_message(
         &self,
         message_id: MessageId,
-        metadata: Vec<u8>,
-        payload: Vec<u8>,
+        metadata: Bytes,
+        payload: Bytes,
     ) -> bool {
         self.send_message(message_id, metadata, payload, 0).await
     }
@@ -618,7 +619,12 @@ mod tests {
         };
         assert!(
             consumer
-                .send_message(msg_id.clone(), vec![9, 9], b"test-payload".to_vec(), 0)
+                .send_message(
+                    msg_id.clone(),
+                    Bytes::from_static(&[9, 9]),
+                    Bytes::from_static(b"test-payload"),
+                    0,
+                )
                 .await
         );
 
@@ -626,8 +632,8 @@ mod tests {
         let (consumer_id, received) = rx.recv().await.unwrap();
         assert_eq!(consumer_id, 42);
         assert_eq!(received.message_id, msg_id);
-        assert_eq!(received.metadata, vec![9, 9]);
-        assert_eq!(received.payload, b"test-payload");
+        assert_eq!(received.metadata.as_ref(), &[9, 9]);
+        assert_eq!(received.payload.as_ref(), b"test-payload");
         assert_eq!(consumer.pending_ack_count().await, 1);
     }
 

@@ -163,8 +163,8 @@ impl NonPersistentDispatcherMultipleConsumers {
                         entry: batch_entry.entry_id(),
                         partition: batch_entry.partition(),
                     },
-                    batch_entry.metadata().to_vec(),
-                    batch_entry.payload().to_vec(),
+                    batch_entry.metadata_bytes(),
+                    batch_entry.payload_bytes(),
                     0,
                 ));
             }

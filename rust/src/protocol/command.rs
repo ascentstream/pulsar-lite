@@ -3,6 +3,7 @@
  * Defines server-side commands for Pulsar protocol
  */
 
+use bytes::Bytes;
 use super::codec::proto::pulsar::{
     base_command, BaseCommand, CommandAckResponse, CommandConnected, CommandConsumerStatsResponse,
     CommandError, CommandLookupTopicResponse, CommandMessage, CommandPartitionedTopicMetadataResponse,
@@ -61,8 +62,8 @@ pub enum ServerCommand {
         ledger_id: u64,
         entry_id: u64,
         partition: i32,
-        metadata: Vec<u8>,
-        payload: Vec<u8>,
+        metadata: Bytes,
+        payload: Bytes,
     },
     AckResponse {
         consumer_id: u64,
@@ -265,7 +266,7 @@ impl ServerCommand {
     /// Get payload reference if available
     pub fn get_payload(&self) -> Option<&[u8]> {
         match self {
-            ServerCommand::Message { payload, .. } => Some(payload),
+            ServerCommand::Message { payload, .. } => Some(payload.as_ref()),
             _ => None,
         }
     }
@@ -302,8 +303,8 @@ mod tests {
             ledger_id: 2,
             entry_id: 3,
             partition: 0,
-            metadata: vec![4, 5, 6],
-            payload: vec![1, 2, 3],
+            metadata: Bytes::from_static(&[4, 5, 6]),
+            payload: Bytes::from_static(&[1, 2, 3]),
         };
         assert!(msg_cmd.has_payload());
 

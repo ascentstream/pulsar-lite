@@ -7,7 +7,7 @@
  * Frame decoder: LengthFieldBasedFrameDecoder(maxMessageSize + 10KB, 0, 4, 0, 4)
  */
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use prost::Message;
 use std::io::{self, Cursor};
 use tokio_util::codec::{Decoder, Encoder};
@@ -181,8 +181,8 @@ impl PulsarFrameCodec {
         ledger_id: u64,
         entry_id: u64,
         partition: i32,
-        metadata: &[u8],
-        payload: &[u8],
+        metadata: &Bytes,
+        payload: &Bytes,
         dst: &mut BytesMut,
     ) -> Result<(), io::Error> {
         use proto::pulsar::*;
@@ -205,27 +205,37 @@ impl PulsarFrameCodec {
 
         let cmd_bytes = command.encode_to_vec();
 
-        let metadata_bytes = if metadata.is_empty() {
-            MessageMetadata {
-                sequence_id: entry_id,
-                ..Default::default()
-            }
-            .encode_to_vec()
+        let synthesized_metadata = if metadata.is_empty() {
+            Some(
+                MessageMetadata {
+                    sequence_id: entry_id,
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            )
         } else {
-            metadata.to_vec()
+            None
         };
+        let metadata_len = synthesized_metadata
+            .as_ref()
+            .map(|bytes| bytes.len())
+            .unwrap_or_else(|| metadata.len());
 
         // Pulsar wire format for messages with payload:
         // [TOTAL_SIZE (4B)] [CMD_SIZE (4B)] [CMD] [METADATA_SIZE (4B)] [METADATA] [PAYLOAD]
-        let total_size = 4 + cmd_bytes.len() + 4 + metadata_bytes.len() + payload.len();
+        let total_size = 4 + cmd_bytes.len() + 4 + metadata_len + payload.len();
 
         dst.reserve(total_size + 4);
         dst.put_u32(total_size as u32);              // TOTAL_SIZE
         dst.put_u32(cmd_bytes.len() as u32);         // CMD_SIZE
         dst.extend_from_slice(&cmd_bytes);           // CMD
-        dst.put_u32(metadata_bytes.len() as u32);    // METADATA_SIZE
-        dst.extend_from_slice(&metadata_bytes);      // METADATA
-        dst.extend_from_slice(payload);              // PAYLOAD
+        dst.put_u32(metadata_len as u32);            // METADATA_SIZE
+        if let Some(metadata_bytes) = synthesized_metadata {
+            dst.extend_from_slice(&metadata_bytes);  // METADATA
+        } else {
+            dst.extend_from_slice(metadata.as_ref()); // METADATA
+        }
+        dst.extend_from_slice(payload.as_ref());     // PAYLOAD
 
         Ok(())
     }
@@ -236,6 +246,7 @@ mod tests {
     use super::*;
     use super::proto::pulsar::{CompressionType, KeyValue, MessageMetadata};
     use crate::protocol::command::ServerCommand;
+    use bytes::Bytes;
     use prost::Message;
 
     #[test]
@@ -296,8 +307,8 @@ mod tests {
             ledger_id: 9,
             entry_id: 11,
             partition: -1,
-            metadata: metadata.clone(),
-            payload: payload.clone(),
+            metadata: Bytes::from(metadata.clone()),
+            payload: Bytes::from(payload.clone()),
         };
 
         let mut encoded = BytesMut::new();

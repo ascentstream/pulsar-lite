@@ -360,8 +360,8 @@ where
             ledger_id: pending_msg.message_id.ledger,
             entry_id: pending_msg.message_id.entry,
             partition: pending_msg.message_id.partition,
-            metadata: pending_msg.metadata.to_vec(),
-            payload: pending_msg.payload.to_vec(),
+            metadata: pending_msg.metadata,
+            payload: pending_msg.payload,
         };
 
         self.framed.send(cmd).await.map_err(to_cnx_error)?;

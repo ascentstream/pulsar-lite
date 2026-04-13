@@ -247,17 +247,21 @@ impl Consumer {
     /// Called by Dispatcher to send messages for delivery.
     /// The message is sent through the channel to ServerCnx which will
     /// serialize and send it to the client.
-    pub async fn send_message(
+    pub async fn send_message<M, P>(
         &self,
         message_id: MessageId,
-        metadata: Bytes,
-        payload: Bytes,
+        metadata: M,
+        payload: P,
         redelivery_count: u32,
-    ) -> bool {
+    ) -> bool
+    where
+        M: Into<Bytes>,
+        P: Into<Bytes>,
+    {
         let msg = PendingMessage {
             message_id: message_id.clone(),
-            metadata,
-            payload,
+            metadata: metadata.into(),
+            payload: payload.into(),
         };
 
         // Native Pulsar writes pending acks before the message is written so that
@@ -325,12 +329,16 @@ impl Consumer {
 
     /// Legacy method - now just calls send_message
     /// Kept for backward compatibility with dispatcher
-    pub async fn enqueue_message(
+    pub async fn enqueue_message<M, P>(
         &self,
         message_id: MessageId,
-        metadata: Bytes,
-        payload: Bytes,
-    ) -> bool {
+        metadata: M,
+        payload: P,
+    ) -> bool
+    where
+        M: Into<Bytes>,
+        P: Into<Bytes>,
+    {
         self.send_message(message_id, metadata, payload, 0).await
     }
 

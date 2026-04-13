@@ -69,3 +69,133 @@ where
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::broker::broker_service::BrokerService;
+    use crate::protocol::codec::proto::pulsar::{
+        base_command,
+        CommandLookupTopic,
+        CommandPartitionedTopicMetadata,
+    };
+    use crate::storage::Storage;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::io::{duplex, AsyncReadExt};
+    use tokio::sync::{Mutex, RwLock};
+
+    fn create_test_broker_service() -> SharedBrokerService {
+        Arc::new(RwLock::new(BrokerService::new(Arc::new(Mutex::new(
+            Storage::new(Path::new("/tmp/test-lookup-handler")).unwrap(),
+        )))))
+    }
+
+    fn create_lookup_command(request_id: u64) -> BaseCommand {
+        BaseCommand {
+            r#type: base_command::Type::Lookup as i32,
+            lookup_topic: Some(CommandLookupTopic {
+                topic: "persistent://public/default/perf-topic".to_string(),
+                request_id,
+                authoritative: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn create_partition_metadata_command(request_id: u64) -> BaseCommand {
+        BaseCommand {
+            r#type: base_command::Type::PartitionedMetadata as i32,
+            partition_metadata: Some(CommandPartitionedTopicMetadata {
+                topic: "persistent://public/default/perf-topic".to_string(),
+                request_id,
+                metadata_auto_creation_enabled: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    async fn spawn_drain_task<T>(mut io: T) -> tokio::task::JoinHandle<()>
+    where
+        T: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        tokio::spawn(async move {
+            let mut buf = [0u8; 8192];
+            loop {
+                match io.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn perf_query_lookup_handler_10k_requests() {
+        const REQUEST_COUNT: usize = 10_000;
+
+        let (client, server) = duplex(1 << 20);
+        let mut framed = Framed::new(server, PulsarFrameCodec::new());
+        let drain_task = spawn_drain_task(client).await;
+        let command = create_lookup_command(1);
+
+        let start = Instant::now();
+        for request_id in 0..REQUEST_COUNT as u64 {
+            let mut command = command.clone();
+            command.lookup_topic.as_mut().unwrap().request_id = request_id;
+            handle_lookup(&mut framed, command, "pulsar://127.0.0.1:6650")
+                .await
+                .unwrap();
+        }
+        let elapsed = start.elapsed();
+
+        println!(
+            "PERF query lookup handler: requests={REQUEST_COUNT}, elapsed_ms={}",
+            elapsed.as_millis()
+        );
+
+        drop(framed);
+        drain_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn perf_query_partition_metadata_handler_10k_requests() {
+        const REQUEST_COUNT: usize = 10_000;
+
+        let broker_service = create_test_broker_service();
+        {
+            let mut guard = broker_service.write().await;
+            guard
+                .get_or_create_partitioned_topic("persistent://public/default/perf-topic", 8)
+                .await;
+        }
+
+        let (client, server) = duplex(1 << 20);
+        let mut framed = Framed::new(server, PulsarFrameCodec::new());
+        let drain_task = spawn_drain_task(client).await;
+        let command = create_partition_metadata_command(1);
+
+        let start = Instant::now();
+        for request_id in 0..REQUEST_COUNT as u64 {
+            let mut command = command.clone();
+            command.partition_metadata.as_mut().unwrap().request_id = request_id;
+            handle_partition_metadata(&mut framed, command, &broker_service)
+                .await
+                .unwrap();
+        }
+        let elapsed = start.elapsed();
+
+        println!(
+            "PERF query partition metadata handler: requests={REQUEST_COUNT}, elapsed_ms={}",
+            elapsed.as_millis()
+        );
+
+        drop(framed);
+        drain_task.await.unwrap();
+    }
+}

@@ -30,6 +30,8 @@ Cargo.lock
 
 # IDEs
 .vscode/
+.omx/
+.codex
 .idea/
 *.swp
 *.swo
@@ -54,3 +56,4 @@ tests/java/
 
 # Pulsar metadata
 rust/*.metadata.json
+

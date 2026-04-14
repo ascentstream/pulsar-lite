@@ -98,8 +98,8 @@ impl NonPersistentDispatcherExclusive {
                     entry: entry.entry_id(),
                     partition: entry.partition(),
                 },
-                entry.metadata().to_vec(),
-                entry.payload().to_vec(),
+                entry.metadata_bytes(),
+                entry.payload_bytes(),
                 0,
             ));
         }
@@ -375,8 +375,8 @@ impl NonPersistentDispatcherFailover {
                     entry: entry.entry_id(),
                     partition: entry.partition(),
                 },
-                entry.metadata().to_vec(),
-                entry.payload().to_vec(),
+                entry.metadata_bytes(),
+                entry.payload_bytes(),
                 0,
             ));
         }

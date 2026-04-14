@@ -163,8 +163,8 @@ impl NonPersistentDispatcherMultipleConsumers {
                         entry: batch_entry.entry_id(),
                         partition: batch_entry.partition(),
                     },
-                    batch_entry.metadata().to_vec(),
-                    batch_entry.payload().to_vec(),
+                    batch_entry.metadata_bytes(),
+                    batch_entry.payload_bytes(),
                     0,
                 ));
             }
@@ -239,6 +239,10 @@ mod tests {
         )
     }
 
+    fn sized_bytes(fill: u8, size: usize) -> Bytes {
+        Bytes::from(vec![fill; size])
+    }
+
     #[tokio::test]
     async fn shared_dispatcher_limits_batch_by_aggregate_permits() {
         let subscription = create_test_subscription();
@@ -301,6 +305,51 @@ mod tests {
 
         println!(
             "PERF baseline shared dispatcher: consumers={CONSUMER_COUNT}, entries={ENTRY_COUNT}, elapsed_ms={}",
+            elapsed.as_millis()
+        );
+        assert_eq!(dispatcher.dropped_messages(), 0);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn perf_copy_path_shared_dispatcher_32_consumers_10k_entries_4k_payload() {
+        const CONSUMER_COUNT: usize = 32;
+        const ENTRY_COUNT: usize = 10_000;
+        const METADATA_SIZE: usize = 256;
+        const PAYLOAD_SIZE: usize = 4096;
+
+        let subscription = create_test_subscription();
+        let mut dispatcher = NonPersistentDispatcherMultipleConsumers::new();
+        let mut _receivers = Vec::with_capacity(CONSUMER_COUNT);
+
+        for consumer_id in 0..CONSUMER_COUNT as u64 {
+            let (consumer, rx) = create_test_consumer(consumer_id, subscription.clone());
+            _receivers.push(rx);
+            consumer.add_permits(ENTRY_COUNT as u32).await;
+            dispatcher.consumer_flow(consumer.consumer_id, ENTRY_COUNT as u32);
+            dispatcher.add_consumer(consumer).unwrap();
+        }
+
+        let metadata = sized_bytes(b'm', METADATA_SIZE);
+        let payload = sized_bytes(b'p', PAYLOAD_SIZE);
+        let entries: Vec<_> = (0..ENTRY_COUNT)
+            .map(|entry_id| {
+                NonPersistentEntry::create(
+                    1,
+                    entry_id as u64,
+                    -1,
+                    metadata.clone(),
+                    payload.clone(),
+                )
+            })
+            .collect();
+
+        let start = Instant::now();
+        dispatcher.send_messages(entries).await.unwrap();
+        let elapsed = start.elapsed();
+
+        println!(
+            "PERF copy-path shared dispatcher: consumers={CONSUMER_COUNT}, entries={ENTRY_COUNT}, metadata_bytes={METADATA_SIZE}, payload_bytes={PAYLOAD_SIZE}, elapsed_ms={}",
             elapsed.as_millis()
         );
         assert_eq!(dispatcher.dropped_messages(), 0);

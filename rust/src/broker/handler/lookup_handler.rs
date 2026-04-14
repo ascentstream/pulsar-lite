@@ -19,20 +19,15 @@ where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let partition_cmd = cmd.partition_metadata.as_ref().ok_or("Missing partition metadata command")?;
-    log::info!("Handling PartitionMetadata command: topic={}, request_id={}",
+    log::debug!("Handling PartitionMetadata command: topic={}, request_id={}",
         partition_cmd.topic, partition_cmd.request_id);
 
     // Get partition count from BrokerService
     let guard = broker_service.read().await;
-    let partitions = if guard.should_be_partitioned(&partition_cmd.topic) {
-        guard.get_partition_count(&partition_cmd.topic)
-            .unwrap_or(guard.get_default_partitions()) as i32
-    } else {
-        0  // Non-partitioned topic
-    };
+    let partitions = guard.get_partition_metadata_response_count(&partition_cmd.topic);
     drop(guard);
 
-    log::info!("Returning partition metadata: topic={}, partitions={}", partition_cmd.topic, partitions);
+    log::debug!("Returning partition metadata: topic={}, partitions={}", partition_cmd.topic, partitions);
 
     let response = ServerCommand::PartitionMetadataResponse {
         request_id: partition_cmd.request_id,
@@ -40,7 +35,7 @@ where
     };
 
     framed.send(response).await?;
-    log::info!("Sent PartitionMetadataResponse for request {}", partition_cmd.request_id);
+    log::debug!("Sent PartitionMetadataResponse for request {}", partition_cmd.request_id);
 
     Ok(())
 }
@@ -55,7 +50,7 @@ where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let lookup_cmd = cmd.lookup_topic.as_ref().ok_or("Missing lookup command")?;
-    log::info!("Handling Lookup command: topic={}, request_id={}",
+    log::debug!("Handling Lookup command: topic={}, request_id={}",
         lookup_cmd.topic, lookup_cmd.request_id);
 
     // Return local broker URL with pulsar:// protocol
@@ -65,7 +60,7 @@ where
     };
 
     framed.send(response).await?;
-    log::info!("Sent LookupResponse for request {}", lookup_cmd.request_id);
+    log::debug!("Sent LookupResponse for request {}", lookup_cmd.request_id);
 
     Ok(())
 }

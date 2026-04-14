@@ -460,12 +460,19 @@ impl Subscription {
 
     /// Get subscription statistics
     pub async fn get_stats(&self) -> SubscriptionStats {
+        let consumers = self.get_consumers();
+        let consumer_count = consumers.len();
+        let mut total_permits = 0;
+        for consumer in consumers {
+            total_permits += consumer.get_available_permits().await;
+        }
+
         SubscriptionStats {
             name: self.name.clone(),
             topic: self.topic.clone(),
             sub_type: self.sub_type,
-            consumer_count: self.get_consumer_count(),
-            total_permits: self.get_total_permits().await,
+            consumer_count,
+            total_permits,
             dropped_messages: match self.runtime_mode {
                 SubscriptionRuntimeMode::PersistentStyle => 0,
                 SubscriptionRuntimeMode::NonPersistent => self

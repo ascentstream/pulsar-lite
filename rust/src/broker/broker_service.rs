@@ -204,6 +204,22 @@ impl BrokerService {
         self.partition_metadata.get(topic_name).copied()
     }
 
+    /// Resolve the partition count returned by PartitionMetadata queries.
+    ///
+    /// Returns 0 for non-partitioned topics, otherwise the configured or
+    /// default partition count.
+    pub fn get_partition_metadata_response_count(&self, topic_name: &str) -> i32 {
+        if let Some(partition_count) = self.partition_metadata.get(topic_name) {
+            return *partition_count as i32;
+        }
+
+        if self.partitioned_topics.contains_key(topic_name) || self.default_partitions > 0 {
+            return self.default_partitions as i32;
+        }
+
+        0
+    }
+
     /// Get all partitioned topics
     pub fn get_all_partitioned_topics(&self) -> &HashMap<String, SharedPartitionedTopic> {
         &self.partitioned_topics

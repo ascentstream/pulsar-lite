@@ -419,16 +419,19 @@ impl Topic {
     /// Get topic statistics
     pub async fn get_stats(&self) -> TopicStats {
         let mut subscription_stats = Vec::new();
+        let mut consumer_count = 0;
         for subscription in self.subscriptions.values() {
             let sub_guard = subscription.read().await;
-            subscription_stats.push(sub_guard.get_stats().await);
+            let stats = sub_guard.get_stats().await;
+            consumer_count += stats.consumer_count;
+            subscription_stats.push(stats);
         }
 
         TopicStats {
             topic_name: self.name.clone(),
             producer_count: self.producers.len(),
             subscription_count: self.subscriptions.len(),
-            consumer_count: self.get_total_consumer_count().await,
+            consumer_count,
             subscriptions: subscription_stats,
         }
     }

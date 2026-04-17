@@ -43,24 +43,37 @@ class PerfCollector:
 
     @staticmethod
     def generate_flamegraph(perf_data_path: Path, svg_output_path: Path) -> bool:
-        inferno = shutil.which('inferno-flamegraph')
-        if not inferno:
+        collapse = shutil.which('inferno-collapse-perf')
+        flamegraph = shutil.which('inferno-flamegraph')
+        if not collapse or not flamegraph:
             return False
 
+        # Step 1: perf script -> inferno-collapse-perf (folded format)
         script_proc = subprocess.Popen(
             ['perf', 'script', '-i', str(perf_data_path)],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
+        collapse_proc = subprocess.Popen(
+            [collapse],
+            stdin=script_proc.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        script_proc.stdout.close()
+
+        # Step 2: folded format -> inferno-flamegraph (SVG)
         with svg_output_path.open('w', encoding='utf-8') as svg_fh:
-            flamegraph_proc = subprocess.Popen(
-                [inferno],
-                stdin=script_proc.stdout,
+            fg_proc = subprocess.Popen(
+                [flamegraph],
+                stdin=collapse_proc.stdout,
                 stdout=svg_fh,
                 stderr=subprocess.DEVNULL,
             )
-            script_proc.stdout.close()
-            flamegraph_proc.wait(timeout=60)
-            script_proc.wait(timeout=10)
+            collapse_proc.stdout.close()
+            fg_proc.wait(timeout=60)
+
+        collapse_proc.wait(timeout=10)
+        script_proc.wait(timeout=10)
 
         return svg_output_path.exists() and svg_output_path.stat().st_size > 0

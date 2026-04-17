@@ -10,7 +10,7 @@ JAVA = JAVA_HOME / 'bin' / 'java'
 BROKER_BIN = ROOT / 'rust' / 'target' / 'release' / 'pulsar-lite'
 BASE_CONFIG = ROOT / 'rust' / 'pulsar-lite.toml'
 PULSAR_TESTCLIENT_JAR = PULSAR_ROOT / 'pulsar-testclient' / 'target' / 'pulsar-testclient.jar'
-CLASSPATH_FILE = Path('/tmp/pulsar-testclient.classpath')
+CLASSPATH_FILE =  ROOT / '.cache' / 'pulsar-testclient.classpath'
 
 ENV_BASE = os.environ.copy()
 ENV_BASE['JAVA_HOME'] = str(JAVA_HOME)

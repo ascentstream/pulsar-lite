@@ -13,7 +13,12 @@ def ensure_prereqs() -> None:
     if not PULSAR_TESTCLIENT_JAR.exists():
         raise FileNotFoundError(f'pulsar-testclient jar missing: {PULSAR_TESTCLIENT_JAR}')
     if not CLASSPATH_FILE.exists():
-        raise FileNotFoundError(f'classpath file missing: {CLASSPATH_FILE}')
+        CLASSPATH_FILE.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ['mvn', '-pl', 'pulsar-testclient', 'dependency:build-classpath',
+            '-DincludeScope=runtime', f'-Dmdep.outputFile={CLASSPATH_FILE}'],
+            cwd=str(PULSAR_ROOT), check=True,
+    )
 
 
 def perf_cmd(subcommand: str, service_url: str, extra_args: list[str], topic: str, histogram_path: Path) -> list[str]:

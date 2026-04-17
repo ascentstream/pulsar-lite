@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import os
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 PULSAR_ROOT = Path('/home/xtline/code/work/pulsar')
 JAVA_HOME = Path('/usr/lib/jvm/java-17-openjdk-amd64')
 JAVA = JAVA_HOME / 'bin' / 'java'

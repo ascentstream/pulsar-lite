@@ -204,6 +204,22 @@ impl BrokerService {
         self.partition_metadata.get(topic_name).copied()
     }
 
+    /// Resolve the partition count returned by PartitionMetadata queries.
+    ///
+    /// Returns 0 for non-partitioned topics, otherwise the configured or
+    /// default partition count.
+    pub fn get_partition_metadata_response_count(&self, topic_name: &str) -> i32 {
+        if let Some(partition_count) = self.partition_metadata.get(topic_name) {
+            return *partition_count as i32;
+        }
+
+        if self.partitioned_topics.contains_key(topic_name) || self.default_partitions > 0 {
+            return self.default_partitions as i32;
+        }
+
+        0
+    }
+
     /// Get all partitioned topics
     pub fn get_all_partitioned_topics(&self) -> &HashMap<String, SharedPartitionedTopic> {
         &self.partitioned_topics
@@ -391,6 +407,7 @@ mod tests {
     use crate::broker::service::{Consumer, Producer};
     use crate::broker::service::topic::SubscriptionType;
     use std::path::Path;
+    use std::time::Instant;
     use tokio::sync::mpsc;
 
     fn create_test_storage() -> Arc<Mutex<Storage>> {
@@ -403,6 +420,21 @@ mod tests {
             format!("producer-{}", id),
             topic_ref,
             format!("conn-{}", id),
+        ))
+    }
+
+    fn create_test_consumer(
+        id: u64,
+        subscription: Arc<RwLock<crate::broker::service::topic::Subscription>>,
+    ) -> Arc<Consumer> {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        Arc::new(Consumer::new(
+            id,
+            format!("consumer-{id}"),
+            subscription,
+            format!("conn-{id}"),
+            tx,
+            0,
         ))
     }
 
@@ -705,6 +737,100 @@ mod tests {
         assert_eq!(stats[0].topic_name, "my-topic");
         assert_eq!(stats[0].partition_count, 3);
         assert_eq!(stats[0].total_producers, 1);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn perf_stats_get_all_stats_100_topics_4_subscriptions_8_consumers() {
+        const TOPIC_COUNT: usize = 100;
+        const SUBSCRIPTION_COUNT: usize = 4;
+        const CONSUMER_COUNT: usize = 8;
+        const ITERATIONS: usize = 100;
+
+        let storage = create_test_storage();
+        let mut manager = BrokerService::new(storage);
+        let mut consumer_id = 0u64;
+
+        for topic_idx in 0..TOPIC_COUNT {
+            let topic = manager
+                .get_or_create_topic(&format!("perf-topic-{topic_idx}"))
+                .await;
+            let mut topic_guard = topic.write().await;
+
+            for sub_idx in 0..SUBSCRIPTION_COUNT {
+                let subscription = topic_guard
+                    .get_or_create_subscription(
+                        &format!("sub-{topic_idx}-{sub_idx}"),
+                        SubscriptionType::Shared,
+                    )
+                    .await
+                    .unwrap();
+
+                let mut sub_guard = subscription.write().await;
+                for _ in 0..CONSUMER_COUNT {
+                    sub_guard
+                        .add_consumer(create_test_consumer(consumer_id, subscription.clone()))
+                        .unwrap();
+                    consumer_id += 1;
+                }
+            }
+        }
+
+        let mut stats = Vec::new();
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            stats = manager.get_all_stats().await;
+        }
+        let elapsed = start.elapsed();
+
+        println!(
+            "PERF stats get_all_stats: topics={TOPIC_COUNT}, subscriptions_per_topic={SUBSCRIPTION_COUNT}, consumers_per_subscription={CONSUMER_COUNT}, iterations={ITERATIONS}, total_elapsed_ms={}, avg_elapsed_ms={:.2}",
+            elapsed.as_millis(),
+            elapsed.as_secs_f64() * 1000.0 / ITERATIONS as f64
+        );
+        assert_eq!(stats.len(), TOPIC_COUNT);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn perf_stats_get_all_partitioned_stats_20_topics_8_partitions() {
+        const TOPIC_COUNT: usize = 20;
+        const PARTITION_COUNT: usize = 8;
+        const ITERATIONS: usize = 200;
+
+        let storage = create_test_storage();
+        let mut manager = BrokerService::new(storage);
+
+        for topic_idx in 0..TOPIC_COUNT {
+            let partitioned_topic = manager
+                .get_or_create_partitioned_topic(
+                    &format!("perf-partitioned-topic-{topic_idx}"),
+                    PARTITION_COUNT,
+                )
+                .await;
+
+            let guard = partitioned_topic.write().await;
+            for partition_idx in 0..PARTITION_COUNT {
+                let partition = guard.get_partition(partition_idx).unwrap();
+                let mut partition_guard = partition.write().await;
+                let producer = create_test_producer(partition_idx as u64, partition.clone());
+                partition_guard.add_producer(producer).unwrap();
+            }
+        }
+
+        let mut stats = Vec::new();
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            stats = manager.get_all_partitioned_stats().await;
+        }
+        let elapsed = start.elapsed();
+
+        println!(
+            "PERF stats get_all_partitioned_stats: topics={TOPIC_COUNT}, partitions_per_topic={PARTITION_COUNT}, iterations={ITERATIONS}, total_elapsed_ms={}, avg_elapsed_ms={:.2}",
+            elapsed.as_millis(),
+            elapsed.as_secs_f64() * 1000.0 / ITERATIONS as f64
+        );
+        assert_eq!(stats.len(), TOPIC_COUNT);
     }
 
     #[tokio::test]

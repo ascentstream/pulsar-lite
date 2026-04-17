@@ -64,7 +64,7 @@ STRESS_SCENARIOS: list[StressScenario] = [
         kind="produce",
         broker="nonpartitioned",
         description="单 producer 不限速吞吐 ceiling",
-        producer_args=["-r", "0", "-m", "500000", "-s", "1024"],
+        producer_args=["-r", "999999", "-m", "500000", "-s", "1024"],
         estimated_duration=60,
     ),
     StressScenario(
@@ -72,7 +72,7 @@ STRESS_SCENARIOS: list[StressScenario] = [
         kind="produce",
         broker="nonpartitioned",
         description="4 producers 不限速并发吞吐 ceiling",
-        producer_args=["-r", "0", "-m", "500000", "-s", "1024", "-n", "4"],
+        producer_args=["-r", "999999", "-m", "500000", "-s", "1024", "-n", "4"],
         estimated_duration=60,
     ),
     StressScenario(
@@ -80,7 +80,7 @@ STRESS_SCENARIOS: list[StressScenario] = [
         kind="produce",
         broker="nonpartitioned",
         description="100KiB payload 带宽瓶颈",
-        producer_args=["-r", "0", "-s", "102400", "-m", "100000"],
+        producer_args=["-r", "999999", "-s", "102400", "-m", "100000"],
         estimated_duration=60,
     ),
     StressScenario(
@@ -88,7 +88,7 @@ STRESS_SCENARIOS: list[StressScenario] = [
         kind="produce",
         broker="nonpartitioned",
         description="5 分钟持续发送稳定性",
-        producer_args=["-time", "300", "-r", "0", "-s", "1024"],
+        producer_args=["-time", "300", "-r", "999999", "-s", "1024"],
         estimated_duration=300,
     ),
     # --- Consumer / E2E stress ---
@@ -99,7 +99,7 @@ STRESS_SCENARIOS: list[StressScenario] = [
         description="Shared 单 consumer 不限速吞吐 ceiling",
         producer_args=[],
         consumer_args=["-m", "500000", "-q", "10000", "-st", "Shared"],
-        feed_producer_args=["-r", "0", "-m", "500000", "-s", "1024"],
+        feed_producer_args=["-r", "999999", "-m", "500000", "-s", "1024"],
         estimated_duration=60,
     ),
     StressScenario(
@@ -109,7 +109,7 @@ STRESS_SCENARIOS: list[StressScenario] = [
         description="Shared 16 consumers 不限速高 fanout",
         producer_args=[],
         consumer_args=["-m", "500000", "-q", "10000", "-st", "Shared", "-n", "16"],
-        feed_producer_args=["-r", "0", "-m", "500000", "-s", "1024"],
+        feed_producer_args=["-r", "999999", "-m", "500000", "-s", "1024"],
         estimated_duration=60,
     ),
     StressScenario(
@@ -119,7 +119,7 @@ STRESS_SCENARIOS: list[StressScenario] = [
         description="8 subscriptions 不限速高 fanout",
         producer_args=[],
         consumer_args=["-m", "2000000", "-q", "10000", "-st", "Shared", "-ns", "8"],
-        feed_producer_args=["-r", "0", "-m", "500000", "-s", "1024"],
+        feed_producer_args=["-r", "999999", "-m", "500000", "-s", "1024"],
         estimated_duration=60,
     ),
     StressScenario(
@@ -129,7 +129,7 @@ STRESS_SCENARIOS: list[StressScenario] = [
         description="5 分钟持续消费稳定性",
         producer_args=[],
         consumer_args=["-time", "300", "-q", "10000", "-st", "Shared"],
-        feed_producer_args=["-time", "300", "-r", "0", "-s", "1024"],
+        feed_producer_args=["-time", "300", "-r", "999999", "-s", "1024"],
         estimated_duration=300,
     ),
     StressScenario(
@@ -139,7 +139,7 @@ STRESS_SCENARIOS: list[StressScenario] = [
         description="Partitioned 4 partitions Shared 4 consumers 不限速",
         producer_args=[],
         consumer_args=["-m", "500000", "-q", "10000", "-st", "Shared", "-n", "4"],
-        feed_producer_args=["-r", "0", "-m", "500000", "-s", "1024"],
+        feed_producer_args=["-r", "999999", "-m", "500000", "-s", "1024"],
         estimated_duration=60,
     ),
 ]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import signal
 import subprocess
 from pathlib import Path
 
@@ -32,7 +33,13 @@ class PerfCollector:
 
     def stop(self) -> None:
         if self._proc and self._proc.poll() is None:
-            self._proc.wait(timeout=30)
+            # Send SIGINT to perf record so it flushes data and exits
+            self._proc.send_signal(signal.SIGINT)
+            try:
+                self._proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._proc.terminate()
+                self._proc.wait(timeout=5)
 
     @staticmethod
     def generate_flamegraph(perf_data_path: Path, svg_output_path: Path) -> bool:

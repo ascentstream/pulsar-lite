@@ -406,12 +406,12 @@ mod tests {
     use super::*;
     use crate::broker::service::{Consumer, Producer};
     use crate::broker::service::topic::SubscriptionType;
-    use std::path::Path;
     use std::time::Instant;
     use tokio::sync::mpsc;
 
     fn create_test_storage() -> Arc<Mutex<Storage>> {
-        Arc::new(Mutex::new(Storage::new(Path::new("/tmp/test-topic-manager")).unwrap()))
+        let dir = tempfile::tempdir().unwrap();
+        Arc::new(Mutex::new(Storage::new(dir.path()).unwrap()))
     }
 
     fn create_test_producer(id: u64, topic_ref: SharedTopic) -> Arc<Producer> {

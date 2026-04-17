@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib import ROOT, PULSAR_ROOT, JAVA_HOME, JAVA, BROKER_BIN, BASE_CONFIG, PULSAR_TESTCLIENT_JAR, CLASSPATH_FILE, ENV_BASE
 from lib.broker import BrokerConfig, BrokerSampler, BrokerProcess
 from lib.parsing import parse_producer_output, parse_consumer_output

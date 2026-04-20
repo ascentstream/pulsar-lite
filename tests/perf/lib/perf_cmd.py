@@ -52,11 +52,11 @@ def wait_for_log(path: Path, needle: str, timeout: float = 30.0) -> None:
     raise RuntimeError(f'timed out waiting for {needle!r} in {path}')
 
 
-def run_consumer_then_feed(consumer_cmd: list[str], producer_cmd: list[str], consumer_log: Path, producer_log: Path, consumer_timeout: float = 300.0) -> tuple[str, str, int, int]:
+def run_consumer_then_feed(consumer_cmd: list[str], producer_cmd: list[str], consumer_log: Path, producer_log: Path, consumer_timeout: float = 300.0, producer_timeout: float = 300.0) -> tuple[str, str, int, int]:
     with consumer_log.open('w', encoding='utf-8') as consumer_fh:
         consumer_proc = subprocess.Popen(consumer_cmd, stdout=consumer_fh, stderr=subprocess.STDOUT, text=True, env=ENV_BASE)
     wait_for_log(consumer_log, 'Start receiving from')
-    producer_proc = run_sync(producer_cmd, producer_log)
+    producer_proc = run_sync(producer_cmd, producer_log, timeout=producer_timeout)
 
     try:
         consumer_rc = consumer_proc.wait(timeout=consumer_timeout)

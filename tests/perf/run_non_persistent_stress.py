@@ -64,7 +64,7 @@ STRESS_SCENARIOS: list[StressScenario] = [
         kind="produce",
         broker="nonpartitioned",
         description="单 producer 不限速吞吐 ceiling",
-        producer_args=["-r", "999999", "-m", "500000", "-s", "1024"],
+        producer_args=["-time", "60", "-r", "999999", "-s", "1024"],
         estimated_duration=60,
     ),
     StressScenario(
@@ -72,7 +72,7 @@ STRESS_SCENARIOS: list[StressScenario] = [
         kind="produce",
         broker="nonpartitioned",
         description="4 producers 不限速并发吞吐 ceiling",
-        producer_args=["-r", "999999", "-m", "500000", "-s", "1024", "-n", "4"],
+        producer_args=["-time", "60", "-r", "999999", "-s", "1024", "-n", "4", "-threads", "4", "-c", "4"],
         estimated_duration=60,
     ),
     StressScenario(
@@ -80,8 +80,9 @@ STRESS_SCENARIOS: list[StressScenario] = [
         kind="produce",
         broker="nonpartitioned",
         description="100KiB payload 带宽瓶颈",
-        producer_args=["-r", "999999", "-s", "102400", "-m", "100000"],
-        estimated_duration=60,
+        producer_args=["-r", "999999", "-s", "102400", "-m", "20000"],
+        # 20k * 100KiB ≈ 1.9GiB，足够测量带宽瓶颈，同时不会超时。
+        estimated_duration=120,
     ),
     StressScenario(
         name="stress_producer_sustained",
@@ -99,7 +100,7 @@ STRESS_SCENARIOS: list[StressScenario] = [
         description="Shared 单 consumer 不限速吞吐 ceiling",
         producer_args=[],
         consumer_args=["-m", "500000", "-q", "10000", "-st", "Shared"],
-        feed_producer_args=["-r", "999999", "-m", "500000", "-s", "1024"],
+        feed_producer_args=["-time", "60", "-r", "999999", "-s", "1024"],
         estimated_duration=60,
     ),
     StressScenario(
@@ -108,8 +109,8 @@ STRESS_SCENARIOS: list[StressScenario] = [
         broker="nonpartitioned",
         description="Shared 16 consumers 不限速高 fanout",
         producer_args=[],
-        consumer_args=["-m", "500000", "-q", "10000", "-st", "Shared", "-n", "16"],
-        feed_producer_args=["-r", "999999", "-m", "500000", "-s", "1024"],
+        consumer_args=["-m", "500000", "-q", "10000", "-st", "Shared", "-n", "16", "-c", "4"],
+        feed_producer_args=["-time", "60", "-r", "999999", "-s", "1024", "-c", "4"],
         estimated_duration=60,
     ),
     StressScenario(
@@ -118,8 +119,8 @@ STRESS_SCENARIOS: list[StressScenario] = [
         broker="nonpartitioned",
         description="8 subscriptions 不限速高 fanout",
         producer_args=[],
-        consumer_args=["-m", "2000000", "-q", "10000", "-st", "Shared", "-ns", "8"],
-        feed_producer_args=["-r", "999999", "-m", "500000", "-s", "1024"],
+        consumer_args=["-time", "60", "-q", "10000", "-st", "Shared", "-ns", "8", "-c", "4"],
+        feed_producer_args=["-time", "60", "-r", "999999", "-s", "1024", "-c", "4"],
         estimated_duration=60,
     ),
     StressScenario(
@@ -128,8 +129,8 @@ STRESS_SCENARIOS: list[StressScenario] = [
         broker="nonpartitioned",
         description="5 分钟持续消费稳定性",
         producer_args=[],
-        consumer_args=["-time", "300", "-q", "10000", "-st", "Shared"],
-        feed_producer_args=["-time", "300", "-r", "999999", "-s", "1024"],
+        consumer_args=["-time", "300", "-q", "10000", "-st", "Shared", "-c", "4"],
+        feed_producer_args=["-time", "300", "-r", "999999", "-s", "1024", "-c", "4"],
         estimated_duration=300,
     ),
     StressScenario(
@@ -138,8 +139,8 @@ STRESS_SCENARIOS: list[StressScenario] = [
         broker="nonpersistent_partitioned",
         description="Partitioned 4 partitions Shared 4 consumers 不限速",
         producer_args=[],
-        consumer_args=["-m", "500000", "-q", "10000", "-st", "Shared", "-n", "4"],
-        feed_producer_args=["-r", "999999", "-m", "500000", "-s", "1024"],
+        consumer_args=["-m", "500000", "-q", "10000", "-st", "Shared", "-n", "4", "-c", "4"],
+        feed_producer_args=["-time", "60", "-r", "999999", "-s", "1024", "-c", "4"],
         estimated_duration=60,
     ),
 ]
@@ -237,7 +238,7 @@ def _run_consume_e2e_scenario(
     started_at = datetime.now(timezone.utc).isoformat()
     t0 = time.monotonic()
     consumer_out, producer_out, consumer_rc, producer_rc = run_consumer_then_feed(
-        consumer_cmd, producer_cmd, consumer_log, producer_log, consumer_timeout=timeout,
+        consumer_cmd, producer_cmd, consumer_log, producer_log, consumer_timeout=timeout, producer_timeout=timeout,
     )
     duration_secs = round(time.monotonic() - t0, 3)
 
@@ -309,8 +310,6 @@ def main() -> None:
         print(f"  Broker [{name}] PID={bp.proc.pid}", file=sys.stderr)
 
     scenario_results: list[dict] = []
-    # Track perf data + flamegraph paths for batch generation
-    flamegraph_queue: list[tuple[Path, Path]] = []  # (perf_data, svg_output)
 
     try:
         for idx, scenario in enumerate(STRESS_SCENARIOS, 1):
@@ -322,7 +321,11 @@ def main() -> None:
             scenario_dir = log_base / scenario.name
             scenario_dir.mkdir(parents=True, exist_ok=True)
 
-            # Start perf recording
+            # Restart broker between scenarios to clear residual topics/subscriptions
+            print(f"  restarting broker [{scenario.broker}] ...", file=sys.stderr)
+            broker_proc.restart()
+
+            # Start perf recording (must be after restart to capture the new PID)
             perf_data_path = scenario_dir / "perf.data"
             perf_collector: PerfCollector | None = None
             if broker_proc.proc:
@@ -333,10 +336,6 @@ def main() -> None:
                 )
                 perf_collector.start()
                 print(f"  perf record started -> {perf_data_path}", file=sys.stderr)
-
-            # Reset broker sampler between scenarios
-            if broker_proc.sampler:
-                broker_proc.sampler.samples.clear()
 
             # Run the scenario
             try:
@@ -376,14 +375,28 @@ def main() -> None:
                 broker_proc.sampler.write_csv(timeseries_path)
                 print(f"  broker timeseries -> {timeseries_path}", file=sys.stderr)
 
+            # Save broker log (contains dispatch metrics and other diagnostics)
+            if broker_proc.log_path and broker_proc.log_path.exists():
+                import shutil
+                broker_log_dest = scenario_dir / "broker.log"
+                shutil.copy2(broker_proc.log_path, broker_log_dest)
+                print(f"  broker log -> {broker_log_dest}", file=sys.stderr)
+
             # Record artifact paths in result
             result["broker_timeseries_file"] = str(timeseries_path.relative_to(ROOT))
             if perf_data_path.exists():
                 result["perf_data_file"] = str(perf_data_path.relative_to(ROOT))
                 svg_path = scenario_dir / "flamegraph.svg"
-                flamegraph_queue.append((perf_data_path, svg_path))
+                ok = PerfCollector.generate_flamegraph(perf_data_path, svg_path)
+                if ok:
+                    result["flamegraph_file"] = str(svg_path.relative_to(ROOT))
+                    print(f"  flamegraph -> {svg_path}", file=sys.stderr)
+                else:
+                    result["flamegraph_file"] = None
+                    print(f"  flamegraph skipped for {perf_data_path.name}", file=sys.stderr)
             else:
                 result["perf_data_file"] = None
+                result["flamegraph_file"] = None
                 print("  perf data not captured", file=sys.stderr)
 
             scenario_results.append(result)
@@ -397,22 +410,6 @@ def main() -> None:
             metrics = bp.stop()
             broker_stop_metrics[name] = metrics
             print(f"  Broker [{name}] stopped: avg_cpu={metrics['broker_avg_cpu_pct']}%", file=sys.stderr)
-
-    # Batch-generate flamegraphs
-    print("\nGenerating flamegraphs ...", file=sys.stderr)
-    for perf_data, svg_path in flamegraph_queue:
-        if not perf_data.exists():
-            continue
-        ok = PerfCollector.generate_flamegraph(perf_data, svg_path)
-        if ok:
-            print(f"  flamegraph -> {svg_path}", file=sys.stderr)
-            # Attach flamegraph path to corresponding result
-            for r in scenario_results:
-                perf_file = r.get("perf_data_file")
-                if perf_file and Path(ROOT / perf_file) == perf_data:
-                    r["flamegraph_file"] = str(svg_path.relative_to(ROOT))
-        else:
-            print(f"  flamegraph skipped (inferno not found) for {perf_data.name}", file=sys.stderr)
 
     # Write results JSON
     output = {

@@ -90,6 +90,7 @@ class BrokerProcess:
             stdout=log_file,
             stderr=subprocess.STDOUT,
             text=True,
+            env={**os.environ, 'RUST_BACKTRACE': '1'},
         )
         self.workdir = temp_dir
         self._wait_for_port()
@@ -122,6 +123,11 @@ class BrokerProcess:
         if self.sampler:
             self.sampler.join(timeout=2)
         return metrics
+
+    def restart(self) -> None:
+        """Stop and start a fresh broker, clearing all topic/subscription state."""
+        self.stop()
+        self.start()
 
     def metrics(self) -> dict[str, float]:
         samples = self.sampler.samples if self.sampler else []

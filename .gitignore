@@ -11,6 +11,7 @@ downloads/
 eggs/
 .eggs/
 lib/
+!tests/perf/lib/
 lib64/
 parts/
 sdist/
@@ -57,3 +58,11 @@ tests/java/
 # Pulsar metadata
 rust/*.metadata.json
 
+# Perf test data (logs, results, flamegraphs, perf.data)
+docs/perf/data/non_persistent_stress_logs/
+docs/perf/data/non_persistent_stress_results.json
+docs/perf/data/non_persistent_e2e_matrix_logs/
+docs/perf/data/non_persistent_e2e_matrix_results.json
+
+# Cache
+/.cache/

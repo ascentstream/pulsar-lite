@@ -35,6 +35,10 @@ make test-python       # Python 集成测试
 rust/pulsar-lite.sh start                          # 启动服务器
 tail -f /tmp/pulsar-lite.log                       # 查看日志
 
+# Perf 压测
+python3 tests/perf/run_non_persistent_stress.py        # Stress 压测（不限速找 ceiling）
+python3 tests/perf/run_non_persistent_e2e_matrix.py    # Coverage 基线（速率控制）
+
 # 代码质量
 make fmt              # 格式化代码
 make lint             # 代码检查

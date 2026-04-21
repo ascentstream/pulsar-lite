@@ -3,11 +3,11 @@
  * Holds the concrete dispatcher implementation based on subscription type
  */
 
-use std::sync::Arc;
 use super::traits::Dispatcher;
-use super::{ExclusiveDispatcher, SharedDispatcher, FailoverDispatcher};
-use crate::broker::service::{Consumer, SharedStorage};
+use super::{ExclusiveDispatcher, FailoverDispatcher, SharedDispatcher};
 use crate::broker::service::topic::SubscriptionType;
+use crate::broker::service::{Consumer, SharedStorage};
+use std::sync::Arc;
 
 /// Dispatcher enum - holds the concrete dispatcher implementation
 /// This is created based on subscription type when first consumer is added
@@ -89,7 +89,9 @@ impl DispatcherEnum {
     }
 
     pub fn get_consumer(&self, consumer_id: u64) -> Option<Arc<Consumer>> {
-        self.get_consumers().into_iter().find(|c| c.consumer_id == consumer_id)
+        self.get_consumers()
+            .into_iter()
+            .find(|c| c.consumer_id == consumer_id)
     }
 
     /// Handle consumer flow command - update permits

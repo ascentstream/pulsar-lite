@@ -3,9 +3,12 @@
  * Handles connection-level commands: Connect, Ping/Pong
  */
 
-use futures::SinkExt;
-use crate::protocol::codec::{PulsarFrameCodec, proto::pulsar::{BaseCommand, CommandPong}};
+use crate::protocol::codec::{
+    proto::pulsar::{BaseCommand, CommandPong},
+    PulsarFrameCodec,
+};
 use crate::protocol::ServerCommand;
+use futures::SinkExt;
 use tokio_util::codec::Framed;
 
 /// Handle Connect command
@@ -31,12 +34,19 @@ where
 
     // Debug: print the command bytes
     let cmd_bytes = response.to_bytes();
-    log::debug!("Command protobuf ({} bytes): {:02x?}", cmd_bytes.len(), cmd_bytes);
+    log::debug!(
+        "Command protobuf ({} bytes): {:02x?}",
+        cmd_bytes.len(),
+        cmd_bytes
+    );
 
     // Calculate frame size
     let total_size = 4 + cmd_bytes.len() + 4; // cmd_size + cmd + metadata_size
     log::debug!("Frame total_size: {}", total_size);
-    log::debug!("Frame layout: [4B total_size] [4B cmd_size] [{}B cmd] [4B metadata_size]", cmd_bytes.len());
+    log::debug!(
+        "Frame layout: [4B total_size] [4B cmd_size] [{}B cmd] [4B metadata_size]",
+        cmd_bytes.len()
+    );
 
     framed.send(response).await?;
 
@@ -45,7 +55,9 @@ where
 }
 
 /// Handle Ping command
-pub async fn handle_ping<T>(framed: &mut Framed<T, PulsarFrameCodec>) -> Result<(), Box<dyn std::error::Error>>
+pub async fn handle_ping<T>(
+    framed: &mut Framed<T, PulsarFrameCodec>,
+) -> Result<(), Box<dyn std::error::Error>>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {

@@ -1,7 +1,7 @@
 use super::{NamespaceResources, TenantResources, TopicResources};
-use crate::storage::{MetadataStore, TopicMetadata};
 #[cfg(test)]
 use crate::storage::MetadataDocument;
+use crate::storage::{MetadataStore, TopicMetadata};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
@@ -58,12 +58,7 @@ impl PulsarResources {
         self.tenant_resources.has_tenant(&self.metadata, tenant)
     }
 
-    pub fn ensure_namespace(
-        &mut self,
-        tenant: &str,
-        namespace: &str,
-        version: u32,
-    ) -> Result<()> {
+    pub fn ensure_namespace(&mut self, tenant: &str, namespace: &str, version: u32) -> Result<()> {
         self.namespace_resources
             .ensure_namespace(&mut self.metadata, tenant, namespace, version)
     }
@@ -80,8 +75,13 @@ impl PulsarResources {
         partition_count: usize,
         version: u32,
     ) -> Result<()> {
-        self.topic_resources
-            .ensure_topic(&mut self.metadata, topic, partitioned, partition_count, version)
+        self.topic_resources.ensure_topic(
+            &mut self.metadata,
+            topic,
+            partitioned,
+            partition_count,
+            version,
+        )
     }
 
     pub fn ensure_subscription(
@@ -100,7 +100,8 @@ impl PulsarResources {
     }
 
     pub fn get_topic_metadata(&self, topic: &str) -> Option<&TopicMetadata> {
-        self.topic_resources.get_topic_metadata(&self.metadata, topic)
+        self.topic_resources
+            .get_topic_metadata(&self.metadata, topic)
     }
 
     pub fn has_subscription(&self, topic: &str, subscription: &str) -> bool {

@@ -26,11 +26,7 @@ impl BaseResources {
     }
 
     // 统一 tenant 父资源 ensure
-    pub(crate) fn ensure_tenant_parent(
-        &self,
-        metadata: &mut MetadataStore,
-        tenant: &str,
-    ) -> bool {
+    pub(crate) fn ensure_tenant_parent(&self, metadata: &mut MetadataStore, tenant: &str) -> bool {
         metadata.insert_tenant_metadata(tenant)
     }
 

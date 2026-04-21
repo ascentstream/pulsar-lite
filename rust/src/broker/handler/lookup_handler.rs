@@ -3,10 +3,10 @@
  * Handles topic metadata and lookup commands
  */
 
-use futures::SinkExt;
-use crate::protocol::codec::{PulsarFrameCodec, proto::pulsar::BaseCommand};
-use crate::protocol::ServerCommand;
 use crate::broker::SharedBrokerService;
+use crate::protocol::codec::{proto::pulsar::BaseCommand, PulsarFrameCodec};
+use crate::protocol::ServerCommand;
+use futures::SinkExt;
 use tokio_util::codec::Framed;
 
 /// Handle PartitionMetadata command
@@ -18,16 +18,26 @@ pub async fn handle_partition_metadata<T>(
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let partition_cmd = cmd.partition_metadata.as_ref().ok_or("Missing partition metadata command")?;
-    log::debug!("Handling PartitionMetadata command: topic={}, request_id={}",
-        partition_cmd.topic, partition_cmd.request_id);
+    let partition_cmd = cmd
+        .partition_metadata
+        .as_ref()
+        .ok_or("Missing partition metadata command")?;
+    log::debug!(
+        "Handling PartitionMetadata command: topic={}, request_id={}",
+        partition_cmd.topic,
+        partition_cmd.request_id
+    );
 
     // Get partition count from BrokerService
     let guard = broker_service.read().await;
     let partitions = guard.get_partition_metadata_response_count(&partition_cmd.topic);
     drop(guard);
 
-    log::debug!("Returning partition metadata: topic={}, partitions={}", partition_cmd.topic, partitions);
+    log::debug!(
+        "Returning partition metadata: topic={}, partitions={}",
+        partition_cmd.topic,
+        partitions
+    );
 
     let response = ServerCommand::PartitionMetadataResponse {
         request_id: partition_cmd.request_id,
@@ -35,7 +45,10 @@ where
     };
 
     framed.send(response).await?;
-    log::debug!("Sent PartitionMetadataResponse for request {}", partition_cmd.request_id);
+    log::debug!(
+        "Sent PartitionMetadataResponse for request {}",
+        partition_cmd.request_id
+    );
 
     Ok(())
 }
@@ -50,8 +63,11 @@ where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let lookup_cmd = cmd.lookup_topic.as_ref().ok_or("Missing lookup command")?;
-    log::debug!("Handling Lookup command: topic={}, request_id={}",
-        lookup_cmd.topic, lookup_cmd.request_id);
+    log::debug!(
+        "Handling Lookup command: topic={}, request_id={}",
+        lookup_cmd.topic,
+        lookup_cmd.request_id
+    );
 
     // Return local broker URL with pulsar:// protocol
     let response = ServerCommand::LookupResponse {
@@ -70,9 +86,7 @@ mod tests {
     use super::*;
     use crate::broker::broker_service::BrokerService;
     use crate::protocol::codec::proto::pulsar::{
-        base_command,
-        CommandLookupTopic,
-        CommandPartitionedTopicMetadata,
+        base_command, CommandLookupTopic, CommandPartitionedTopicMetadata,
     };
     use crate::storage::Storage;
     use std::path::Path;

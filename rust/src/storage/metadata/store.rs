@@ -175,7 +175,8 @@ impl MetadataStore {
                             let parsed = parse_topic_name(&full_name).map_err(|error| {
                                 anyhow!(
                                     "Invalid topic in metadata resources '{}': {}",
-                                    full_name, error
+                                    full_name,
+                                    error
                                 )
                             })?;
 
@@ -218,7 +219,8 @@ impl MetadataStore {
             let parsed = parse_topic_name(&logical_topic).map_err(|error| {
                 anyhow!(
                     "Invalid partitioned topic metadata '{}': {}",
-                    logical_topic, error
+                    logical_topic,
+                    error
                 )
             })?;
 
@@ -236,15 +238,18 @@ impl MetadataStore {
                 },
             );
 
-            let entry = self.topics_meta.entry(logical_topic.clone()).or_insert(TopicMetadata {
-                full_name: logical_topic.clone(),
-                domain: parsed.domain,
-                tenant: parsed.tenant,
-                namespace: parsed.namespace,
-                local_name: parsed.local_name,
-                partitioned: true,
-                partition_count: partitioned_topic.partitions,
-            });
+            let entry = self
+                .topics_meta
+                .entry(logical_topic.clone())
+                .or_insert(TopicMetadata {
+                    full_name: logical_topic.clone(),
+                    domain: parsed.domain,
+                    tenant: parsed.tenant,
+                    namespace: parsed.namespace,
+                    local_name: parsed.local_name,
+                    partitioned: true,
+                    partition_count: partitioned_topic.partitions,
+                });
             entry.partitioned = true;
             entry.partition_count = partitioned_topic.partitions;
         }
@@ -342,7 +347,8 @@ impl MetadataStore {
     }
 
     pub(crate) fn has_namespace_metadata(&self, tenant: &str, namespace: &str) -> bool {
-        self.namespaces.contains_key(&namespace_key(tenant, namespace))
+        self.namespaces
+            .contains_key(&namespace_key(tenant, namespace))
     }
 
     pub(crate) fn get_topic_metadata(&self, topic: &str) -> Option<&TopicMetadata> {

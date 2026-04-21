@@ -6,11 +6,11 @@
  * Consistent with Apache Pulsar's PersistentDispatcherSingleActiveConsumer
  */
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use crate::broker::service::{Consumer, SharedStorage};
 use crate::broker::dispatcher::Dispatcher;
 use crate::broker::service::topic::SubscriptionType;
+use crate::broker::service::{Consumer, SharedStorage};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 /// Consistent with Apache Pulsar: dispatcherMaxRoundRobinBatchSize = 20
 const DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE: u32 = 20;
@@ -67,10 +67,12 @@ impl Dispatcher for ExclusiveDispatcher {
     fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {
         if let Some(ref consumer) = self.consumer {
             if consumer.consumer_id == consumer_id {
-                self.total_available_permits.fetch_add(additional_permits, Ordering::Relaxed);
+                self.total_available_permits
+                    .fetch_add(additional_permits, Ordering::Relaxed);
                 log::debug!(
                     "Exclusive consumer {} flowing {} permits, total={}",
-                    consumer_id, additional_permits,
+                    consumer_id,
+                    additional_permits,
                     self.total_available_permits.load(Ordering::Relaxed)
                 );
             }
@@ -81,7 +83,7 @@ impl Dispatcher for ExclusiveDispatcher {
         &self,
         storage: SharedStorage,
         topic: String,
-        subscription: String
+        subscription: String,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // For Exclusive, just dispatch to the single consumer
         if let Some(consumer) = &self.consumer {
@@ -90,7 +92,8 @@ impl Dispatcher for ExclusiveDispatcher {
                 return Ok(());
             }
 
-            let max_messages = std::cmp::min(available_permits, DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE);
+            let max_messages =
+                std::cmp::min(available_permits, DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE);
             let mut dispatched = 0;
 
             for _ in 0..max_messages {
@@ -101,7 +104,11 @@ impl Dispatcher for ExclusiveDispatcher {
 
                 let message_opt = {
                     let mut guard = storage.lock().await;
-                    guard.get_next_unassigned_message(&topic, &subscription, consumer.consumer_id)?
+                    guard.get_next_unassigned_message(
+                        &topic,
+                        &subscription,
+                        consumer.consumer_id,
+                    )?
                 };
 
                 if let Some((message_id, payload)) = message_opt {
@@ -124,7 +131,11 @@ impl Dispatcher for ExclusiveDispatcher {
             }
 
             if dispatched > 0 {
-                log::info!("Exclusive dispatched {} messages to consumer {}", dispatched, consumer.consumer_id);
+                log::info!(
+                    "Exclusive dispatched {} messages to consumer {}",
+                    dispatched,
+                    consumer.consumer_id
+                );
             }
         }
 

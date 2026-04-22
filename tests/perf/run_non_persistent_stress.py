@@ -7,10 +7,12 @@ then batch-generates flamegraphs and writes aggregated JSON results.
 
 Usage:
     python3 tests/perf/run_non_persistent_stress.py
+    python3 tests/perf/run_non_persistent_stress.py stress_consume_multi_subscription_fanout
 """
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import json
 import sys
@@ -120,7 +122,15 @@ STRESS_SCENARIOS: list[StressScenario] = [
         description="8 subscriptions 不限速高 fanout",
         producer_args=[],
         consumer_args=["-time", "60", "-q", "10000", "-st", "Shared", "-ns", "8", "-c", "4"],
-        feed_producer_args=["-time", "60", "-r", "999999", "-s", "1024", "-c", "4"],
+        feed_producer_args=[
+            "-time", "60",
+            "-r", "999999",
+            "-s", "1024",
+            "-c", "4",
+            "--memory-limit", "268435456",
+            "--max-outstanding", "4096",
+            "--max-outstanding-across-partitions", "16384",
+        ],
         estimated_duration=60,
     ),
     StressScenario(
@@ -144,6 +154,35 @@ STRESS_SCENARIOS: list[StressScenario] = [
         estimated_duration=60,
     ),
 ]
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run non-persistent stress scenarios for pulsar-lite."
+    )
+    parser.add_argument(
+        "scenarios",
+        nargs="*",
+        help="Optional scenario names to run. Defaults to all scenarios.",
+    )
+    return parser
+
+
+def select_scenarios(requested_names: list[str]) -> list[StressScenario]:
+    if not requested_names:
+        return STRESS_SCENARIOS
+
+    by_name = {scenario.name: scenario for scenario in STRESS_SCENARIOS}
+    missing = [name for name in requested_names if name not in by_name]
+    if missing:
+        parser = build_arg_parser()
+        parser.error(
+            "unknown scenario(s): "
+            + ", ".join(missing)
+            + ". Available: "
+            + ", ".join(sorted(by_name))
+        )
+    return [by_name[name] for name in requested_names]
 
 # ---------------------------------------------------------------------------
 # Runner helpers
@@ -290,8 +329,10 @@ def _run_consume_e2e_scenario(
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     print("=== Non-persistent stress test ===", file=sys.stderr)
+    args = build_arg_parser().parse_args(argv)
+    scenarios = select_scenarios(args.scenarios)
     ensure_prereqs()
 
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -312,8 +353,8 @@ def main() -> None:
     scenario_results: list[dict] = []
 
     try:
-        for idx, scenario in enumerate(STRESS_SCENARIOS, 1):
-            label = f"[{idx}/{len(STRESS_SCENARIOS)}] {scenario.name}"
+        for idx, scenario in enumerate(scenarios, 1):
+            label = f"[{idx}/{len(scenarios)}] {scenario.name}"
             print(f"\n--- {label} ---", file=sys.stderr)
             print(f"  {scenario.description}", file=sys.stderr)
 

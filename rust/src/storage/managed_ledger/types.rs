@@ -6,15 +6,7 @@ use std::sync::{
 
 /// Position inside a managed-ledger style append-only log.
 #[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 pub struct ManagedLedgerPosition {
     pub ledger_id: u64,
@@ -27,15 +19,7 @@ pub struct ManagedLedgerPosition {
 /// This remains the public message identity type for `pulsar-lite`, while the
 /// managed-ledger line uses `ManagedLedgerPosition` as its structural analogue.
 #[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 pub struct MessageId {
     pub ledger: u64,

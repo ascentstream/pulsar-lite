@@ -5,11 +5,11 @@
  * Consistent with Apache Pulsar's PersistentDispatcherMultipleConsumers in Failover mode
  */
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use crate::broker::service::{Consumer, SharedStorage};
 use crate::broker::dispatcher::Dispatcher;
 use crate::broker::service::topic::SubscriptionType;
+use crate::broker::service::{Consumer, SharedStorage};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 /// Consistent with Apache Pulsar: dispatcherMaxRoundRobinBatchSize = 20
 const DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE: u32 = 20;
@@ -47,7 +47,11 @@ impl Dispatcher for FailoverDispatcher {
     }
 
     fn add_consumer(&mut self, consumer: Arc<Consumer>) -> Result<(), String> {
-        if self.consumers.iter().any(|c| c.consumer_id == consumer.consumer_id) {
+        if self
+            .consumers
+            .iter()
+            .any(|c| c.consumer_id == consumer.consumer_id)
+        {
             return Err(format!("Consumer {} already exists", consumer.consumer_id));
         }
         self.consumers.push(consumer);
@@ -55,7 +59,11 @@ impl Dispatcher for FailoverDispatcher {
     }
 
     fn remove_consumer(&mut self, consumer_id: u64) -> Option<Arc<Consumer>> {
-        if let Some(pos) = self.consumers.iter().position(|c| c.consumer_id == consumer_id) {
+        if let Some(pos) = self
+            .consumers
+            .iter()
+            .position(|c| c.consumer_id == consumer_id)
+        {
             Some(self.consumers.remove(pos))
         } else {
             None
@@ -64,10 +72,12 @@ impl Dispatcher for FailoverDispatcher {
 
     fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {
         if let Some(_consumer) = self.consumers.iter().find(|c| c.consumer_id == consumer_id) {
-            self.total_available_permits.fetch_add(additional_permits, Ordering::Relaxed);
+            self.total_available_permits
+                .fetch_add(additional_permits, Ordering::Relaxed);
             log::debug!(
                 "Failover consumer {} flowing {} permits, total={}",
-                consumer_id, additional_permits,
+                consumer_id,
+                additional_permits,
                 self.total_available_permits.load(Ordering::Relaxed)
             );
         }
@@ -77,7 +87,7 @@ impl Dispatcher for FailoverDispatcher {
         &self,
         storage: SharedStorage,
         topic: String,
-        subscription: String
+        subscription: String,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // For Failover, only dispatch to the primary (first) consumer
         if let Some(primary_consumer) = self.consumers.first() {
@@ -86,7 +96,8 @@ impl Dispatcher for FailoverDispatcher {
                 return Ok(());
             }
 
-            let max_messages = std::cmp::min(available_permits, DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE);
+            let max_messages =
+                std::cmp::min(available_permits, DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE);
             let mut dispatched = 0;
 
             for _ in 0..max_messages {
@@ -97,7 +108,11 @@ impl Dispatcher for FailoverDispatcher {
 
                 let message_opt = {
                     let mut guard = storage.lock().await;
-                    guard.get_next_unassigned_message(&topic, &subscription, primary_consumer.consumer_id)?
+                    guard.get_next_unassigned_message(
+                        &topic,
+                        &subscription,
+                        primary_consumer.consumer_id,
+                    )?
                 };
 
                 if let Some((message_id, payload)) = message_opt {
@@ -105,7 +120,9 @@ impl Dispatcher for FailoverDispatcher {
                         .enqueue_message(message_id, Vec::new(), payload.clone())
                         .await
                     {
-                        primary_consumer.record_message_dispatched(payload.len()).await;
+                        primary_consumer
+                            .record_message_dispatched(payload.len())
+                            .await;
                         dispatched += 1;
                     } else {
                         primary_consumer.add_permits(1).await;
@@ -120,7 +137,11 @@ impl Dispatcher for FailoverDispatcher {
             }
 
             if dispatched > 0 {
-                log::info!("Failover dispatched {} messages to primary consumer {}", dispatched, primary_consumer.consumer_id);
+                log::info!(
+                    "Failover dispatched {} messages to primary consumer {}",
+                    dispatched,
+                    primary_consumer.consumer_id
+                );
             }
         }
 

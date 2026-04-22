@@ -1,8 +1,8 @@
 pub mod broker;
 pub mod config;
+pub mod error;
 pub mod protocol;
 pub mod storage;
-pub mod error;
 
 // Re-export commonly used types
 pub use broker::BrokerService;

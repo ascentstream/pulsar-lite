@@ -33,7 +33,9 @@ pub struct SubscriptionCursor {
 pub fn is_message_acknowledged(cursor: Option<&SubscriptionCursor>, entry: u64) -> bool {
     cursor
         .map(|cursor| {
-            cursor.mark_delete.is_some_and(|mark_delete| entry <= mark_delete)
+            cursor
+                .mark_delete
+                .is_some_and(|mark_delete| entry <= mark_delete)
                 || cursor.acked_holes.contains(&entry)
         })
         .unwrap_or(false)

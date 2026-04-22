@@ -28,12 +28,7 @@ impl NamespaceResources {
         self._base.persist_if_changed(metadata, version, changed)
     }
 
-    pub fn has_namespace(
-        &self,
-        metadata: &MetadataStore,
-        tenant: &str,
-        namespace: &str,
-    ) -> bool {
+    pub fn has_namespace(&self, metadata: &MetadataStore, tenant: &str, namespace: &str) -> bool {
         self._base.has_namespace(metadata, tenant, namespace)
     }
 }

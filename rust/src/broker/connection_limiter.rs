@@ -41,9 +41,16 @@ impl ConnectionLimiter {
             return Err("Reached the maximum number of broker connections".to_string());
         }
 
-        let per_ip = state.connections_per_ip.get(&ip).copied().unwrap_or_default();
+        let per_ip = state
+            .connections_per_ip
+            .get(&ip)
+            .copied()
+            .unwrap_or_default();
         if state.max_connections_per_ip > 0 && per_ip >= state.max_connections_per_ip {
-            return Err(format!("Reached the maximum number of connections for address {}", ip));
+            return Err(format!(
+                "Reached the maximum number of connections for address {}",
+                ip
+            ));
         }
 
         state.total_connections += 1;

@@ -3,14 +3,14 @@
  * Defines server-side commands for Pulsar protocol
  */
 
-use bytes::Bytes;
 use super::codec::proto::pulsar::{
-    base_command, BaseCommand, CommandAckResponse, CommandConnected, CommandConsumerStatsResponse,
-    CommandError, CommandLookupTopicResponse, CommandMessage, CommandPartitionedTopicMetadataResponse,
-    CommandPing, CommandPong, CommandProducerSuccess, CommandSendError, CommandSendReceipt, CommandSuccess,
-    MessageIdData, ServerError,
-    command_lookup_topic_response, command_partitioned_topic_metadata_response,
+    base_command, command_lookup_topic_response, command_partitioned_topic_metadata_response,
+    BaseCommand, CommandAckResponse, CommandConnected, CommandConsumerStatsResponse, CommandError,
+    CommandLookupTopicResponse, CommandMessage, CommandPartitionedTopicMetadataResponse,
+    CommandPing, CommandPong, CommandProducerSuccess, CommandSendError, CommandSendReceipt,
+    CommandSuccess, MessageIdData, ServerError,
 };
+use bytes::Bytes;
 use prost::Message;
 
 /// Command to send to client

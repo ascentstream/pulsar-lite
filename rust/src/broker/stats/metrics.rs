@@ -86,7 +86,8 @@ impl BrokerMetrics {
     /// Record a published message
     pub fn record_message_published(&self, size: usize) {
         self.messages_published.fetch_add(1, Ordering::Relaxed);
-        self.bytes_published.fetch_add(size as u64, Ordering::Relaxed);
+        self.bytes_published
+            .fetch_add(size as u64, Ordering::Relaxed);
     }
 
     /// Increment consumer count
@@ -102,7 +103,8 @@ impl BrokerMetrics {
     /// Record a delivered message
     pub fn record_message_delivered(&self, size: usize) {
         self.messages_delivered.fetch_add(1, Ordering::Relaxed);
-        self.bytes_delivered.fetch_add(size as u64, Ordering::Relaxed);
+        self.bytes_delivered
+            .fetch_add(size as u64, Ordering::Relaxed);
     }
 
     /// Record an acknowledged message

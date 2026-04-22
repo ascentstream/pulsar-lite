@@ -21,6 +21,7 @@ pub mod proto {
 
 // Import ServerCommand from command module
 use super::command::ServerCommand;
+use crate::broker::service::PendingMessage;
 
 /// Magic number for checksum verification (0x0e01)
 const MAGIC_NUMBER: u16 = 0x0e01;
@@ -50,10 +51,117 @@ impl Default for PulsarFrameCodec {
 /// Decoded Pulsar frame
 #[derive(Debug)]
 pub struct PulsarFrame {
-    pub command: Vec<u8>,           // Serialized command protobuf
-    pub metadata: Option<Vec<u8>>,  // Serialized metadata protobuf (optional)
-    pub payload: Vec<u8>,           // Message payload
-    pub checksum: Option<u32>,      // Checksum (optional)
+    pub command: Bytes,          // Serialized command protobuf
+    pub metadata: Option<Bytes>, // Serialized metadata protobuf (optional)
+    pub payload: Bytes,          // Message payload
+    pub checksum: Option<u32>,   // Checksum (optional)
+}
+
+#[derive(Debug, Clone)]
+pub struct EncodedMessageParts {
+    pub header: Bytes,
+    pub metadata: Bytes,
+    pub payload: Bytes,
+}
+
+pub fn estimate_message_parts_size(
+    consumer_id: u64,
+    ledger_id: u64,
+    entry_id: u64,
+    partition: i32,
+    metadata: &Bytes,
+    payload: &Bytes,
+) -> usize {
+    use proto::pulsar::*;
+
+    let command = BaseCommand {
+        r#type: base_command::Type::Message as i32,
+        message: Some(CommandMessage {
+            consumer_id,
+            message_id: MessageIdData {
+                ledger_id,
+                entry_id,
+                partition: Some(partition),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let cmd_len = command.encoded_len();
+    let metadata_len = if metadata.is_empty() {
+        MessageMetadata {
+            sequence_id: entry_id,
+            ..Default::default()
+        }
+        .encoded_len()
+    } else {
+        metadata.len()
+    };
+
+    // Total encoded bytes:
+    // [TOTAL_SIZE(4)] [CMD_SIZE(4)] [CMD] [METADATA_SIZE(4)] [METADATA] [PAYLOAD]
+    (4 + 4 + cmd_len + 4) + metadata_len + payload.len()
+}
+
+pub fn encode_message_parts(
+    consumer_id: u64,
+    ledger_id: u64,
+    entry_id: u64,
+    partition: i32,
+    metadata: &Bytes,
+    payload: &Bytes,
+) -> Result<EncodedMessageParts, io::Error> {
+    use proto::pulsar::*;
+
+    let command = BaseCommand {
+        r#type: base_command::Type::Message as i32,
+        message: Some(CommandMessage {
+            consumer_id,
+            message_id: MessageIdData {
+                ledger_id,
+                entry_id,
+                partition: Some(partition),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let cmd_len = command.encoded_len();
+    let metadata_bytes = if metadata.is_empty() {
+        let synthesized = MessageMetadata {
+            sequence_id: entry_id,
+            ..Default::default()
+        };
+        let mut buf = BytesMut::with_capacity(synthesized.encoded_len());
+        synthesized
+            .encode(&mut buf)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        buf.freeze()
+    } else {
+        metadata.clone()
+    };
+
+    // Pulsar wire format for messages with payload:
+    // [TOTAL_SIZE (4B)] [CMD_SIZE (4B)] [CMD] [METADATA_SIZE (4B)] [METADATA] [PAYLOAD]
+    let total_size = 4 + cmd_len + 4 + metadata_bytes.len() + payload.len();
+
+    let mut header = BytesMut::with_capacity(4 + 4 + cmd_len + 4);
+    header.put_u32(total_size as u32);
+    header.put_u32(cmd_len as u32);
+    command
+        .encode(&mut header)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    header.put_u32(metadata_bytes.len() as u32);
+
+    Ok(EncodedMessageParts {
+        header: header.freeze(),
+        metadata: metadata_bytes,
+        payload: payload.clone(),
+    })
 }
 
 impl Decoder for PulsarFrameCodec {
@@ -104,7 +212,7 @@ impl Decoder for PulsarFrameCodec {
                 "Incomplete command data",
             ));
         }
-        let command = frame_data.split_to(cmd_size).to_vec();
+        let command = frame_data.split_to(cmd_size).freeze();
 
         // Check for checksum (optional)
         let (checksum, mut remaining) = if frame_data.len() >= 6 {
@@ -121,20 +229,20 @@ impl Decoder for PulsarFrameCodec {
             (None, frame_data)
         };
 
-        // Read metadata and payload
+        // Read metadata and payload (zero-copy via freeze())
         let (metadata, payload) = if remaining.len() >= 4 {
             let metadata_size = Cursor::new(&remaining[..4]).get_u32() as usize;
             remaining.advance(4);
 
             if remaining.len() >= metadata_size {
-                let metadata = remaining.split_to(metadata_size).to_vec();
-                let payload = remaining.to_vec();
+                let metadata = remaining.split_to(metadata_size).freeze();
+                let payload = remaining.freeze();
                 (Some(metadata), payload)
             } else {
-                (None, remaining.to_vec())
+                (None, remaining.freeze())
             }
         } else {
-            (None, remaining.to_vec())
+            (None, remaining.freeze())
         };
 
         Ok(Some(PulsarFrame {
@@ -151,25 +259,65 @@ impl Encoder<ServerCommand> for PulsarFrameCodec {
 
     fn encode(&mut self, item: ServerCommand, dst: &mut BytesMut) -> Result<(), Self::Error> {
         // 特殊处理 Message 命令（包含 payload）
-        if let ServerCommand::Message { consumer_id, ledger_id, entry_id, partition, metadata, payload } = &item {
-            return self.encode_message(*consumer_id, *ledger_id, *entry_id, *partition, metadata, payload, dst);
+        if let ServerCommand::Message {
+            consumer_id,
+            ledger_id,
+            entry_id,
+            partition,
+            metadata,
+            payload,
+        } = &item
+        {
+            return self.encode_message(
+                *consumer_id,
+                *ledger_id,
+                *entry_id,
+                *partition,
+                metadata,
+                payload,
+                dst,
+            );
         }
 
-        let cmd_bytes = item.to_bytes();
+        let command = item.to_base_command();
+        let cmd_len = command.encoded_len();
 
         // Pulsar wire format for commands without payload:
         // [TOTAL_SIZE (4B)] [CMD_SIZE (4B)] [CMD]
         // where TOTAL_SIZE = CMD_SIZE (4) + CMD
 
-        let total_size = 4 + cmd_bytes.len(); // cmd_size field (4) + cmd
+        let total_size = 4 + cmd_len; // cmd_size field (4) + cmd
 
         // Write frame
         dst.reserve(total_size + 4); // +4 for total_size field itself
-        dst.put_u32(total_size as u32);  // TOTAL_SIZE
-        dst.put_u32(cmd_bytes.len() as u32);  // CMD_SIZE
-        dst.extend_from_slice(&cmd_bytes);  // CMD
+        dst.put_u32(total_size as u32); // TOTAL_SIZE
+        dst.put_u32(cmd_len as u32); // CMD_SIZE
+        command
+            .encode(dst)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
 
         Ok(())
+    }
+}
+
+impl Encoder<(u64, PendingMessage)> for PulsarFrameCodec {
+    type Error = io::Error;
+
+    fn encode(
+        &mut self,
+        item: (u64, PendingMessage),
+        dst: &mut BytesMut,
+    ) -> Result<(), Self::Error> {
+        let (consumer_id, msg) = item;
+        self.encode_message(
+            consumer_id,
+            msg.message_id.ledger,
+            msg.message_id.entry,
+            msg.message_id.partition,
+            &msg.metadata,
+            &msg.payload,
+            dst,
+        )
     }
 }
 
@@ -185,57 +333,18 @@ impl PulsarFrameCodec {
         payload: &Bytes,
         dst: &mut BytesMut,
     ) -> Result<(), io::Error> {
-        use proto::pulsar::*;
-
-        // 创建 Message 命令
-        let command = BaseCommand {
-            r#type: base_command::Type::Message as i32,
-            message: Some(CommandMessage {
-                consumer_id,
-                message_id: MessageIdData {
-                    ledger_id,
-                    entry_id,
-                    partition: Some(partition),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let cmd_bytes = command.encode_to_vec();
-
-        let synthesized_metadata = if metadata.is_empty() {
-            Some(
-                MessageMetadata {
-                    sequence_id: entry_id,
-                    ..Default::default()
-                }
-                .encode_to_vec(),
-            )
-        } else {
-            None
-        };
-        let metadata_len = synthesized_metadata
-            .as_ref()
-            .map(|bytes| bytes.len())
-            .unwrap_or_else(|| metadata.len());
-
-        // Pulsar wire format for messages with payload:
-        // [TOTAL_SIZE (4B)] [CMD_SIZE (4B)] [CMD] [METADATA_SIZE (4B)] [METADATA] [PAYLOAD]
-        let total_size = 4 + cmd_bytes.len() + 4 + metadata_len + payload.len();
-
-        dst.reserve(total_size + 4);
-        dst.put_u32(total_size as u32);              // TOTAL_SIZE
-        dst.put_u32(cmd_bytes.len() as u32);         // CMD_SIZE
-        dst.extend_from_slice(&cmd_bytes);           // CMD
-        dst.put_u32(metadata_len as u32);            // METADATA_SIZE
-        if let Some(metadata_bytes) = synthesized_metadata {
-            dst.extend_from_slice(&metadata_bytes);  // METADATA
-        } else {
-            dst.extend_from_slice(metadata.as_ref()); // METADATA
-        }
-        dst.extend_from_slice(payload.as_ref());     // PAYLOAD
+        let parts = encode_message_parts(
+            consumer_id,
+            ledger_id,
+            entry_id,
+            partition,
+            metadata,
+            payload,
+        )?;
+        dst.reserve(parts.header.len() + parts.metadata.len() + parts.payload.len());
+        dst.extend_from_slice(parts.header.as_ref());
+        dst.extend_from_slice(parts.metadata.as_ref());
+        dst.extend_from_slice(parts.payload.as_ref());
 
         Ok(())
     }
@@ -243,8 +352,8 @@ impl PulsarFrameCodec {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::proto::pulsar::{CompressionType, KeyValue, MessageMetadata};
+    use super::*;
     use crate::protocol::command::ServerCommand;
     use bytes::Bytes;
     use prost::Message;
@@ -255,14 +364,14 @@ mod tests {
 
         // Create a simple frame: total_size=12, cmd_size=4, cmd=[1,2,3,4], metadata_size=0
         let mut data = BytesMut::new();
-        data.put_u32(12);  // total size
-        data.put_u32(4);   // cmd size
-        data.extend_from_slice(&[1, 2, 3, 4]);  // cmd
-        data.put_u32(0);   // metadata size (0)
+        data.put_u32(12); // total size
+        data.put_u32(4); // cmd size
+        data.extend_from_slice(&[1, 2, 3, 4]); // cmd
+        data.put_u32(0); // metadata size (0)
 
         let frame = codec.decode(&mut data).unwrap().unwrap();
-        assert_eq!(frame.command, vec![1u8, 2, 3, 4]);
-        assert_eq!(frame.payload, Vec::<u8>::new());
+        assert_eq!(frame.command, Bytes::from(vec![1u8, 2, 3, 4]));
+        assert_eq!(frame.payload, Bytes::new());
     }
 
     #[test]
@@ -271,15 +380,15 @@ mod tests {
 
         // Create frame with payload
         let mut data = BytesMut::new();
-        data.put_u32(16);  // total size
-        data.put_u32(4);   // cmd size
-        data.extend_from_slice(&[1, 2, 3, 4]);  // cmd
-        data.put_u32(0);   // metadata size (0)
-        data.extend_from_slice(&[5, 6, 7, 8]);  // payload
+        data.put_u32(16); // total size
+        data.put_u32(4); // cmd size
+        data.extend_from_slice(&[1, 2, 3, 4]); // cmd
+        data.put_u32(0); // metadata size (0)
+        data.extend_from_slice(&[5, 6, 7, 8]); // payload
 
         let frame = codec.decode(&mut data).unwrap().unwrap();
-        assert_eq!(frame.command, vec![1, 2, 3, 4]);
-        assert_eq!(frame.payload, vec![5, 6, 7, 8]);
+        assert_eq!(frame.command, Bytes::from(vec![1, 2, 3, 4]));
+        assert_eq!(frame.payload, Bytes::from(vec![5, 6, 7, 8]));
     }
 
     #[test]
@@ -319,11 +428,46 @@ mod tests {
         assert_eq!(decoded_metadata.sequence_id, 42);
         assert_eq!(decoded_metadata.event_time, Some(200));
         assert_eq!(decoded_metadata.ordering_key, Some(b"order-key".to_vec()));
-        assert_eq!(decoded_metadata.compression, Some(CompressionType::Lz4 as i32));
+        assert_eq!(
+            decoded_metadata.compression,
+            Some(CompressionType::Lz4 as i32)
+        );
         assert_eq!(decoded_metadata.uncompressed_size, Some(128));
         assert_eq!(decoded_metadata.properties.len(), 1);
         assert_eq!(decoded_metadata.properties[0].key, "env");
         assert_eq!(decoded_metadata.properties[0].value, "test");
-        assert_eq!(frame.payload, payload);
+        assert_eq!(frame.payload, Bytes::from(payload));
+    }
+
+    #[test]
+    fn test_encode_message_parts_matches_codec_output() {
+        let mut codec = PulsarFrameCodec::new();
+        let command = ServerCommand::Message {
+            consumer_id: 7,
+            ledger_id: 11,
+            entry_id: 22,
+            partition: -1,
+            metadata: Bytes::new(),
+            payload: Bytes::from_static(b"payload"),
+        };
+
+        let mut encoded = BytesMut::new();
+        codec.encode(command, &mut encoded).unwrap();
+
+        let parts = encode_message_parts(
+            7,
+            11,
+            22,
+            -1,
+            &Bytes::new(),
+            &Bytes::from_static(b"payload"),
+        )
+        .unwrap();
+        let mut rebuilt = BytesMut::new();
+        rebuilt.extend_from_slice(parts.header.as_ref());
+        rebuilt.extend_from_slice(parts.metadata.as_ref());
+        rebuilt.extend_from_slice(parts.payload.as_ref());
+
+        assert_eq!(encoded.freeze(), rebuilt.freeze());
     }
 }

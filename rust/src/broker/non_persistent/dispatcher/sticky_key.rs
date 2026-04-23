@@ -5,7 +5,7 @@ use crate::broker::service::Consumer;
 use crate::protocol::codec::proto::pulsar::MessageMetadata;
 use crate::storage::{MessageId, NonPersistentEntry};
 use prost::Message;
-use std::collections:: HashMap;
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicU32, AtomicU64, Ordering},
     Arc,
@@ -18,7 +18,9 @@ pub struct NonPersistentStickyKeyDispatcher {
     sticky_assignments: Vec<(KeySharedHashRange, Arc<Consumer>)>,
     key_shared_policy: KeySharedPolicy,
     total_available_permits: AtomicU32,
+    received_messages: AtomicU64,
     dropped_messages: AtomicU64,
+    dispatched_messages: AtomicU64,
 }
 
 impl NonPersistentStickyKeyDispatcher {
@@ -33,7 +35,9 @@ impl NonPersistentStickyKeyDispatcher {
                 allow_out_of_order_delivery: false,
             }),
             total_available_permits: AtomicU32::new(0),
+            received_messages: AtomicU64::new(0),
             dropped_messages: AtomicU64::new(0),
+            dispatched_messages: AtomicU64::new(0),
         }
     }
 
@@ -95,6 +99,18 @@ impl NonPersistentStickyKeyDispatcher {
         self.dropped_messages.load(Ordering::Relaxed)
     }
 
+    pub fn received_messages(&self) -> u64 {
+        self.received_messages.load(Ordering::Relaxed)
+    }
+
+    pub fn dispatched_messages(&self) -> u64 {
+        self.dispatched_messages.load(Ordering::Relaxed)
+    }
+
+    fn record_dispatched(&self, count: u64) {
+        self.dispatched_messages.fetch_add(count, Ordering::Relaxed);
+    }
+
     pub fn has_same_key_shared_policy(&self, policy: Option<&KeySharedPolicy>) -> bool {
         let Some(policy) = policy else {
             return self.key_shared_policy.mode == KeySharedMode::AutoSplit;
@@ -102,7 +118,7 @@ impl NonPersistentStickyKeyDispatcher {
         policy.mode == self.key_shared_policy.mode
     }
 
-    fn record_drop(&self, count: u64) {
+    pub fn record_drop(&self, count: u64) {
         self.dropped_messages.fetch_add(count, Ordering::Relaxed);
     }
 
@@ -112,6 +128,13 @@ impl NonPersistentStickyKeyDispatcher {
             Ordering::Relaxed,
             |current: u32| Some(current.saturating_sub(permits)),
         );
+    }
+
+    fn active_assignments(&self) -> &[(KeySharedHashRange, Arc<Consumer>)] {
+        match self.key_shared_policy.mode {
+            KeySharedMode::AutoSplit => &self.auto_split_assignments,
+            KeySharedMode::Sticky => &self.sticky_assignments,
+        }
     }
 
     fn resolve_sticky_key(entry: &NonPersistentEntry) -> Vec<u8> {
@@ -237,15 +260,13 @@ impl NonPersistentStickyKeyDispatcher {
 
     fn select_consumer(&self, sticky_key: &[u8]) -> Option<Arc<Consumer>> {
         let sticky_key_hash = Self::sticky_key_hash(sticky_key);
-        let assignments = match self.key_shared_policy.mode {
-            KeySharedMode::AutoSplit => &self.auto_split_assignments,
-            KeySharedMode::Sticky => &self.sticky_assignments,
-        };
+        let assignments = self.active_assignments();
 
         for (range, consumer) in assignments {
             if sticky_key_hash >= range.start
-            && sticky_key_hash <= range.end
-            && consumer.available_permits_now() > 0
+                && sticky_key_hash <= range.end
+                && consumer.available_permits_now() > 0
+                && consumer.is_writable()
             {
                 return Some(consumer.clone());
             }
@@ -253,12 +274,13 @@ impl NonPersistentStickyKeyDispatcher {
 
         None
     }
-    
 
     pub async fn send_messages(
         &self,
         entries: Vec<NonPersistentEntry>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.received_messages
+            .fetch_add(entries.len() as u64, Ordering::Relaxed);
         if self.total_available_permits.load(Ordering::Relaxed) == 0 {
             self.record_drop(entries.len() as u64);
             for entry in entries {
@@ -267,8 +289,6 @@ impl NonPersistentStickyKeyDispatcher {
             return Ok(());
         }
 
-        let mut grouped_entries: HashMap<u64, (Arc<Consumer>, Vec<NonPersistentEntry>)> =
-            HashMap::new();
         for entry in entries {
             let sticky_key = Self::resolve_sticky_key(&entry);
             let Some(consumer) = self.select_consumer(&sticky_key) else {
@@ -279,66 +299,28 @@ impl NonPersistentStickyKeyDispatcher {
                 entry.release();
                 continue;
             };
-            grouped_entries
-                .entry(consumer.consumer_id)
-                .or_insert_with(|| (consumer.clone(), Vec::new()))
-                .1
-                .push(entry);
-        }
 
-        for (_consumer_id, (consumer, entries_for_consumer)) in grouped_entries {
-            let consumer_permits = consumer.get_available_permits().await as usize;
-            let aggregate_permits = self.total_available_permits.load(Ordering::Relaxed) as usize;
-            let dispatchable = consumer_permits.min(aggregate_permits);
-            if dispatchable == 0 {
-                self.record_drop(entries_for_consumer.len() as u64);
-                for entry in entries_for_consumer {
-                    entry.release();
-                }
-                continue;
-            }
+            let message_id = MessageId {
+                ledger: entry.ledger_id(),
+                entry: entry.entry_id(),
+                partition: entry.partition(),
+            };
+            let metadata = entry.metadata_bytes();
+            let payload = entry.payload_bytes();
 
-            let mut batch_entries = entries_for_consumer;
-            let overflow = batch_entries.split_off(dispatchable.min(batch_entries.len()));
-
-            let mut batch_messages = Vec::with_capacity(batch_entries.len());
-            for entry in &batch_entries {
-                let permit_acquired = consumer.use_permit().await;
-                debug_assert!(
-                    permit_acquired,
-                    "key-shared dispatch window exceeded permits"
-                );
-                batch_messages.push((
-                    MessageId {
-                        ledger: entry.ledger_id(),
-                        entry: entry.entry_id(),
-                        partition: entry.partition(),
-                    },
-                    entry.metadata_bytes(),
-                    entry.payload_bytes(),
-                    0,
-                ));
+            if let Some(reservation) = consumer
+                .try_reserve_dispatch(&message_id, metadata, payload, 0)
+                .await
+            {
+                reservation.send();
+                self.record_dispatched(1);
+                self.subtract_total_permits(1);
+                consumer.record_message_dispatched(entry.len()).await;
+            } else {
+                self.record_drop(1);
             }
 
-            let attempted = batch_messages.len();
-            let sent = consumer.send_messages_batch(batch_messages).await;
-            if sent > 0 {
-                self.subtract_total_permits(sent as u32);
-                for entry in batch_entries.iter().take(sent) {
-                    consumer.record_message_dispatched(entry.len()).await;
-                }
-            }
-            if sent < attempted {
-                consumer.add_permits((attempted - sent) as u32).await;
-            }
-            if sent < attempted {
-                self.record_drop((attempted - sent) as u64);
-            }
-            self.record_drop(overflow.len() as u64);
-
-            for entry in batch_entries.into_iter().chain(overflow.into_iter()) {
-                entry.release();
-            }
+            entry.release();
         }
         Ok(())
     }
@@ -373,7 +355,18 @@ mod tests {
         key_shared_policy: Option<KeySharedPolicy>,
     ) -> (
         Arc<Consumer>,
-        mpsc::UnboundedReceiver<(u64, crate::broker::service::PendingMessage)>,
+        mpsc::Receiver<(u64, crate::broker::service::PendingMessage)>,
+    ) {
+        create_consumer_with_rx_and_capacity(consumer_id, key_shared_policy, 8192)
+    }
+
+    fn create_consumer_with_rx_and_capacity(
+        consumer_id: u64,
+        key_shared_policy: Option<KeySharedPolicy>,
+        capacity: usize,
+    ) -> (
+        Arc<Consumer>,
+        mpsc::Receiver<(u64, crate::broker::service::PendingMessage)>,
     ) {
         let subscription = Arc::new(RwLock::new(Subscription::new_with_options(
             "sub".to_string(),
@@ -384,7 +377,7 @@ mod tests {
             key_shared_policy.clone(),
             create_test_storage(),
         )));
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(capacity);
         (
             Arc::new(Consumer::new_with_options(
                 consumer_id,
@@ -392,11 +385,72 @@ mod tests {
                 subscription,
                 "conn".to_string(),
                 tx,
+                Arc::new(crate::broker::service::ConnectionWriteState::new(
+                    64 * 1024,
+                    32 * 1024,
+                )),
                 0,
                 key_shared_policy,
             )),
             rx,
         )
+    }
+
+    #[tokio::test]
+    async fn sticky_selector_treats_backpressured_consumer_as_unavailable() {
+        let mut dispatcher = NonPersistentStickyKeyDispatcher::new(Some(KeySharedPolicy {
+            mode: KeySharedMode::Sticky,
+            ranges: Vec::new(),
+            allow_out_of_order_delivery: false,
+        }));
+
+        let (consumer, _rx) = create_consumer_with_rx_and_capacity(
+            1,
+            Some(KeySharedPolicy {
+                mode: KeySharedMode::Sticky,
+                ranges: vec![KeySharedHashRange {
+                    start: 0,
+                    end: 32767,
+                }],
+                allow_out_of_order_delivery: false,
+            }),
+            1,
+        );
+
+        dispatcher.add_consumer(consumer.clone()).unwrap();
+        consumer.add_permits(1).await;
+        dispatcher.consumer_flow(consumer.consumer_id, 1);
+
+        let permit = consumer
+            .try_acquire_send_permit()
+            .expect("channel should have initial capacity");
+        permit.send((
+            consumer.consumer_id,
+            crate::broker::service::PendingMessage {
+                message_id: MessageId {
+                    ledger: 1,
+                    entry: 1,
+                    partition: -1,
+                },
+                metadata: Bytes::new(),
+                payload: Bytes::from_static(b"occupied"),
+                wire_size: 8,
+            },
+        ));
+
+        dispatcher
+            .send_messages(vec![NonPersistentEntry::create(
+                0,
+                1,
+                -1,
+                Bytes::from(metadata_with_partition_key("key-123")),
+                Bytes::from_static(b"payload"),
+            )])
+            .await
+            .unwrap();
+
+        assert_eq!(dispatcher.dropped_messages(), 1);
+        assert_eq!(consumer.get_available_permits().await, 1);
     }
 
     fn metadata_with_partition_key(key: &str) -> Vec<u8> {

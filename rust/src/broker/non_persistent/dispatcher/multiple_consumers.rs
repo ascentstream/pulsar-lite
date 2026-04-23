@@ -13,7 +13,9 @@ pub struct NonPersistentDispatcherMultipleConsumers {
     ordered_consumers: Vec<Arc<Consumer>>,
     next_consumer_index: AtomicUsize,
     total_available_permits: AtomicU32,
+    received_messages: AtomicU64,
     dropped_messages: AtomicU64,
+    dispatched_messages: AtomicU64,
 }
 
 impl NonPersistentDispatcherMultipleConsumers {
@@ -80,8 +82,20 @@ impl NonPersistentDispatcherMultipleConsumers {
         self.dropped_messages.load(Ordering::Relaxed)
     }
 
-    fn record_drop(&self, count: u64) {
+    pub fn received_messages(&self) -> u64 {
+        self.received_messages.load(Ordering::Relaxed)
+    }
+
+    pub fn dispatched_messages(&self) -> u64 {
+        self.dispatched_messages.load(Ordering::Relaxed)
+    }
+
+    pub fn record_drop(&self, count: u64) {
         self.dropped_messages.fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn record_dispatched(&self, count: u64) {
+        self.dispatched_messages.fetch_add(count, Ordering::Relaxed);
     }
 
     fn subtract_total_permits(&self, permits: u32) {
@@ -92,29 +106,23 @@ impl NonPersistentDispatcherMultipleConsumers {
         );
     }
 
-    fn get_next_available_consumer(&self) -> Option<Arc<Consumer>> {
+    fn next_consumer_start_index(&self) -> Option<usize> {
         if self.ordered_consumers.is_empty() {
             return None;
         }
 
-        let start =
-            self.next_consumer_index.fetch_add(1, Ordering::Relaxed) % self.ordered_consumers.len();
-
-        for offset in 0..self.ordered_consumers.len() {
-            let consumer =
-                self.ordered_consumers[(start + offset) % self.ordered_consumers.len()].clone();
-            if consumer.available_permits_now() > 0 {
-                return Some(consumer);
-            }
-        }
-
-        None
+        Some(
+            self.next_consumer_index.fetch_add(1, Ordering::Relaxed) % self.ordered_consumers.len(),
+        )
     }
 
     pub async fn send_messages(
         &self,
         entries: Vec<NonPersistentEntry>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let entry_count = entries.len() as u64;
+        self.received_messages
+            .fetch_add(entry_count, Ordering::Relaxed);
         let mut pending_entries = entries.into_iter();
         while let Some(entry) = pending_entries.next() {
             if self.total_available_permits.load(Ordering::Relaxed) == 0 {
@@ -128,64 +136,44 @@ impl NonPersistentDispatcherMultipleConsumers {
                 continue;
             }
 
-            let Some(consumer) = self.get_next_available_consumer() else {
-                log::debug!("Dropping non-persistent shared entry due to no available consumer");
+            let Some(start) = self.next_consumer_start_index() else {
+                log::debug!("Dropping non-persistent shared entry due to no connected consumer");
                 self.record_drop(1);
                 entry.release();
                 continue;
             };
 
-            let consumer_permits = consumer.get_available_permits().await as usize;
-            let aggregate_permits = self.total_available_permits.load(Ordering::Relaxed) as usize;
-            let dispatchable = consumer_permits.min(aggregate_permits);
-            if dispatchable == 0 {
-                self.record_drop(1);
-                entry.release();
-                continue;
-            }
+            let message_id = MessageId {
+                ledger: entry.ledger_id(),
+                entry: entry.entry_id(),
+                partition: entry.partition(),
+            };
+            let metadata = entry.metadata_bytes();
+            let payload = entry.payload_bytes();
 
-            let mut batch_entries = Vec::with_capacity(dispatchable);
-            batch_entries.push(entry);
-            for _ in 1..dispatchable {
-                let Some(next_entry) = pending_entries.next() else {
+            let mut delivered = false;
+            for offset in 0..self.ordered_consumers.len() {
+                let consumer =
+                    self.ordered_consumers[(start + offset) % self.ordered_consumers.len()].clone();
+
+                if let Some(reservation) = consumer
+                    .try_reserve_dispatch(&message_id, metadata.clone(), payload.clone(), 0)
+                    .await
+                {
+                    reservation.send();
+                    self.record_dispatched(1);
+                    self.subtract_total_permits(1);
+                    consumer.record_message_dispatched(entry.len()).await;
+                    delivered = true;
                     break;
-                };
-                batch_entries.push(next_entry);
-            }
-
-            let mut batch_messages = Vec::with_capacity(batch_entries.len());
-            for batch_entry in &batch_entries {
-                let permit_acquired = consumer.use_permit().await;
-                debug_assert!(permit_acquired, "shared dispatch window exceeded permits");
-                batch_messages.push((
-                    MessageId {
-                        ledger: batch_entry.ledger_id(),
-                        entry: batch_entry.entry_id(),
-                        partition: batch_entry.partition(),
-                    },
-                    batch_entry.metadata_bytes(),
-                    batch_entry.payload_bytes(),
-                    0,
-                ));
-            }
-
-            let attempted = batch_messages.len();
-            let sent = consumer.send_messages_batch(batch_messages).await;
-            if sent > 0 {
-                self.subtract_total_permits(sent as u32);
-                for batch_entry in batch_entries.iter().take(sent) {
-                    consumer.record_message_dispatched(batch_entry.len()).await;
                 }
             }
-            if sent < attempted {
-                consumer.add_permits((attempted - sent) as u32).await;
+
+            if !delivered {
+                log::debug!("Dropping non-persistent shared entry due to no writable consumer");
+                self.record_drop(1);
             }
-            if sent < attempted {
-                self.record_drop((attempted - sent) as u64);
-            }
-            for batch_entry in batch_entries {
-                batch_entry.release();
-            }
+            entry.release();
         }
         Ok(())
     }
@@ -223,9 +211,20 @@ mod tests {
         subscription: Arc<RwLock<Subscription>>,
     ) -> (
         Arc<Consumer>,
-        mpsc::UnboundedReceiver<(u64, crate::broker::service::PendingMessage)>,
+        mpsc::Receiver<(u64, crate::broker::service::PendingMessage)>,
     ) {
-        let (tx, rx) = mpsc::unbounded_channel();
+        create_test_consumer_with_capacity(id, subscription, 8192)
+    }
+
+    fn create_test_consumer_with_capacity(
+        id: u64,
+        subscription: Arc<RwLock<Subscription>>,
+        capacity: usize,
+    ) -> (
+        Arc<Consumer>,
+        mpsc::Receiver<(u64, crate::broker::service::PendingMessage)>,
+    ) {
+        let (tx, rx) = mpsc::channel(capacity);
         (
             Arc::new(Consumer::new(
                 id,
@@ -237,6 +236,58 @@ mod tests {
             )),
             rx,
         )
+    }
+
+    #[tokio::test]
+    async fn shared_dispatcher_skips_backpressured_consumer() {
+        let subscription = create_test_subscription();
+        let (consumer_a, _rx_a) = create_test_consumer_with_capacity(1, subscription.clone(), 1);
+        let (consumer_b, mut rx_b) = create_test_consumer_with_capacity(2, subscription, 1);
+
+        let mut dispatcher = NonPersistentDispatcherMultipleConsumers::new();
+        dispatcher.add_consumer(consumer_a.clone()).unwrap();
+        dispatcher.add_consumer(consumer_b.clone()).unwrap();
+
+        consumer_a.add_permits(1).await;
+        consumer_b.add_permits(1).await;
+        dispatcher.consumer_flow(consumer_a.consumer_id, 1);
+        dispatcher.consumer_flow(consumer_b.consumer_id, 1);
+
+        let permit = consumer_a
+            .try_acquire_send_permit()
+            .expect("consumer A channel should have capacity");
+        permit.send((
+            consumer_a.consumer_id,
+            crate::broker::service::PendingMessage {
+                message_id: MessageId {
+                    ledger: 9,
+                    entry: 9,
+                    partition: -1,
+                },
+                metadata: Bytes::new(),
+                payload: Bytes::from_static(b"occupied"),
+                wire_size: 8,
+            },
+        ));
+
+        dispatcher
+            .send_messages(vec![NonPersistentEntry::create(
+                1,
+                1,
+                -1,
+                Bytes::new(),
+                Bytes::from_static(b"hello"),
+            )])
+            .await
+            .unwrap();
+
+        let delivered = rx_b
+            .recv()
+            .await
+            .expect("consumer B should receive message");
+        assert_eq!(delivered.0, consumer_b.consumer_id);
+        assert_eq!(delivered.1.payload, Bytes::from_static(b"hello"));
+        assert_eq!(dispatcher.dropped_messages(), 0);
     }
 
     fn sized_bytes(fill: u8, size: usize) -> Bytes {

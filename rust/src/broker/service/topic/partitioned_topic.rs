@@ -3,10 +3,11 @@
  * A topic that contains multiple partitions for parallel processing
  */
 
+use super::{SharedSubscription, SubscriptionType, Topic};
+use crate::broker::service::{Consumer, Producer, SharedStorage};
+use bytes::Bytes;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use crate::broker::service::{Consumer, SharedStorage, Producer};
-use super::{Topic, SubscriptionType, SharedSubscription};
 
 /// Shared PartitionedTopic wrapped in Arc<RwLock>
 pub type SharedPartitionedTopic = Arc<RwLock<PartitionedTopic>>;
@@ -34,17 +35,13 @@ pub struct PartitionedTopic {
     storage: SharedStorage,
 }
 
-
 impl PartitionedTopic {
     /// Create a new partitioned topic with the specified number of partitions
-    pub fn new(
-        topic_name: String,
-        partition_count: usize,
-        storage: SharedStorage,
-    ) -> Self {
+    pub fn new(topic_name: String, partition_count: usize, storage: SharedStorage) -> Self {
         log::info!(
             "Creating partitioned topic '{}' with {} partitions",
-            topic_name, partition_count
+            topic_name,
+            partition_count
         );
 
         // Create partition topics
@@ -96,7 +93,11 @@ impl PartitionedTopic {
         producer: Arc<Producer>,
     ) -> Result<(), String> {
         if partition_index >= self.partition_count {
-            return Err(format!("Partition index {} out of bounds (max: {})", partition_index, self.partition_count - 1));
+            return Err(format!(
+                "Partition index {} out of bounds (max: {})",
+                partition_index,
+                self.partition_count - 1
+            ));
         }
 
         let mut partition = self.partitions[partition_index].write().await;
@@ -156,7 +157,9 @@ impl PartitionedTopic {
         // Get or create subscription
         let subscription = {
             let sub_type = SubscriptionType::Shared; // Default to Shared
-            partition.get_or_create_subscription(subscription_name, sub_type).await?
+            partition
+                .get_or_create_subscription(subscription_name, sub_type)
+                .await?
         };
 
         // Add consumer to subscription
@@ -199,7 +202,9 @@ impl PartitionedTopic {
         }
 
         let mut partition = self.partitions[partition_index].write().await;
-        partition.get_or_create_subscription(subscription_name, sub_type).await
+        partition
+            .get_or_create_subscription(subscription_name, sub_type)
+            .await
     }
 
     /// Get total subscription count across all partitions
@@ -222,16 +227,18 @@ impl PartitionedTopic {
     pub async fn publish_message_to_partition(
         &mut self,
         partition_index: usize,
-        metadata: Option<&[u8]>,
-        payload: &[u8],
-    ) -> Result<crate::storage::MessageId, Box<dyn std::error::Error>> {
+        metadata: Option<Bytes>,
+        payload: Bytes,
+    ) -> Result<crate::storage::MessageId, Box<dyn std::error::Error + Send + Sync>> {
         if partition_index >= self.partition_count {
             return Err(format!("Partition index {} out of bounds", partition_index).into());
         }
 
         log::debug!(
             "Publishing message to partitioned topic '{}' partition {} ({} bytes)",
-            self.topic_name, partition_index, payload.len()
+            self.topic_name,
+            partition_index,
+            payload.len()
         );
 
         let partition = self.partitions[partition_index].clone();
@@ -306,7 +313,9 @@ mod tests {
     use tokio::sync::Mutex;
 
     fn create_test_storage() -> SharedStorage {
-        Arc::new(Mutex::new(Storage::new(Path::new("/tmp/test-partitioned-topic")).unwrap()))
+        Arc::new(Mutex::new(
+            Storage::new(Path::new("/tmp/test-partitioned-topic")).unwrap(),
+        ))
     }
 
     fn create_test_producer(id: u64, topic_ref: Arc<RwLock<Topic>>) -> Arc<Producer> {
@@ -346,16 +355,26 @@ mod tests {
     #[tokio::test]
     async fn test_partition_names() {
         let storage = create_test_storage();
-        let topic = PartitionedTopic::new("persistent://public/default/my-topic".to_string(), 3, storage);
+        let topic = PartitionedTopic::new(
+            "persistent://public/default/my-topic".to_string(),
+            3,
+            storage,
+        );
 
         // Check partition names
         let p0 = topic.get_partition(0).unwrap();
         let p0_guard = p0.read().await;
-        assert_eq!(p0_guard.name, "persistent://public/default/my-topic-partition-0");
+        assert_eq!(
+            p0_guard.name,
+            "persistent://public/default/my-topic-partition-0"
+        );
 
         let p1 = topic.get_partition(1).unwrap();
         let p1_guard = p1.read().await;
-        assert_eq!(p1_guard.name, "persistent://public/default/my-topic-partition-1");
+        assert_eq!(
+            p1_guard.name,
+            "persistent://public/default/my-topic-partition-1"
+        );
     }
 
     #[tokio::test]

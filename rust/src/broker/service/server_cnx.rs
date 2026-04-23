@@ -14,9 +14,10 @@ use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tokio_util::codec::Framed;
 
 use super::consumer::PendingMessage;
-use super::{Consumer, Producer, SharedStorage};
+use super::{ConnectionWriteState, Consumer, Producer, SharedStorage};
 use crate::broker::broker_service::SharedBrokerService;
 use crate::broker::handler;
+use crate::broker::service::topic::TopicPublishRateExceeded;
 use crate::protocol::codec::{
     proto::pulsar::{base_command, BaseCommand, ProtocolVersion, ServerError},
     PulsarFrame, PulsarFrameCodec,
@@ -90,39 +91,64 @@ where
 
     /// Message channel receiver - receives messages from consumers to send to client
     /// All consumers on this connection share the same channel
-    message_rx: mpsc::UnboundedReceiver<(u64, PendingMessage)>,
+    message_rx: mpsc::Receiver<(u64, PendingMessage)>,
 
     /// Message channel sender - cloned and
-    message_tx: mpsc::UnboundedSender<(u64, PendingMessage)>,
+    message_tx: mpsc::Sender<(u64, PendingMessage)>,
+    /// Shared connection-level write-buffer state exposed to consumers.
+    connection_write_state: Arc<ConnectionWriteState>,
 
     /// Connection ID (unique identifier for this connection)
     connection_id: String,
-
-    /// Next producer ID for this connection
-    next_producer_id: u64,
-
-    /// Next consumer ID for this connection
-    next_consumer_id: u64,
 
     /// Shared storage reference
     storage: SharedStorage,
 
     /// Topic manager reference
     topic_manager: SharedBrokerService,
-    /// Connection-local non-persistent publish slots.
-    non_persistent_pending_messages: usize,
-    max_non_persistent_pending_messages: usize,
+    /// Number of in-flight non-persistent publish tasks spawned from this connection.
+    pending_send_requests: usize,
+    /// Drop gate: messages are silently dropped with fake receipt when this is exceeded.
+    /// Maps to Pulsar's maxConcurrentNonPersistentMessagePerConnection.
+    max_concurrent_non_persistent: usize,
+    /// TCP throttle gate: reading from framed stops when pending reaches this limit.
+    /// Maps to Pulsar's maxPendingPublishRequestsPerConnection.
+    max_pending_publish_requests: usize,
+    /// Resume reading threshold (hysteresis = max_pending_publish_requests / 2).
+    resume_threshold: usize,
+    /// When true, the event loop skips framed.next(), equivalent to Netty auto-read = false.
+    read_paused: bool,
     /// Maximum message size accepted by the broker.
     max_message_size: usize,
 
     /// Advertised broker service url returned from Lookup.
     broker_service_url: String,
+
 }
 
 impl<T> ServerCnx<T>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
+    fn sync_connection_writable_from_framed_buffer(&self) {
+        self.connection_write_state
+            .observe_buffered_bytes(self.framed.write_buffer().len());
+    }
+
+    async fn write_message_batch(&mut self, batch: Vec<(u64, PendingMessage)>) -> CnxResult<()> {
+        for item in batch {
+            self.sync_connection_writable_from_framed_buffer();
+            self.framed.feed(item).await.map_err(to_cnx_error)?;
+            self.sync_connection_writable_from_framed_buffer();
+        }
+
+        futures::sink::SinkExt::<(u64, PendingMessage)>::flush(&mut self.framed)
+            .await
+            .map_err(to_cnx_error)?;
+        self.sync_connection_writable_from_framed_buffer();
+        Ok(())
+    }
+
     /// Create a new ServerCnx
     pub fn new(
         socket: T,
@@ -132,14 +158,22 @@ where
         keep_alive_interval: Duration,
         handshake_timeout: Duration,
         connection_liveness_check_timeout: Duration,
-        max_non_persistent_pending_messages: usize,
+        max_concurrent_non_persistent: usize,
+        max_pending_publish_requests: usize,
         max_message_size: usize,
         broker_service_url: String,
+        channel_write_buffer_high_water_mark_bytes: usize,
+        channel_write_buffer_low_water_mark_bytes: usize,
     ) -> Self {
-        let (message_tx, message_rx) = mpsc::unbounded_channel();
-
+        let mut framed = Framed::new(socket, PulsarFrameCodec::new());
+        framed.set_backpressure_boundary(channel_write_buffer_high_water_mark_bytes);
+        let (message_tx, message_rx) = mpsc::channel(8192);
+        let connection_write_state = Arc::new(ConnectionWriteState::new(
+            channel_write_buffer_high_water_mark_bytes,
+            channel_write_buffer_low_water_mark_bytes,
+        ));
         Self {
-            framed: Framed::new(socket, PulsarFrameCodec::new()),
+            framed,
             state: State::Start,
             handshake_completed: false,
             last_activity: Instant::now(),
@@ -154,19 +188,21 @@ where
             consumers: HashMap::new(),
             message_rx,
             message_tx,
+            connection_write_state,
             connection_id,
-            next_producer_id: 0,
-            next_consumer_id: 0,
             storage,
             topic_manager,
-            non_persistent_pending_messages: 0,
-            max_non_persistent_pending_messages,
+            pending_send_requests: 0,
+            max_concurrent_non_persistent,
+            max_pending_publish_requests,
+            resume_threshold: max_pending_publish_requests / 2,
+            read_paused: false,
             max_message_size,
             broker_service_url,
         }
     }
 
-    pub fn get_message_sender(&self) -> mpsc::UnboundedSender<(u64, PendingMessage)> {
+    pub fn get_message_sender(&self) -> mpsc::Sender<(u64, PendingMessage)> {
         self.message_tx.clone()
     }
 
@@ -192,8 +228,8 @@ where
         let loop_result: CnxResult<()> = loop {
             let connection_check_deadline = self.connection_check_in_progress;
             tokio::select! {
-                // Inbound protocol commands drive the broker-side request lifecycle.
-                frame_result = self.framed.next() => {
+                // Inbound protocol commands — skipped when read_paused (TCP backpressure).
+                frame_result = self.framed.next(), if !self.read_paused && self.connection_write_state.is_writable() => {
                     match frame_result {
                         Some(frame) => {
                             let frame = frame.map_err(to_cnx_error)?;
@@ -207,6 +243,7 @@ where
                                 log::error!("Error handling command: {}", e);
                                 break Err(e);
                             }
+                            self.sync_connection_writable_from_framed_buffer();
                         }
                         None => {
                             self.close_reason.get_or_insert(CloseReason::ClientClosed);
@@ -215,12 +252,31 @@ where
                     }
                 }
 
-                // Outbound broker messages are funneled through the connection before hitting the socket.
+                // Outbound broker messages are batched: drain all pending, encode
+                // into the write buffer with feed(), then flush once for a single
+                // TCP write.  This amortises syscall overhead across many messages.
                 Some((consumer_id, pending_msg)) = self.message_rx.recv() => {
-                    if let Err(e) = self.send_message_to_client(consumer_id, pending_msg).await {
-                        self.set_failed(CloseReason::ProtocolError(e.to_string()));
-                        log::error!("Error sending message to client: {}", e);
-                        break Err(e);
+                    let mut batch = vec![(consumer_id, pending_msg)];
+                    while let Ok(next) = self.message_rx.try_recv() {
+                        batch.push(next);
+                        if batch.len() >= 128 {
+                            break;
+                        }
+                    }
+
+                    let mut send_error: Option<CnxError> = None;
+
+                    if let Err(e) = self.write_message_batch(batch).await {
+                        send_error = Some(e);
+                    }
+
+                    match send_error {
+                        Some(e) => {
+                            self.set_failed(CloseReason::ProtocolError(e.to_string()));
+                            log::error!("Error sending message batch to client: {}", e);
+                            break Err(e);
+                        }
+                        None => {}
                     }
                 }
 
@@ -339,35 +395,6 @@ where
         );
         self.set_failed(reason);
         true
-    }
-
-    async fn send_message_to_client(
-        &mut self,
-        consumer_id: u64,
-        pending_msg: PendingMessage,
-    ) -> CnxResult<()> {
-        log::debug!(
-            "Sending message {}:{}:{} to consumer {} on connection {}",
-            pending_msg.message_id.ledger,
-            pending_msg.message_id.entry,
-            pending_msg.message_id.partition,
-            consumer_id,
-            self.connection_id
-        );
-
-        let cmd = ServerCommand::Message {
-            consumer_id,
-            ledger_id: pending_msg.message_id.ledger,
-            entry_id: pending_msg.message_id.entry,
-            partition: pending_msg.message_id.partition,
-            metadata: pending_msg.metadata,
-            payload: pending_msg.payload,
-        };
-
-        self.framed.send(cmd).await.map_err(to_cnx_error)?;
-
-        log::debug!("Message sent successfully to consumer {}", consumer_id);
-        Ok(())
     }
 
     async fn handle_command(
@@ -535,7 +562,6 @@ where
             &mut self.framed,
             cmd,
             &mut self.producers,
-            &mut self.next_producer_id,
             self.topic_manager.clone(),
         )
         .await
@@ -547,13 +573,13 @@ where
             .send
             .as_ref()
             .ok_or_else(|| to_cnx_error("Missing send command"))?;
+        let producer_id = send_cmd.producer_id;
+        let sequence_id = send_cmd.sequence_id;
         let producer = self
             .producers
-            .get(&send_cmd.producer_id)
+            .get(&producer_id)
             .cloned()
-            .ok_or_else(|| {
-                to_cnx_error(format!("Unknown producer ID: {}", send_cmd.producer_id))
-            })?;
+            .ok_or_else(|| to_cnx_error(format!("Unknown producer ID: {}", producer_id)))?;
 
         let topic = producer.get_topic();
         let is_non_persistent = {
@@ -584,36 +610,55 @@ where
             return Ok(());
         }
 
-        if is_non_persistent
-            && self.non_persistent_pending_messages >= self.max_non_persistent_pending_messages
-        {
-            self.framed
-                .send(ServerCommand::SendReceipt {
-                    producer_id: send_cmd.producer_id,
-                    sequence_id: send_cmd.sequence_id,
-                    ledger_id: u64::MAX,
-                    entry_id: u64::MAX,
-                    partition: -1,
-                })
-                .await
-                .map_err(to_cnx_error)?;
-            return Ok(());
+        if is_non_persistent {
+            if self.pending_send_requests >= self.max_concurrent_non_persistent {
+                self.framed
+                    .send(ServerCommand::SendReceipt {
+                        producer_id,
+                        sequence_id,
+                        ledger_id: u64::MAX,
+                        entry_id: u64::MAX,
+                        partition: -1,
+                    })
+                    .await
+                    .map_err(to_cnx_error)?;
+                return Ok(());
+            }
+
+            self.pending_send_requests += 1;
+            if self.pending_send_requests >= self.max_pending_publish_requests {
+                self.read_paused = true;
+            }
         }
+
+        let result = handler::handle_send(&mut self.framed, cmd, frame, &self.producers).await;
 
         if is_non_persistent {
-            self.non_persistent_pending_messages += 1;
+            self.pending_send_requests = self.pending_send_requests.saturating_sub(1);
+            if self.read_paused && self.pending_send_requests <= self.resume_threshold {
+                self.read_paused = false;
+            }
         }
 
-        let result = handler::handle_send(&mut self.framed, cmd, frame, &self.producers)
-            .await
-            .map_err(to_cnx_error);
-
-        if is_non_persistent {
-            self.non_persistent_pending_messages =
-                self.non_persistent_pending_messages.saturating_sub(1);
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if let Some(rate_error) = error.downcast_ref::<TopicPublishRateExceeded>() {
+                    self.framed
+                        .send(ServerCommand::SendError {
+                            producer_id,
+                            sequence_id,
+                            error: ServerError::ServiceNotReady,
+                            message: rate_error.to_string(),
+                        })
+                        .await
+                        .map_err(to_cnx_error)?;
+                    Ok(())
+                } else {
+                    Err(to_cnx_error(error))
+                }
+            }
         }
-
-        result
     }
 
     async fn handle_subscribe(&mut self, cmd: BaseCommand) -> CnxResult<()> {
@@ -621,10 +666,10 @@ where
             &mut self.framed,
             cmd,
             &mut self.consumers,
-            &mut self.next_consumer_id,
             self.topic_manager.clone(),
             self.connection_id.clone(),
             self.message_tx.clone(),
+            self.connection_write_state.clone(),
         )
         .await
         .map_err(to_cnx_error)
@@ -681,8 +726,11 @@ pub async fn handle_connection(
     handshake_timeout: Duration,
     connection_liveness_check_timeout: Duration,
     max_non_persistent_pending_messages: usize,
+    max_pending_publish_requests: usize,
     max_message_size: usize,
     broker_service_url: String,
+    channel_write_buffer_high_water_mark_bytes: usize,
+    channel_write_buffer_low_water_mark_bytes: usize,
 ) -> CnxResult<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -700,8 +748,11 @@ pub async fn handle_connection(
         handshake_timeout,
         connection_liveness_check_timeout,
         max_non_persistent_pending_messages,
+        max_pending_publish_requests,
         max_message_size,
         broker_service_url,
+        channel_write_buffer_high_water_mark_bytes,
+        channel_write_buffer_low_water_mark_bytes,
     );
     server_cnx.run().await
 }
@@ -711,11 +762,11 @@ mod tests {
     use super::*;
     use crate::broker::broker_service::{BrokerService, TopicRef};
     use crate::broker::service::{topic::TopicRuntimeMode, Producer};
-    use bytes::Bytes;
     use crate::protocol::codec::proto::pulsar::{
         base_command, BaseCommand, CommandConnect, CommandPing, CommandSend,
     };
     use crate::storage::Storage;
+    use bytes::Bytes;
     use std::path::Path;
     use std::sync::Arc;
     use tokio::io::{duplex, DuplexStream};
@@ -737,8 +788,11 @@ mod tests {
             Duration::from_secs(30),
             Duration::from_secs(10),
             1000,
+            1000,
             5 * 1024 * 1024,
             "pulsar://127.0.0.1:6650".to_string(),
+            64 * 1024,
+            32 * 1024,
         );
         let client_framed = Framed::new(client, PulsarFrameCodec::new());
         (server_cnx, client_framed)
@@ -947,8 +1001,8 @@ mod tests {
     #[tokio::test]
     async fn non_persistent_send_limit_returns_negative_send_receipt() {
         let (mut server_cnx, mut client) = build_test_connection();
-        server_cnx.max_non_persistent_pending_messages = 0;
-        server_cnx.non_persistent_pending_messages = 0;
+        server_cnx.max_concurrent_non_persistent = 0;
+        server_cnx.pending_send_requests = 0;
         attach_non_persistent_producer(
             &mut server_cnx,
             "non-persistent://public/default/non-persistent-slot-topic",
@@ -979,5 +1033,78 @@ mod tests {
         assert_eq!(message_id.ledger_id, u64::MAX);
         assert_eq!(message_id.entry_id, u64::MAX);
         assert_eq!(message_id.partition, Some(-1));
+    }
+
+    #[tokio::test]
+    async fn non_persistent_publish_rate_limit_returns_send_error_without_closing_connection() {
+        let (mut server_cnx, mut client) = build_test_connection();
+        attach_non_persistent_producer(
+            &mut server_cnx,
+            "non-persistent://public/default/non-persistent-rate-limit-topic",
+            10,
+        )
+        .await;
+
+        if let Some(producer) = server_cnx.producers.get(&10) {
+            let topic = producer.get_topic();
+            topic
+                .write()
+                .await
+                .set_publish_rate(crate::broker::service::topic::TopicPublishRate {
+                    messages_per_sec: 0,
+                    bytes_per_sec: 1,
+                });
+        }
+
+        server_cnx
+            .handle_send(
+                send_command(10, 33),
+                PulsarFrame {
+                    command: Bytes::new(),
+                    metadata: None,
+                    payload: Bytes::from(vec![1, 2, 3]),
+                    checksum: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let frame = client.next().await.unwrap().unwrap();
+        let cmd = BaseCommand::decode(&frame.command[..]).unwrap();
+        assert_eq!(cmd.r#type, base_command::Type::SendError as i32);
+        let send_error = cmd.send_error.expect("send error payload");
+        assert_eq!(send_error.producer_id, 10);
+        assert_eq!(send_error.sequence_id, 33);
+        assert_eq!(send_error.error, ServerError::ServiceNotReady as i32);
+        assert!(send_error.message.contains("publish rate exceeded"));
+        assert_ne!(server_cnx.state, State::Failed);
+        assert_ne!(server_cnx.state, State::Closed);
+    }
+
+    #[tokio::test]
+    async fn non_persistent_send_completes_without_leaving_pending_backlog() {
+        let (mut server_cnx, _client) = build_test_connection();
+        attach_non_persistent_producer(
+            &mut server_cnx,
+            "non-persistent://public/default/non-persistent-sync-send-topic",
+            13,
+        )
+        .await;
+
+        server_cnx
+            .handle_send(
+                send_command(13, 44),
+                PulsarFrame {
+                    command: Bytes::new(),
+                    metadata: None,
+                    payload: Bytes::from(vec![1, 2, 3]),
+                    checksum: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(server_cnx.pending_send_requests, 0);
+        assert!(!server_cnx.read_paused);
     }
 }

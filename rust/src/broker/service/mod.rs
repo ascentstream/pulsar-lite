@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub mod consumer; // Make public so PendingMessage can be used
+mod connection_write_state;
 mod pending_acks;
 mod producer;
 mod server_cnx;
@@ -21,7 +22,8 @@ pub type SharedStorage = Arc<Mutex<Storage>>;
 pub use server_cnx::{handle_connection, ServerCnx, State as ConnectionState};
 
 // Consumer types
-pub use consumer::{Consumer, ConsumerStats, PendingMessage};
+pub use consumer::{Consumer, ConsumerStats, DispatchReservation, PendingMessage};
+pub use connection_write_state::ConnectionWriteState;
 // Producer entity (new design, inspired by Apache Pulsar)
 pub use producer::Producer;
 

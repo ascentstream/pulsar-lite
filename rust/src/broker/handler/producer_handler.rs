@@ -4,6 +4,7 @@
  */
 
 use crate::broker::broker_service::{SharedBrokerService, TopicRef};
+use crate::broker::service::topic::TopicRuntimeMode;
 use crate::broker::service::Producer;
 use crate::protocol::codec::{proto::pulsar::BaseCommand, PulsarFrame, PulsarFrameCodec};
 use crate::protocol::ServerCommand;
@@ -17,7 +18,6 @@ pub async fn handle_producer<T>(
     framed: &mut Framed<T, PulsarFrameCodec>,
     cmd: BaseCommand,
     producers: &mut HashMap<u64, Arc<Producer>>,
-    _next_producer_id: &mut u64,
     topic_manager: SharedBrokerService,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -103,7 +103,7 @@ pub async fn handle_send<T>(
     cmd: BaseCommand,
     frame: PulsarFrame,
     producers: &HashMap<u64, Arc<Producer>>,
-) -> Result<(), Box<dyn std::error::Error>>
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -119,37 +119,64 @@ where
         .ok_or_else(|| format!("Unknown producer ID: {}", send_cmd.producer_id))?
         .clone();
 
-    // Publish message directly through Producer (Apache Pulsar style)
-    let message_id = producer
-        .publish_message(frame.metadata.as_deref(), &frame.payload)
-        .await?;
-
-    log::debug!(
-        "Stored message {}:{}:{} for topic '{}'",
-        message_id.ledger,
-        message_id.entry,
-        message_id.partition,
-        producer.get_topic_name()
-    );
-
-    // Push mode: Dispatch message to all subscriptions immediately
-    // This is consistent with Apache Pulsar's behavior
-    {
-        let topic = producer.get_topic();
-        let mut topic_guard = topic.write().await;
-        topic_guard.dispatch_to_subscriptions().await;
-    }
-
-    // Send SendReceipt response
-    let response = ServerCommand::SendReceipt {
-        producer_id: send_cmd.producer_id,
-        sequence_id: send_cmd.sequence_id,
-        ledger_id: message_id.ledger,
-        entry_id: message_id.entry,
-        partition: message_id.partition,
+    // Publish and dispatch
+    let topic = producer.get_topic();
+    let is_non_persistent = {
+        let topic_guard = topic.read().await;
+        topic_guard.runtime_mode() == TopicRuntimeMode::NonPersistent
     };
 
-    framed.send(response).await?;
+    if is_non_persistent {
+        // Non-persistent path: publish dispatches immediately at topic level,
+        // following Pulsar's dispatch-or-drop semantics.
+        producer.record_message_sent(frame.payload.len()).await;
+
+        let message_id = {
+            let mut topic_guard = topic.write().await;
+            topic_guard.publish_message(frame.metadata, frame.payload).await?
+        };
+
+        // Send SendReceipt response
+        let response = ServerCommand::SendReceipt {
+            producer_id: send_cmd.producer_id,
+            sequence_id: send_cmd.sequence_id,
+            ledger_id: message_id.ledger,
+            entry_id: message_id.entry,
+            partition: message_id.partition,
+        };
+        framed.send(response).await?;
+    } else {
+        // Persistent path: keep existing publish + dispatch flow
+        let message_id = producer
+            .publish_message(frame.metadata, frame.payload)
+            .await?;
+
+        log::debug!(
+            "Stored message {}:{}:{} for topic '{}'",
+            message_id.ledger,
+            message_id.entry,
+            message_id.partition,
+            producer.get_topic_name()
+        );
+
+        // Push mode: Dispatch message to all subscriptions immediately
+        {
+            let topic = producer.get_topic();
+            let mut topic_guard = topic.write().await;
+            topic_guard.dispatch_to_subscriptions().await;
+        }
+
+        // Send SendReceipt response
+        let response = ServerCommand::SendReceipt {
+            producer_id: send_cmd.producer_id,
+            sequence_id: send_cmd.sequence_id,
+            ledger_id: message_id.ledger,
+            entry_id: message_id.entry,
+            partition: message_id.partition,
+        };
+        framed.send(response).await?;
+    }
+
     log::debug!("Sent SendReceipt for sequence {}", send_cmd.sequence_id);
 
     Ok(())

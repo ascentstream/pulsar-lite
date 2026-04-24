@@ -711,6 +711,7 @@ mod tests {
     use super::*;
     use crate::broker::broker_service::{BrokerService, TopicRef};
     use crate::broker::service::{topic::TopicRuntimeMode, Producer};
+    use bytes::Bytes;
     use crate::protocol::codec::proto::pulsar::{
         base_command, BaseCommand, CommandConnect, CommandPing, CommandSend,
     };
@@ -885,9 +886,9 @@ mod tests {
             .handle_command(
                 ping_cmd,
                 PulsarFrame {
-                    command: vec![],
+                    command: Bytes::new(),
                     metadata: None,
-                    payload: vec![],
+                    payload: Bytes::new(),
                     checksum: None,
                 },
             )
@@ -921,9 +922,9 @@ mod tests {
             .handle_send(
                 send_command(7, 11),
                 PulsarFrame {
-                    command: vec![],
-                    metadata: Some(vec![1, 2]),
-                    payload: vec![3, 4, 5],
+                    command: Bytes::new(),
+                    metadata: Some(Bytes::from(vec![1, 2])),
+                    payload: Bytes::from(vec![3, 4, 5]),
                     checksum: None,
                 },
             )
@@ -959,9 +960,9 @@ mod tests {
             .handle_send(
                 send_command(8, 12),
                 PulsarFrame {
-                    command: vec![],
+                    command: Bytes::new(),
                     metadata: None,
-                    payload: vec![1, 2, 3],
+                    payload: Bytes::from(vec![1, 2, 3]),
                     checksum: None,
                 },
             )

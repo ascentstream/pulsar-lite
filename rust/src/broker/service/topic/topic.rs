@@ -3,19 +3,91 @@
  * Manages producers and subscriptions for a specific topic
  */
 
-use bytes::Bytes;
-use crate::broker::non_persistent::NonPersistentTopicRuntime;
-use crate::broker::service::{Consumer, SharedStorage, Producer};
-use crate::storage::{NonPersistentEntry, Storage};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use super::{
     KeySharedPolicy, Subscription, SubscriptionRuntimeMode, SubscriptionStats, SubscriptionType,
 };
+use crate::broker::service::{Consumer, Producer, SharedStorage};
+use crate::storage::{NonPersistentEntry, Storage};
+use bytes::Bytes;
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 
 /// Type alias for shared subscription
 pub type SharedSubscription = Arc<RwLock<Subscription>>;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TopicPublishRate {
+    pub messages_per_sec: u64,
+    pub bytes_per_sec: u64,
+}
+
+#[derive(Debug)]
+struct TopicPublishRateLimiter {
+    limits: TopicPublishRate,
+    window_started_at: Instant,
+    messages_in_window: u64,
+    bytes_in_window: u64,
+}
+
+impl TopicPublishRateLimiter {
+    fn new() -> Self {
+        Self {
+            limits: TopicPublishRate::default(),
+            window_started_at: Instant::now(),
+            messages_in_window: 0,
+            bytes_in_window: 0,
+        }
+    }
+
+    fn set_limits(&mut self, limits: TopicPublishRate) {
+        self.limits = limits;
+        self.window_started_at = Instant::now();
+        self.messages_in_window = 0;
+        self.bytes_in_window = 0;
+    }
+
+    fn allow_publish(&mut self, message_count: u64, bytes: u64) -> bool {
+        if self.limits.messages_per_sec == 0 && self.limits.bytes_per_sec == 0 {
+            return true;
+        }
+
+        if self.window_started_at.elapsed() >= Duration::from_secs(1) {
+            self.window_started_at = Instant::now();
+            self.messages_in_window = 0;
+            self.bytes_in_window = 0;
+        }
+
+        let next_messages = self.messages_in_window.saturating_add(message_count);
+        let next_bytes = self.bytes_in_window.saturating_add(bytes);
+        let messages_ok =
+            self.limits.messages_per_sec == 0 || next_messages <= self.limits.messages_per_sec;
+        let bytes_ok = self.limits.bytes_per_sec == 0 || next_bytes <= self.limits.bytes_per_sec;
+
+        if messages_ok && bytes_ok {
+            self.messages_in_window = next_messages;
+            self.bytes_in_window = next_bytes;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct TopicPublishRateExceeded {
+    topic_name: String,
+}
+
+impl fmt::Display for TopicPublishRateExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Topic publish rate exceeded for '{}'", self.topic_name)
+    }
+}
+
+impl std::error::Error for TopicPublishRateExceeded {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TopicRuntimeMode {
@@ -38,10 +110,9 @@ pub struct Topic {
     subscriptions: HashMap<String, SharedSubscription>,
     /// Internal topic runtime mode.
     runtime_mode: TopicRuntimeMode,
-    /// Dedicated non-persistent topic runtime state.
-    non_persistent_runtime: Option<NonPersistentTopicRuntime>,
     /// Storage backend
     storage: SharedStorage,
+    publish_rate_limiter: TopicPublishRateLimiter,
 }
 
 impl Topic {
@@ -75,8 +146,8 @@ impl Topic {
             producers: HashMap::new(),
             subscriptions: HashMap::new(),
             runtime_mode,
-            non_persistent_runtime: None,
             storage,
+            publish_rate_limiter: TopicPublishRateLimiter::new(),
         }
     }
 
@@ -88,17 +159,8 @@ impl Topic {
         self.runtime_mode = mode;
     }
 
-    fn reuse_or_create_non_persistent_runtime(&mut self) {
-        if self.non_persistent_runtime.is_none() {
-            self.non_persistent_runtime = Some(NonPersistentTopicRuntime::new());
-        }
-    }
-
-    pub fn non_persistent_pending_message_count(&self) -> usize {
-        self.non_persistent_runtime
-            .as_ref()
-            .map(|runtime| runtime.pending_message_count())
-            .unwrap_or(0)
+    pub fn set_publish_rate(&mut self, limits: TopicPublishRate) {
+        self.publish_rate_limiter.set_limits(limits);
     }
 
     /// Extract partition ID from topic name
@@ -122,15 +184,23 @@ impl Topic {
         let producer_id = producer.get_producer_id();
         let producer_name = producer.get_producer_name().to_string();
 
-        // Check if producer already exists
-        if self.producers.contains_key(&producer_id) {
-            return Err(format!("Producer {} already exists in topic", producer_id));
+        // Evict stale producer with the same ID (client reconnected on a new connection)
+        if let Some(old) = self.producers.remove(&producer_id) {
+            log::debug!(
+                "Evicted stale producer '{}' (id={}) from topic '{}'",
+                old.get_producer_name(),
+                producer_id,
+                self.name
+            );
         }
 
         self.producers.insert(producer_id, producer);
         log::info!(
             "Added producer '{}' (id={}) to topic '{}' (total={})",
-            producer_name, producer_id, self.name, self.producers.len()
+            producer_name,
+            producer_id,
+            self.name,
+            self.producers.len()
         );
         Ok(())
     }
@@ -141,7 +211,10 @@ impl Topic {
         if let Some(ref p) = producer {
             log::info!(
                 "Removed producer '{}' (id={}) from topic '{}', remaining={}",
-                p.get_producer_name(), producer_id, self.name, self.producers.len()
+                p.get_producer_name(),
+                producer_id,
+                self.name,
+                self.producers.len()
             );
         }
         producer
@@ -217,11 +290,14 @@ impl Topic {
                 key_shared_policy,
                 self.storage.clone(),
             )));
-            self.subscriptions.insert(subscription_name.to_string(), subscription.clone());
+            self.subscriptions
+                .insert(subscription_name.to_string(), subscription.clone());
 
             log::info!(
                 "Created subscription '{}' (type={:?}) on topic '{}'",
-                subscription_name, sub_type, self.name
+                subscription_name,
+                sub_type,
+                self.name
             );
 
             Ok(subscription)
@@ -251,7 +327,8 @@ impl Topic {
         if subscription.is_some() {
             log::info!(
                 "Removed subscription '{}' from topic '{}'",
-                subscription_name, self.name
+                subscription_name,
+                self.name
             );
         }
         subscription
@@ -287,42 +364,78 @@ impl Topic {
     /// Non-persistent topics append only to runtime memory and avoid storage.
     pub async fn publish_message(
         &mut self,
-        metadata: Option<&[u8]>,
-        payload: &[u8],
-    ) -> Result<crate::storage::MessageId, Box<dyn std::error::Error>> {
+        metadata: Option<Bytes>,
+        payload: Bytes,
+    ) -> Result<crate::storage::MessageId, Box<dyn std::error::Error + Send + Sync>> {
         log::debug!(
             "Publishing message to topic '{}' partition '{}' (metadata={} bytes, payload={} bytes)",
             self.name,
             self.partition,
-            metadata.map(|value| value.len()).unwrap_or(0),
+            metadata.as_ref().map(|value| value.len()).unwrap_or(0),
             payload.len()
         );
+
+        let total_bytes = metadata
+            .as_ref()
+            .map(|value| value.len() as u64)
+            .unwrap_or(0)
+            .saturating_add(payload.len() as u64);
+        if !self.publish_rate_limiter.allow_publish(1, total_bytes) {
+            return Err(Box::new(TopicPublishRateExceeded {
+                topic_name: self.name.clone(),
+            }));
+        }
 
         let message_id = match self.runtime_mode {
             TopicRuntimeMode::PersistentStyle => {
                 let mut guard = self.storage.lock().await;
-                guard.append_message(&self.name, self.partition, payload)?
+                guard.append_message(&self.name, self.partition, &payload)?
             }
             TopicRuntimeMode::NonPersistent => {
-                self.reuse_or_create_non_persistent_runtime();
                 let entry = NonPersistentEntry::create(
                     0,
                     0,
                     self.partition,
-                    Bytes::copy_from_slice(metadata.unwrap_or_default()),
-                    Bytes::copy_from_slice(payload),
+                    metadata.unwrap_or_default(),
+                    payload,
                 );
-                self.non_persistent_runtime
-                    .as_mut()
-                    .expect("non-persistent runtime just initialized")
-                    .publish_entry(entry);
+                let subscriptions: Vec<_> = self
+                    .subscriptions
+                    .iter()
+                    .map(|(sub_name, subscription)| (sub_name.clone(), subscription.clone()))
+                    .collect();
 
-                crate::storage::MessageId { ledger: 0, entry: 0, partition: self.partition }
+                for (sub_name, subscription) in subscriptions {
+                    let sub_guard = subscription.read().await;
+                    let result = sub_guard
+                        .send_non_persistent_entries(vec![entry.retained_duplicate()])
+                        .await;
+                    if let Err(e) = result {
+                        log::error!(
+                            "Failed to dispatch non-persistent entry to subscription '{}' on topic '{}': {}",
+                            sub_name,
+                            self.name,
+                            e
+                        );
+                    }
+                }
+                entry.release();
+
+                crate::storage::MessageId {
+                    ledger: 0,
+                    entry: 0,
+                    partition: self.partition,
+                }
             }
         };
 
-        log::info!("Published message {}:{}:{} to topic '{}'",
-            message_id.ledger, message_id.entry, message_id.partition, self.name);
+        log::debug!(
+            "Published message {}:{}:{} to topic '{}'",
+            message_id.ledger,
+            message_id.entry,
+            message_id.partition,
+            self.name
+        );
 
         Ok(message_id)
     }
@@ -336,82 +449,43 @@ impl Topic {
         match self.runtime_mode {
             TopicRuntimeMode::PersistentStyle => {
                 if subscription_count == 0 {
-                    log::debug!("No subscriptions on topic '{}', skipping dispatch", self.name);
-                    return;
-                }
-                log::debug!(
-                    "Dispatching messages to {} subscription(s) on topic '{}' with runtime={:?}",
-                    subscription_count, self.name, self.runtime_mode
-                );
-                for (sub_name, subscription) in &self.subscriptions {
-                    let sub_guard = subscription.read().await;
-                    if let Err(e) = sub_guard.dispatch_messages().await {
-                        log::error!(
-                            "Failed to dispatch message to subscription '{}' on topic '{}': {}",
-                            sub_name, self.name, e
-                        );
-                    }
-                }
-            }
-            TopicRuntimeMode::NonPersistent => {
-                if subscription_count == 0 {
-                    let entries = self
-                        .non_persistent_runtime
-                        .as_mut()
-                        .map(|runtime| runtime.drain_published_messages())
-                        .unwrap_or_default();
-                    for entry in entries {
-                        entry.release();
-                    }
                     log::debug!(
-                        "No subscriptions on non-persistent topic '{}', released pending entries",
+                        "No subscriptions on topic '{}', skipping dispatch",
                         self.name
                     );
                     return;
                 }
                 log::debug!(
                     "Dispatching messages to {} subscription(s) on topic '{}' with runtime={:?}",
-                    subscription_count, self.name, self.runtime_mode
+                    subscription_count,
+                    self.name,
+                    self.runtime_mode
                 );
-                let entries = self
-                    .non_persistent_runtime
-                    .as_mut()
-                    .map(|runtime| runtime.drain_published_messages())
-                    .unwrap_or_default();
-                let subscriptions: Vec<_> = self
-                    .subscriptions
-                    .iter()
-                    .map(|(sub_name, subscription)| (sub_name.clone(), subscription.clone()))
-                    .collect();
-
-                let mut entries_by_subscription = Vec::with_capacity(subscriptions.len());
-                for _ in 0..subscriptions.len() {
-                    entries_by_subscription.push(Vec::with_capacity(entries.len()));
-                }
-
-                for entry in &entries {
-                    for subscription_entries in &mut entries_by_subscription {
-                        subscription_entries.push(entry.retained_duplicate());
-                    }
-                }
-
-                for ((sub_name, subscription), subscription_entries) in
-                    subscriptions.into_iter().zip(entries_by_subscription.into_iter())
-                {
+                for (sub_name, subscription) in &self.subscriptions {
                     let sub_guard = subscription.read().await;
-                    if let Err(e) = sub_guard.send_non_persistent_entries(subscription_entries).await {
+                    if let Err(e) = sub_guard.dispatch_messages().await {
                         log::error!(
-                            "Failed to dispatch non-persistent entries to subscription '{}' on topic '{}': {}",
-                            sub_name, self.name, e
+                            "Failed to dispatch message to subscription '{}' on topic '{}': {}",
+                            sub_name,
+                            self.name,
+                            e
                         );
                     }
                 }
-
-                for entry in entries {
-                    entry.release();
-                }
+            }
+            TopicRuntimeMode::NonPersistent => {
+                log::debug!(
+                    "Non-persistent topic '{}' dispatches immediately on publish; no topic backlog to drain",
+                    self.name
+                );
             }
         }
+    }
+
+    /// Returns cloned Arc references to all subscriptions.
+    /// Call while holding any lock on Topic, then use the Arcs after releasing.
+    pub fn get_subscription_refs(&self) -> Vec<SharedSubscription> {
+        self.subscriptions.values().cloned().collect()
     }
 
     // ==================== Statistics ====================
@@ -476,10 +550,12 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc as StdArc;
     use std::time::Instant;
-    use tokio::sync::{Mutex, RwLock, mpsc};
+    use tokio::sync::{mpsc, Mutex, RwLock};
 
     fn create_test_storage() -> SharedStorage {
-        StdArc::new(Mutex::new(Storage::new(Path::new("/tmp/test-topic-storage")).unwrap()))
+        StdArc::new(Mutex::new(
+            Storage::new(Path::new("/tmp/test-topic-storage")).unwrap(),
+        ))
     }
 
     fn create_test_producer(id: u64, topic_ref: Arc<RwLock<Topic>>) -> Arc<Producer> {
@@ -492,7 +568,7 @@ mod tests {
     }
 
     fn create_test_consumer(id: u64, subscription: SharedSubscription) -> Arc<Consumer> {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(8192);
         StdArc::new(Consumer::new(
             id,
             format!("consumer-{}", id),
@@ -508,9 +584,9 @@ mod tests {
         subscription: SharedSubscription,
     ) -> (
         Arc<Consumer>,
-        mpsc::UnboundedReceiver<(u64, crate::broker::service::PendingMessage)>,
+        mpsc::Receiver<(u64, crate::broker::service::PendingMessage)>,
     ) {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(8192);
         (
             StdArc::new(Consumer::new(
                 id,
@@ -535,30 +611,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_non_persistent_publish_uses_runtime_only_path() {
+    async fn test_non_persistent_publish_dispatches_immediately_without_topic_backlog() {
         let storage = create_test_storage();
         let mut topic = Topic::new("test-topic".to_string(), storage.clone());
         topic.set_runtime_mode(TopicRuntimeMode::NonPersistent);
 
-        let message_id = topic.publish_message(None, b"hello").await.unwrap();
+        let message_id = topic
+            .publish_message(None, Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
 
         assert_eq!(message_id.ledger, 0);
         assert_eq!(message_id.entry, 0);
-        assert_eq!(topic.non_persistent_pending_message_count(), 1);
         assert!(storage.lock().await.get_messages("test-topic").is_empty());
     }
 
     #[tokio::test]
-    async fn test_non_persistent_without_subscriptions_releases_pending_entries() {
+    async fn test_non_persistent_without_subscriptions_does_not_leave_topic_backlog() {
         let storage = create_test_storage();
         let mut topic = Topic::new("test-topic".to_string(), storage);
         topic.set_runtime_mode(TopicRuntimeMode::NonPersistent);
 
-        topic.publish_message(None, b"hello").await.unwrap();
-        assert_eq!(topic.non_persistent_pending_message_count(), 1);
-
-        topic.dispatch_to_subscriptions().await;
-        assert_eq!(topic.non_persistent_pending_message_count(), 0);
+        topic
+            .publish_message(None, Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -587,13 +664,14 @@ mod tests {
         .encode_to_vec();
 
         let message_id = topic
-            .publish_message(Some(&metadata), b"hello")
+            .publish_message(
+                Some(Bytes::from(metadata.clone())),
+                Bytes::from_static(b"hello"),
+            )
             .await
             .unwrap();
         assert_eq!(message_id.ledger, 0);
         assert_eq!(message_id.entry, 0);
-
-        topic.dispatch_to_subscriptions().await;
 
         let (consumer_id, pending) = rx.recv().await.expect("message dispatched");
         assert_eq!(consumer_id, 1);
@@ -634,8 +712,14 @@ mod tests {
             sub_guard.consumer_flow(2, 1).await;
         }
 
-        topic.publish_message(None, b"first").await.unwrap();
-        topic.publish_message(None, b"second").await.unwrap();
+        topic
+            .publish_message(None, Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+        topic
+            .publish_message(None, Bytes::from_static(b"second"))
+            .await
+            .unwrap();
         topic.dispatch_to_subscriptions().await;
 
         let first = rx1.recv().await.expect("consumer1 receives a message");
@@ -648,7 +732,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_non_persistent_dispatch_batches_entries_per_subscription() {
+    async fn test_non_persistent_dispatches_entries_per_subscription_in_order() {
         let storage = create_test_storage();
         let mut topic = Topic::new("test-topic".to_string(), storage);
         topic.set_runtime_mode(TopicRuntimeMode::NonPersistent);
@@ -685,8 +769,14 @@ mod tests {
             sub_guard.consumer_flow(2, 2).await;
         }
 
-        topic.publish_message(None, b"first").await.unwrap();
-        topic.publish_message(None, b"second").await.unwrap();
+        topic
+            .publish_message(None, Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+        topic
+            .publish_message(None, Bytes::from_static(b"second"))
+            .await
+            .unwrap();
         topic.dispatch_to_subscriptions().await;
 
         let sub1_first = rx1.recv().await.expect("sub1 gets first message");
@@ -702,6 +792,62 @@ mod tests {
         assert_eq!(sub1_second.1.payload, b"second".to_vec());
         assert_eq!(sub2_first.1.payload, b"first".to_vec());
         assert_eq!(sub2_second.1.payload, b"second".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_non_persistent_topic_immediately_drops_for_blocked_subscription() {
+        let storage = create_test_storage();
+        let mut topic = Topic::new("test-topic".to_string(), storage);
+        topic.set_runtime_mode(TopicRuntimeMode::NonPersistent);
+
+        let ready_subscription = topic
+            .get_or_create_subscription("sub-ready", SubscriptionType::Exclusive)
+            .await
+            .unwrap();
+        let blocked_subscription = topic
+            .get_or_create_subscription("sub-blocked", SubscriptionType::Exclusive)
+            .await
+            .unwrap();
+
+        let (ready_consumer, mut ready_rx) =
+            create_test_consumer_with_rx(1, ready_subscription.clone());
+        let (blocked_consumer, _blocked_rx) =
+            create_test_consumer_with_rx(2, blocked_subscription.clone());
+
+        ready_consumer.add_permits(1).await;
+
+        {
+            let mut sub_guard = ready_subscription.write().await;
+            sub_guard.add_consumer(ready_consumer).unwrap();
+        }
+        {
+            let mut sub_guard = blocked_subscription.write().await;
+            sub_guard.add_consumer(blocked_consumer).unwrap();
+        }
+        {
+            let sub_guard = ready_subscription.read().await;
+            sub_guard.consumer_flow(1, 1).await;
+        }
+
+        topic
+            .publish_message(None, Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
+        topic.dispatch_to_subscriptions().await;
+
+        let delivered = ready_rx
+            .recv()
+            .await
+            .expect("ready subscription gets message");
+        assert_eq!(delivered.1.payload, b"hello".to_vec());
+
+        let ready_stats = ready_subscription.read().await.get_stats().await;
+        let blocked_stats = blocked_subscription.read().await.get_stats().await;
+        assert_eq!(ready_stats.received_messages, 1);
+        assert_eq!(ready_stats.dispatched_messages, 1);
+        assert_eq!(blocked_stats.received_messages, 1);
+        assert_eq!(blocked_stats.dispatched_messages, 0);
+        assert_eq!(blocked_stats.dropped_messages, 1);
     }
 
     #[tokio::test]
@@ -735,10 +881,11 @@ mod tests {
 
         for entry_id in 0..ENTRY_COUNT {
             let payload = format!("shared-topic-{entry_id}");
-            topic.publish_message(None, payload.as_bytes()).await.unwrap();
+            topic
+                .publish_message(None, Bytes::from(payload))
+                .await
+                .unwrap();
         }
-
-        assert_eq!(topic.non_persistent_pending_message_count(), ENTRY_COUNT);
 
         let start = Instant::now();
         topic.dispatch_to_subscriptions().await;
@@ -758,7 +905,6 @@ mod tests {
         }
 
         assert_eq!(received, ENTRY_COUNT);
-        assert_eq!(topic.non_persistent_pending_message_count(), 0);
 
         let stats = subscription.read().await.get_stats().await;
         assert_eq!(stats.dropped_messages, 0);
@@ -780,7 +926,10 @@ mod tests {
             sub_guard.add_consumer(consumer).unwrap();
         }
 
-        topic.publish_message(None, b"blocked").await.unwrap();
+        topic
+            .publish_message(None, Bytes::from_static(b"blocked"))
+            .await
+            .unwrap();
         topic.dispatch_to_subscriptions().await;
         assert!(rx.try_recv().is_err());
 
@@ -794,7 +943,10 @@ mod tests {
             sub_guard.consumer_flow(1, 1).await;
         }
 
-        topic.publish_message(None, b"allowed").await.unwrap();
+        topic
+            .publish_message(None, Bytes::from_static(b"allowed"))
+            .await
+            .unwrap();
         topic.dispatch_to_subscriptions().await;
 
         let dispatched = rx.recv().await.expect("message delivered after flow");
@@ -826,9 +978,15 @@ mod tests {
             sub_guard.consumer_flow(1, 1).await;
         }
 
-        topic.publish_message(None, b"first").await.unwrap();
+        topic
+            .publish_message(None, Bytes::from_static(b"first"))
+            .await
+            .unwrap();
         topic.dispatch_to_subscriptions().await;
-        let first = rx1.recv().await.expect("active failover consumer receives message");
+        let first = rx1
+            .recv()
+            .await
+            .expect("active failover consumer receives message");
         assert_eq!(first.0, 1);
         assert!(rx2.try_recv().is_err());
 
@@ -843,7 +1001,10 @@ mod tests {
             sub_guard.consumer_flow(2, 1).await;
         }
 
-        topic.publish_message(None, b"second").await.unwrap();
+        topic
+            .publish_message(None, Bytes::from_static(b"second"))
+            .await
+            .unwrap();
         topic.dispatch_to_subscriptions().await;
         let second = rx2.recv().await.expect("standby consumer is promoted");
         assert_eq!(second.0, 2);
@@ -881,9 +1042,15 @@ mod tests {
             sub_guard.consumer_flow(2, 1).await;
         }
 
-        topic.publish_message(None, b"first").await.unwrap();
+        topic
+            .publish_message(None, Bytes::from_static(b"first"))
+            .await
+            .unwrap();
         topic.dispatch_to_subscriptions().await;
-        let first = rx2.recv().await.expect("partition-selected failover consumer receives");
+        let first = rx2
+            .recv()
+            .await
+            .expect("partition-selected failover consumer receives");
         assert_eq!(first.0, 2);
         assert!(rx1.try_recv().is_err());
 
@@ -913,7 +1080,10 @@ mod tests {
             sub_guard.add_consumer(consumer).unwrap();
         }
 
-        topic.publish_message(None, b"drop-me").await.unwrap();
+        topic
+            .publish_message(None, Bytes::from_static(b"drop-me"))
+            .await
+            .unwrap();
         topic.dispatch_to_subscriptions().await;
 
         let stats = subscription.read().await.get_stats().await;
@@ -925,7 +1095,10 @@ mod tests {
         let storage = create_test_storage();
         let mut topic = Topic::new("test-topic".to_string(), storage);
         topic.set_runtime_mode(TopicRuntimeMode::NonPersistent);
-        topic.publish_message(None, b"hello").await.unwrap();
+        topic
+            .publish_message(None, Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
 
         let error = topic.get_last_message_id().await.unwrap_err();
         assert!(error.contains("unsupported"));
@@ -956,9 +1129,10 @@ mod tests {
         assert!(topic.add_producer(producer2).is_ok());
         assert_eq!(topic.get_producer_count(), 2);
 
-        // Try to add duplicate
+        // Add duplicate producer_id evicts old entry (cross-connection reconnect)
         let producer1_dup = create_test_producer(1, topic_ref.clone());
-        assert!(topic.add_producer(producer1_dup).is_err());
+        assert!(topic.add_producer(producer1_dup).is_ok());
+        assert_eq!(topic.get_producer_count(), 2); // evicted old, inserted new — count unchanged
 
         // Remove producer
         assert!(topic.remove_producer(1).is_some());
@@ -972,17 +1146,23 @@ mod tests {
         let mut topic = Topic::new("persistent://public/default/test".to_string(), storage);
 
         // Create subscription
-        let sub = topic.get_or_create_subscription("sub1", SubscriptionType::Shared).await;
+        let sub = topic
+            .get_or_create_subscription("sub1", SubscriptionType::Shared)
+            .await;
         assert!(sub.is_ok());
         assert_eq!(topic.get_subscription_count(), 1);
 
         // Get existing subscription
-        let sub2 = topic.get_or_create_subscription("sub1", SubscriptionType::Shared).await;
+        let sub2 = topic
+            .get_or_create_subscription("sub1", SubscriptionType::Shared)
+            .await;
         assert!(sub2.is_ok());
         assert_eq!(topic.get_subscription_count(), 1); // Should not create duplicate
 
         // Create another subscription
-        let sub3 = topic.get_or_create_subscription("sub2", SubscriptionType::Exclusive).await;
+        let sub3 = topic
+            .get_or_create_subscription("sub2", SubscriptionType::Exclusive)
+            .await;
         assert!(sub3.is_ok());
         assert_eq!(topic.get_subscription_count(), 2);
 
@@ -1002,7 +1182,10 @@ mod tests {
         topic.add_producer(producer).unwrap();
 
         // Add subscription with consumer
-        let sub = topic.get_or_create_subscription("sub1", SubscriptionType::Shared).await.unwrap();
+        let sub = topic
+            .get_or_create_subscription("sub1", SubscriptionType::Shared)
+            .await
+            .unwrap();
         let consumer = create_test_consumer(1, sub.clone());
         {
             let mut sub_guard = sub.write().await;
@@ -1033,5 +1216,26 @@ mod tests {
         // Remove producer
         topic.remove_producer(1);
         assert!(topic.is_idle().await);
+    }
+
+    #[tokio::test]
+    async fn test_topic_publish_rate_limiter_rejects_second_message_in_window() {
+        let storage = create_test_storage();
+        let mut topic = Topic::new("test-topic".to_string(), storage);
+        topic.set_publish_rate(TopicPublishRate {
+            messages_per_sec: 1,
+            bytes_per_sec: 0,
+        });
+
+        topic
+            .publish_message(None, Bytes::from_static(b"first"))
+            .await
+            .expect("first message should pass rate limiter");
+
+        let error = topic
+            .publish_message(None, Bytes::from_static(b"second"))
+            .await
+            .expect_err("second message should be rejected in the same window");
+        assert!(error.downcast_ref::<TopicPublishRateExceeded>().is_some());
     }
 }

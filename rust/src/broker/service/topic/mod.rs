@@ -14,4 +14,7 @@ pub use subscription::{
     KeySharedHashRange, KeySharedMode, KeySharedPolicy, Subscription, SubscriptionRuntimeMode,
     SubscriptionStats, SubscriptionType,
 };
-pub use topic::{SharedSubscription, Topic, TopicRuntimeMode, TopicStats};
+pub use topic::{
+    SharedSubscription, Topic, TopicPublishRate, TopicPublishRateExceeded, TopicRuntimeMode,
+    TopicStats,
+};

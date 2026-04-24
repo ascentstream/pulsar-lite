@@ -560,7 +560,7 @@ mod tests {
         priority_level: i32,
         subscription: Arc<RwLock<Subscription>>,
     ) -> Arc<Consumer> {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(8192);
         Arc::new(Consumer::new(
             consumer_id,
             format!("consumer-{}", consumer_id),

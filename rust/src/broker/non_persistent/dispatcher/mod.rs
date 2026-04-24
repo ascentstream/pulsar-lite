@@ -42,9 +42,9 @@ impl NonPersistentDispatcherEnum {
             SubscriptionType::Shared => {
                 Self::MultipleConsumers(NonPersistentDispatcherMultipleConsumers::new())
             }
-            SubscriptionType::KeyShared => Self::StickyKey(NonPersistentStickyKeyDispatcher::new(
-                key_shared_policy,
-            )),
+            SubscriptionType::KeyShared => {
+                Self::StickyKey(NonPersistentStickyKeyDispatcher::new(key_shared_policy))
+            }
         }
     }
 
@@ -125,10 +125,37 @@ impl NonPersistentDispatcherEnum {
         }
     }
 
+    pub fn received_messages(&self) -> u64 {
+        match self {
+            Self::Exclusive(d) => d.received_messages(),
+            Self::Failover(d) => d.received_messages(),
+            Self::MultipleConsumers(d) => d.received_messages(),
+            Self::StickyKey(d) => d.received_messages(),
+        }
+    }
+
+    pub fn dispatched_messages(&self) -> u64 {
+        match self {
+            Self::Exclusive(d) => d.dispatched_messages(),
+            Self::Failover(d) => d.dispatched_messages(),
+            Self::MultipleConsumers(d) => d.dispatched_messages(),
+            Self::StickyKey(d) => d.dispatched_messages(),
+        }
+    }
+
     pub fn has_same_key_shared_policy(&self, policy: Option<&KeySharedPolicy>) -> bool {
         match self {
             Self::StickyKey(d) => d.has_same_key_shared_policy(policy),
             _ => policy.is_none(),
+        }
+    }
+
+    pub fn record_drop(&self, count: u64) {
+        match self {
+            Self::Exclusive(d) => d.record_drop(count),
+            Self::Failover(d) => d.record_drop(count),
+            Self::MultipleConsumers(d) => d.record_drop(count),
+            Self::StickyKey(d) => d.record_drop(count),
         }
     }
 

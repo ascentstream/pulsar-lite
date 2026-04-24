@@ -50,9 +50,36 @@ pub struct Config {
     #[serde(default = "default_max_concurrent_non_persistent_messages_per_connection")]
     pub max_concurrent_non_persistent_messages_per_connection: usize,
 
+    /// Maximum pending publish requests per connection before TCP throttle activates.
+    /// When in-flight count reaches this limit, the broker stops reading from the
+    /// TCP connection, causing TCP backpressure to the producer client.
+    /// Reading resumes when pending drops to 50% of this limit (hysteresis).
+    /// Maps to Pulsar's maxPendingPublishRequestsPerConnection.
+    /// Default: 1000
+    #[serde(default = "default_max_pending_publish_requests_per_connection")]
+    pub max_pending_publish_requests_per_connection: usize,
+
     /// Maximum allowed message size in bytes.
     #[serde(default = "default_max_message_size_bytes")]
     pub max_message_size_bytes: usize,
+
+    /// Topic-level publish rate limit in messages per second (0 = unlimited).
+    #[serde(default)]
+    pub publish_rate_messages_per_sec: u64,
+
+    /// Topic-level publish rate limit in bytes per second (0 = unlimited).
+    #[serde(default)]
+    pub publish_rate_bytes_per_sec: u64,
+
+    /// Pulsar-style connection write-buffer high watermark in bytes.
+    /// Mirrors Netty's WRITE_BUFFER_HIGH_WATER_MARK semantics.
+    #[serde(default = "default_pulsar_channel_write_buffer_high_water_mark_bytes")]
+    pub pulsar_channel_write_buffer_high_water_mark_bytes: usize,
+
+    /// Pulsar-style connection write-buffer low watermark in bytes.
+    /// Mirrors Netty's WRITE_BUFFER_LOW_WATER_MARK hysteresis semantics.
+    #[serde(default = "default_pulsar_channel_write_buffer_low_water_mark_bytes")]
+    pub pulsar_channel_write_buffer_low_water_mark_bytes: usize,
 }
 
 fn default_addr() -> String {
@@ -83,8 +110,20 @@ fn default_max_concurrent_non_persistent_messages_per_connection() -> usize {
     1000
 }
 
+fn default_max_pending_publish_requests_per_connection() -> usize {
+    1000
+}
+
 fn default_max_message_size_bytes() -> usize {
     5 * 1024 * 1024
+}
+
+fn default_pulsar_channel_write_buffer_high_water_mark_bytes() -> usize {
+    64 * 1024
+}
+
+fn default_pulsar_channel_write_buffer_low_water_mark_bytes() -> usize {
+    32 * 1024
 }
 
 impl Default for Config {
@@ -96,12 +135,21 @@ impl Default for Config {
             log_level: default_log_level(),
             keep_alive_interval_secs: default_keep_alive_interval_secs(),
             handshake_timeout_secs: default_handshake_timeout_secs(),
-            connection_liveness_check_timeout_secs: default_connection_liveness_check_timeout_secs(),
+            connection_liveness_check_timeout_secs: default_connection_liveness_check_timeout_secs(
+            ),
             max_connections: 0,
             max_connections_per_ip: 0,
             max_concurrent_non_persistent_messages_per_connection:
                 default_max_concurrent_non_persistent_messages_per_connection(),
+            max_pending_publish_requests_per_connection:
+                default_max_pending_publish_requests_per_connection(),
             max_message_size_bytes: default_max_message_size_bytes(),
+            publish_rate_messages_per_sec: 0,
+            publish_rate_bytes_per_sec: 0,
+            pulsar_channel_write_buffer_high_water_mark_bytes:
+                default_pulsar_channel_write_buffer_high_water_mark_bytes(),
+            pulsar_channel_write_buffer_low_water_mark_bytes:
+                default_pulsar_channel_write_buffer_low_water_mark_bytes(),
         }
     }
 }
@@ -150,7 +198,12 @@ mod tests {
             config.max_concurrent_non_persistent_messages_per_connection,
             1000
         );
+        assert_eq!(config.max_pending_publish_requests_per_connection, 1000);
         assert_eq!(config.max_message_size_bytes, 5 * 1024 * 1024);
+        assert_eq!(config.publish_rate_messages_per_sec, 0);
+        assert_eq!(config.publish_rate_bytes_per_sec, 0);
+        assert_eq!(config.pulsar_channel_write_buffer_high_water_mark_bytes, 64 * 1024);
+        assert_eq!(config.pulsar_channel_write_buffer_low_water_mark_bytes, 32 * 1024);
     }
 
     #[test]
@@ -165,8 +218,13 @@ mod tests {
             connection_liveness_check_timeout_secs: 5,
             max_connections: 100,
             max_connections_per_ip: 8,
-            max_concurrent_non_persistent_messages_per_connection: 256,
+            max_concurrent_non_persistent_messages_per_connection: 10000,
+            max_pending_publish_requests_per_connection: 2000,
             max_message_size_bytes: 2048,
+            publish_rate_messages_per_sec: 123,
+            publish_rate_bytes_per_sec: 456,
+            pulsar_channel_write_buffer_high_water_mark_bytes: 96 * 1024,
+            pulsar_channel_write_buffer_low_water_mark_bytes: 48 * 1024,
         };
 
         let toml_str = toml::to_string(&config).unwrap();
@@ -177,7 +235,10 @@ mod tests {
         assert_eq!(parsed.db_path, config.db_path);
         assert_eq!(parsed.default_partitions, config.default_partitions);
         assert_eq!(parsed.log_level, config.log_level);
-        assert_eq!(parsed.keep_alive_interval_secs, config.keep_alive_interval_secs);
+        assert_eq!(
+            parsed.keep_alive_interval_secs,
+            config.keep_alive_interval_secs
+        );
         assert_eq!(parsed.handshake_timeout_secs, config.handshake_timeout_secs);
         assert_eq!(
             parsed.connection_liveness_check_timeout_secs,
@@ -189,6 +250,26 @@ mod tests {
             parsed.max_concurrent_non_persistent_messages_per_connection,
             config.max_concurrent_non_persistent_messages_per_connection
         );
+        assert_eq!(
+            parsed.max_pending_publish_requests_per_connection,
+            config.max_pending_publish_requests_per_connection
+        );
         assert_eq!(parsed.max_message_size_bytes, config.max_message_size_bytes);
+        assert_eq!(
+            parsed.publish_rate_messages_per_sec,
+            config.publish_rate_messages_per_sec
+        );
+        assert_eq!(
+            parsed.publish_rate_bytes_per_sec,
+            config.publish_rate_bytes_per_sec
+        );
+        assert_eq!(
+            parsed.pulsar_channel_write_buffer_high_water_mark_bytes,
+            config.pulsar_channel_write_buffer_high_water_mark_bytes
+        );
+        assert_eq!(
+            parsed.pulsar_channel_write_buffer_low_water_mark_bytes,
+            config.pulsar_channel_write_buffer_low_water_mark_bytes
+        );
     }
 }

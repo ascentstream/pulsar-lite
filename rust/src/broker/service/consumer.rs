@@ -9,13 +9,14 @@ use std::sync::{
     Arc,
 };
 
+use super::ConnectionWriteState;
 use super::topic::SubscriptionType;
 use super::{PendingAck, PendingAcksMap};
 use tokio::sync::{mpsc, RwLock};
 
+use super::topic::KeySharedPolicy;
 /// Forward declaration for Subscription type
 use super::topic::Subscription;
-use super::topic::KeySharedPolicy;
 use crate::storage::MessageId;
 
 /// Consumer statistics
@@ -44,6 +45,59 @@ pub struct PendingMessage {
     pub metadata: Bytes,
     /// Message payload
     pub payload: Bytes,
+    /// Estimated encoded bytes currently pending on the connection.
+    pub wire_size: usize,
+}
+
+/// RAII dispatch reservation holding all resources for one message dispatch.
+///
+/// Created by `Consumer::try_reserve_dispatch()` after atomically acquiring:
+/// - flow-control permit
+/// - outbound bytes reservation
+/// - channel slot
+/// - pending ack entry (Shared/KeyShared only)
+///
+/// Call `send()` to commit the dispatch. If dropped without sending, all
+/// resources are automatically rolled back (dispatch-or-drop semantics).
+pub struct DispatchReservation {
+    available_permits: Arc<AtomicU32>,
+    pending_acks: Arc<PendingAcksMap>,
+    owned_permit: Option<mpsc::OwnedPermit<(u64, PendingMessage)>>,
+    consumer_id: u64,
+    message: Option<PendingMessage>,
+    pending_ack_message_id: Option<MessageId>,
+    committed: bool,
+}
+
+impl DispatchReservation {
+    /// Commit the dispatch: send the message through the channel.
+    /// Consumes self. After this call, resources belong to the connection write path.
+    pub fn send(mut self) {
+        self.committed = true;
+        let permit = self.owned_permit.take().expect("owned_permit always present");
+        let message = self.message.take().expect("message always present");
+        permit.send((self.consumer_id, message));
+    }
+
+}
+
+impl Drop for DispatchReservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        // Sync rollback: permit + channel slot
+        self.available_permits.fetch_add(1, Ordering::Relaxed);
+        // owned_permit (Some) drops here, releasing the channel slot
+
+        // Pending ack: fire-and-forget async cleanup (rare safety-net path)
+        if let Some(msg_id) = self.pending_ack_message_id.take() {
+            let pending_acks = self.pending_acks.clone();
+            tokio::spawn(async move {
+                pending_acks.remove(&msg_id).await;
+            });
+        }
+    }
 }
 
 /// Consumer - represents a consumer connection
@@ -63,12 +117,14 @@ pub struct Consumer {
 
     /// Statistics
     stats: Arc<RwLock<ConsumerStats>>,
-    available_permits: AtomicU32,
+    available_permits: Arc<AtomicU32>,
 
     /// Message sender channel - sends messages to ServerCnx for delivery
     /// Format: (consumer_id, PendingMessage)
     /// This avoids circular dependency between Consumer and ServerCnx
-    message_tx: mpsc::UnboundedSender<(u64, PendingMessage)>,
+    message_tx: mpsc::Sender<(u64, PendingMessage)>,
+    /// Connection-level outbound write state sourced from ServerCnx.
+    connection_write_state: Arc<ConnectionWriteState>,
 
     ///  Pending message tracking
     pending_acks: Arc<PendingAcksMap>,
@@ -103,7 +159,7 @@ impl Consumer {
         consumer_name: String,
         subscription: Arc<RwLock<Subscription>>,
         connection_id: String,
-        message_tx: mpsc::UnboundedSender<(u64, PendingMessage)>,
+        message_tx: mpsc::Sender<(u64, PendingMessage)>,
         priority_level: i32,
     ) -> Self {
         Self::new_with_options(
@@ -112,6 +168,7 @@ impl Consumer {
             subscription,
             connection_id,
             message_tx,
+            Arc::new(ConnectionWriteState::new(64 * 1024, 32 * 1024)),
             priority_level,
             None,
         )
@@ -122,7 +179,8 @@ impl Consumer {
         consumer_name: String,
         subscription: Arc<RwLock<Subscription>>,
         connection_id: String,
-        message_tx: mpsc::UnboundedSender<(u64, PendingMessage)>,
+        message_tx: mpsc::Sender<(u64, PendingMessage)>,
+        connection_write_state: Arc<ConnectionWriteState>,
         priority_level: i32,
         key_shared_policy: Option<KeySharedPolicy>,
     ) -> Self {
@@ -132,8 +190,9 @@ impl Consumer {
             subscription,
             connection_id,
             stats: Arc::new(RwLock::new(ConsumerStats::default())),
-            available_permits: AtomicU32::new(0),
+            available_permits: Arc::new(AtomicU32::new(0)),
             message_tx,
+            connection_write_state,
             pending_acks: Arc::new(PendingAcksMap::new()),
             priority_level,
             key_shared_policy,
@@ -150,7 +209,7 @@ impl Consumer {
     /// Use one permit when dispatching a message
     pub async fn use_permit(&self) -> bool {
         let mut current = self.available_permits.load(Ordering::Relaxed);
-        while current > 0 {   
+        while current > 0 {
             match self.available_permits.compare_exchange(
                 current,
                 current - 1,
@@ -242,6 +301,23 @@ impl Consumer {
     // Message Sending (Channel-based)
     // ========================================
 
+    /// Atomically acquire a channel slot without blocking.
+    /// Success = channel has capacity, subsequent permit.send() is guaranteed.
+    /// Failure = channel full (consumer backpressure) or closed (consumer disconnected).
+    pub fn try_acquire_send_permit(
+        &self,
+    ) -> Option<tokio::sync::mpsc::Permit<'_, (u64, PendingMessage)>> {
+        self.message_tx.try_reserve().ok()
+    }
+
+    pub fn is_writable(&self) -> bool {
+        self.connection_write_state.is_writable()
+    }
+
+    pub fn has_send_capacity(&self) -> bool {
+        self.is_writable() && self.try_acquire_send_permit().is_some()
+    }
+
     /// Send a message to this consumer via channel
     ///
     /// Called by Dispatcher to send messages for delivery.
@@ -258,10 +334,21 @@ impl Consumer {
         M: Into<Bytes>,
         P: Into<Bytes>,
     {
+        let metadata = metadata.into();
+        let payload = payload.into();
+        let wire_size = crate::protocol::codec::estimate_message_parts_size(
+            self.consumer_id,
+            message_id.ledger,
+            message_id.entry,
+            message_id.partition,
+            &metadata,
+            &payload,
+        );
         let msg = PendingMessage {
             message_id: message_id.clone(),
-            metadata: metadata.into(),
-            payload: payload.into(),
+            metadata,
+            payload,
+            wire_size,
         };
 
         // Native Pulsar writes pending acks before the message is written so that
@@ -269,10 +356,9 @@ impl Consumer {
         if matches!(
             self.get_sub_type(),
             SubscriptionType::Shared | SubscriptionType::KeyShared
-        )
-            && !self
-                .track_message_dispatched(&message_id, redelivery_count)
-                .await
+        ) && !self
+            .track_message_dispatched(&message_id, redelivery_count)
+            .await
         {
             log::debug!(
                 "Skipping send of message {}:{} to closing consumer {}",
@@ -283,14 +369,10 @@ impl Consumer {
             return false;
         }
 
-        if let Err(e) = self.message_tx.send((self.consumer_id, msg)) {
-            log::error!(
-                "Failed to send message {}:{} to consumer {}: {}",
-                message_id.ledger,
-                message_id.entry,
-                self.consumer_id,
-                e
-            );
+        // Atomically reserve a channel slot (non-async, non-blocking).
+        // Failure = channel full (consumer backpressure) → return false,
+        // dispatcher batch interrupts and handles partial success.
+        let Some(permit) = self.try_acquire_send_permit() else {
             if matches!(
                 self.get_sub_type(),
                 SubscriptionType::Shared | SubscriptionType::KeyShared
@@ -298,7 +380,10 @@ impl Consumer {
                 self.remove_pending_ack(&message_id).await;
             }
             return false;
-        }
+        };
+
+        // Send the message (non-async, guaranteed success once permit is held).
+        permit.send((self.consumer_id, msg));
 
         log::debug!(
             "Sent message {}:{} to consumer {} via channel",
@@ -307,6 +392,87 @@ impl Consumer {
             self.consumer_id
         );
         true
+    }
+
+    /// Atomically reserve all resources needed to dispatch one message.
+    ///
+    /// Checks and acquires (in order): flow-control permit
+    /// → connection writability → channel slot → pending ack entry (Shared/KeyShared only).
+    ///
+    /// Returns `Some(DispatchReservation)` on success, `None` if any check
+    /// fails (dispatch-or-drop: the dispatcher should immediately drop the
+    /// message and record the loss).
+    pub async fn try_reserve_dispatch(
+        &self,
+        message_id: &MessageId,
+        metadata: Bytes,
+        payload: Bytes,
+        redelivery_count: u32,
+    ) -> Option<DispatchReservation> {
+        // Step 1: Acquire flow-control permit
+        if !self.use_permit().await {
+            return None;
+        }
+
+        // Step 2: Calculate wire size
+        let wire_size = crate::protocol::codec::estimate_message_parts_size(
+            self.consumer_id,
+            message_id.ledger,
+            message_id.entry,
+            message_id.partition,
+            &metadata,
+            &payload,
+        );
+
+        // Step 3: Connection must currently be writable.
+        if !self.is_writable() {
+            self.available_permits.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        // Step 4: Acquire owned channel slot
+        let owned_permit = match self.message_tx.clone().try_reserve_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                self.available_permits.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
+
+        // Step 5: Track pending ack (Shared/KeyShared only)
+        let mut pending_ack_message_id = None;
+        if matches!(
+            self.get_sub_type(),
+            SubscriptionType::Shared | SubscriptionType::KeyShared
+        ) {
+            if !self
+                .track_message_dispatched(message_id, redelivery_count)
+                .await
+            {
+                self.available_permits.fetch_add(1, Ordering::Relaxed);
+                // owned_permit drops here, releasing channel slot
+                return None;
+            }
+            pending_ack_message_id = Some(message_id.clone());
+        }
+
+        // Step 6: Build reservation
+        let message = PendingMessage {
+            message_id: message_id.clone(),
+            metadata,
+            payload,
+            wire_size,
+        };
+
+        Some(DispatchReservation {
+            available_permits: self.available_permits.clone(),
+            pending_acks: self.pending_acks.clone(),
+            owned_permit: Some(owned_permit),
+            consumer_id: self.consumer_id,
+            message: Some(message),
+            pending_ack_message_id,
+            committed: false,
+        })
     }
 
     pub async fn send_messages_batch(
@@ -500,7 +666,7 @@ impl std::hash::Hash for Consumer {
 #[cfg(test)]
 mod tests {
     use super::super::topic::Subscription;
-    use super::super::SharedStorage;
+    use super::super::{ConnectionWriteState, SharedStorage};
     use super::*;
     use crate::storage::Storage;
     use std::path::Path;
@@ -527,7 +693,7 @@ mod tests {
         subscription: Arc<RwLock<Subscription>>,
         conn_id: &str,
     ) -> Consumer {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(8192);
         Consumer::new(
             id,
             name.to_string(),
@@ -609,7 +775,7 @@ mod tests {
     #[tokio::test]
     async fn test_consumer_send_message() {
         let subscription = create_test_subscription();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(8192);
         let consumer = Consumer::new(
             42,
             "test-consumer".to_string(),
@@ -674,5 +840,61 @@ mod tests {
         assert_eq!(drained[0].0, msg2);
         assert_eq!(drained[0].1.redelivery_count, 2);
         assert_eq!(consumer.pending_ack_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_consumer_writable_follows_pending_outbound_bytes_watermarks() {
+        let subscription = create_test_subscription();
+        let (tx, mut rx) = mpsc::channel(8);
+        let write_state = Arc::new(ConnectionWriteState::new(64, 32));
+        let consumer = Consumer::new_with_options(
+            88,
+            "watermark-consumer".to_string(),
+            subscription,
+            "conn-watermark".to_string(),
+            tx,
+            write_state.clone(),
+            0,
+            None,
+        );
+
+        consumer.add_permits(2).await;
+
+        assert!(
+            consumer
+                .send_message(
+                    MessageId {
+                        ledger: 1,
+                        entry: 1,
+                        partition: -1,
+                    },
+                    Bytes::new(),
+                    Bytes::from(vec![7u8; 80]),
+                    0,
+                )
+                .await
+        );
+
+        let expected_wire_size = crate::protocol::codec::estimate_message_parts_size(
+            consumer.consumer_id,
+            1,
+            1,
+            -1,
+            &Bytes::new(),
+            &Bytes::from(vec![7u8; 80]),
+        );
+        write_state.observe_buffered_bytes(expected_wire_size);
+        assert!(
+            !consumer.is_writable(),
+            "pending outbound bytes above the high watermark should flip writable false"
+        );
+
+        let (_cid, _pending) = rx.recv().await.expect("queued message");
+        write_state.observe_buffered_bytes(0);
+
+        assert!(
+            consumer.is_writable(),
+            "releasing bytes below the low watermark should restore writable"
+        );
     }
 }

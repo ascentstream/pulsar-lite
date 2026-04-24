@@ -1,8 +1,9 @@
 /*
- * Non-persistent runtime placeholders
+ * Non-persistent subscription runtime
  *
- * These placeholders allow the broker runtime to grow a dedicated
- * non-persistent path without changing the protocol/topic naming layer first.
+ * Topic-level non-persistent staging has been removed so that publish follows
+ * Pulsar-style immediate fanout/drop semantics. The remaining runtime state is
+ * subscription-scoped and owns the dispatcher family only.
  */
 
 use crate::broker::non_persistent::NonPersistentDispatcherEnum;
@@ -10,31 +11,7 @@ use crate::broker::service::topic::{KeySharedPolicy, SubscriptionType};
 use crate::broker::service::Consumer;
 use crate::storage::NonPersistentEntry;
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::sync::Arc;
-
-#[derive(Debug, Default)]
-pub struct NonPersistentTopicRuntime {
-    published_messages: VecDeque<NonPersistentEntry>,
-}
-
-impl NonPersistentTopicRuntime {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn publish_entry(&mut self, entry: NonPersistentEntry) {
-        self.published_messages.push_back(entry);
-    }
-
-    pub fn pending_message_count(&self) -> usize {
-        self.published_messages.len()
-    }
-
-    pub fn drain_published_messages(&mut self) -> Vec<NonPersistentEntry> {
-        self.published_messages.drain(..).collect()
-    }
-}
 
 #[derive(Debug)]
 pub struct NonPersistentSubscriptionRuntime {
@@ -173,9 +150,29 @@ impl NonPersistentSubscriptionRuntime {
             .unwrap_or(0)
     }
 
+    pub fn received_messages(&self) -> u64 {
+        self.dispatcher
+            .as_ref()
+            .map(|dispatcher| dispatcher.received_messages())
+            .unwrap_or(0)
+    }
+
+    pub fn dispatched_messages(&self) -> u64 {
+        self.dispatcher
+            .as_ref()
+            .map(|dispatcher| dispatcher.dispatched_messages())
+            .unwrap_or(0)
+    }
+
     pub fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {
         if let Some(dispatcher) = &self.dispatcher {
             dispatcher.consumer_flow(consumer_id, additional_permits);
+        }
+    }
+
+    pub fn record_drop(&self, count: u64) {
+        if let Some(dispatcher) = &self.dispatcher {
+            dispatcher.record_drop(count);
         }
     }
 

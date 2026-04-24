@@ -9,7 +9,9 @@ use std::sync::{
 #[derive(Debug, Default)]
 pub struct NonPersistentDispatcherExclusive {
     consumer: Option<Arc<Consumer>>,
+    received_messages: AtomicU64,
     dropped_messages: AtomicU64,
+    dispatched_messages: AtomicU64,
 }
 
 impl NonPersistentDispatcherExclusive {
@@ -60,14 +62,28 @@ impl NonPersistentDispatcherExclusive {
         self.dropped_messages.load(Ordering::Relaxed)
     }
 
-    fn record_drop(&self, count: u64) {
+    pub fn received_messages(&self) -> u64 {
+        self.received_messages.load(Ordering::Relaxed)
+    }
+
+    pub fn dispatched_messages(&self) -> u64 {
+        self.dispatched_messages.load(Ordering::Relaxed)
+    }
+
+    pub fn record_drop(&self, count: u64) {
         self.dropped_messages.fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn record_dispatched(&self, count: u64) {
+        self.dispatched_messages.fetch_add(count, Ordering::Relaxed);
     }
 
     pub async fn send_messages(
         &self,
         entries: Vec<NonPersistentEntry>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.received_messages
+            .fetch_add(entries.len() as u64, Ordering::Relaxed);
         let Some(consumer) = &self.consumer else {
             for entry in entries {
                 self.record_drop(1);
@@ -76,48 +92,25 @@ impl NonPersistentDispatcherExclusive {
             return Ok(());
         };
 
-        let dispatchable = consumer.get_available_permits().await as usize;
-        if dispatchable == 0 {
-            self.record_drop(entries.len() as u64);
-            for entry in entries {
-                entry.release();
+        for entry in entries {
+            let message_id = MessageId {
+                ledger: entry.ledger_id(),
+                entry: entry.entry_id(),
+                partition: entry.partition(),
+            };
+            let metadata = entry.metadata_bytes();
+            let payload = entry.payload_bytes();
+
+            if let Some(reservation) = consumer
+                .try_reserve_dispatch(&message_id, metadata, payload, 0)
+                .await
+            {
+                reservation.send();
+                self.record_dispatched(1);
+                consumer.record_message_dispatched(entry.len()).await;
+            } else {
+                self.record_drop(1);
             }
-            return Ok(());
-        }
-
-        let mut batch_entries = entries;
-        let overflow = batch_entries.split_off(dispatchable.min(batch_entries.len()));
-
-        let mut batch_messages = Vec::with_capacity(batch_entries.len());
-        for entry in &batch_entries {
-            let permit_acquired = consumer.use_permit().await;
-            debug_assert!(permit_acquired, "exclusive dispatch window exceeded permits");
-            batch_messages.push((
-                MessageId {
-                    ledger: entry.ledger_id(),
-                    entry: entry.entry_id(),
-                    partition: entry.partition(),
-                },
-                entry.metadata_bytes(),
-                entry.payload_bytes(),
-                0,
-            ));
-        }
-
-        let attempted = batch_messages.len();
-        let sent = consumer.send_messages_batch(batch_messages).await;
-        for entry in batch_entries.iter().take(sent) {
-            consumer.record_message_dispatched(entry.len()).await;
-        }
-        if sent < attempted {
-            consumer.add_permits((attempted - sent) as u32).await;
-        }
-        if sent < attempted {
-            self.record_drop((attempted - sent) as u64);
-        }
-        self.record_drop(overflow.len() as u64);
-
-        for entry in batch_entries.into_iter().chain(overflow.into_iter()) {
             entry.release();
         }
         Ok(())
@@ -130,7 +123,9 @@ pub struct NonPersistentDispatcherFailover {
     partition_index: i32,
     consumers: Vec<Arc<Consumer>>,
     active_consumer_id: Option<u64>,
+    received_messages: AtomicU64,
     dropped_messages: AtomicU64,
+    dispatched_messages: AtomicU64,
 }
 
 impl NonPersistentDispatcherFailover {
@@ -140,7 +135,9 @@ impl NonPersistentDispatcherFailover {
             partition_index,
             consumers: Vec::new(),
             active_consumer_id: None,
+            received_messages: AtomicU64::new(0),
             dropped_messages: AtomicU64::new(0),
+            dispatched_messages: AtomicU64::new(0),
         }
     }
 
@@ -337,14 +334,28 @@ impl NonPersistentDispatcherFailover {
         self.dropped_messages.load(Ordering::Relaxed)
     }
 
-    fn record_drop(&self, count: u64) {
+    pub fn received_messages(&self) -> u64 {
+        self.received_messages.load(Ordering::Relaxed)
+    }
+
+    pub fn dispatched_messages(&self) -> u64 {
+        self.dispatched_messages.load(Ordering::Relaxed)
+    }
+
+    pub fn record_drop(&self, count: u64) {
         self.dropped_messages.fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn record_dispatched(&self, count: u64) {
+        self.dispatched_messages.fetch_add(count, Ordering::Relaxed);
     }
 
     pub async fn send_messages(
         &self,
         entries: Vec<NonPersistentEntry>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.received_messages
+            .fetch_add(entries.len() as u64, Ordering::Relaxed);
         let Some(active_consumer) = self.get_active_consumer() else {
             for entry in entries {
                 self.record_drop(1);
@@ -353,48 +364,25 @@ impl NonPersistentDispatcherFailover {
             return Ok(());
         };
 
-        let dispatchable = active_consumer.get_available_permits().await as usize;
-        if dispatchable == 0 {
-            self.record_drop(entries.len() as u64);
-            for entry in entries {
-                entry.release();
+        for entry in entries {
+            let message_id = MessageId {
+                ledger: entry.ledger_id(),
+                entry: entry.entry_id(),
+                partition: entry.partition(),
+            };
+            let metadata = entry.metadata_bytes();
+            let payload = entry.payload_bytes();
+
+            if let Some(reservation) = active_consumer
+                .try_reserve_dispatch(&message_id, metadata, payload, 0)
+                .await
+            {
+                reservation.send();
+                self.record_dispatched(1);
+                active_consumer.record_message_dispatched(entry.len()).await;
+            } else {
+                self.record_drop(1);
             }
-            return Ok(());
-        }
-
-        let mut batch_entries = entries;
-        let overflow = batch_entries.split_off(dispatchable.min(batch_entries.len()));
-
-        let mut batch_messages = Vec::with_capacity(batch_entries.len());
-        for entry in &batch_entries {
-            let permit_acquired = active_consumer.use_permit().await;
-            debug_assert!(permit_acquired, "failover dispatch window exceeded permits");
-            batch_messages.push((
-                MessageId {
-                    ledger: entry.ledger_id(),
-                    entry: entry.entry_id(),
-                    partition: entry.partition(),
-                },
-                entry.metadata_bytes(),
-                entry.payload_bytes(),
-                0,
-            ));
-        }
-
-        let attempted = batch_messages.len();
-        let sent = active_consumer.send_messages_batch(batch_messages).await;
-        for entry in batch_entries.iter().take(sent) {
-            active_consumer.record_message_dispatched(entry.len()).await;
-        }
-        if sent < attempted {
-            active_consumer.add_permits((attempted - sent) as u32).await;
-        }
-        if sent < attempted {
-            self.record_drop((attempted - sent) as u64);
-        }
-        self.record_drop(overflow.len() as u64);
-
-        for entry in batch_entries.into_iter().chain(overflow.into_iter()) {
             entry.release();
         }
         Ok(())

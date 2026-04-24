@@ -3,7 +3,7 @@
  * Manages consumers for a specific subscription on a topic
  * Inspired by Apache Pulsar's PersistentSubscription
  */
- 
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -473,6 +473,22 @@ impl Subscription {
             sub_type: self.sub_type,
             consumer_count,
             total_permits,
+            received_messages: match self.runtime_mode {
+                SubscriptionRuntimeMode::PersistentStyle => 0,
+                SubscriptionRuntimeMode::NonPersistent => self
+                    .non_persistent_runtime
+                    .as_ref()
+                    .map(|runtime| runtime.received_messages())
+                    .unwrap_or(0),
+            },
+            dispatched_messages: match self.runtime_mode {
+                SubscriptionRuntimeMode::PersistentStyle => 0,
+                SubscriptionRuntimeMode::NonPersistent => self
+                    .non_persistent_runtime
+                    .as_ref()
+                    .map(|runtime| runtime.dispatched_messages())
+                    .unwrap_or(0),
+            },
             dropped_messages: match self.runtime_mode {
                 SubscriptionRuntimeMode::PersistentStyle => 0,
                 SubscriptionRuntimeMode::NonPersistent => self
@@ -529,17 +545,36 @@ impl Subscription {
             }
             SubscriptionRuntimeMode::NonPersistent => {
                 if let Some(ref runtime) = self.non_persistent_runtime {
-                    runtime.send_messages(entries).await
+                    let result = runtime.send_messages(entries).await;
+                    let recv = runtime.received_messages();
+                    let dispatched = runtime.dispatched_messages();
+                    let dropped = runtime.dropped_messages();
+                    if recv > 0 && recv % 100_000 < 50 {
+                        log::info!(
+                            "[dispatch-metrics] sub='{}' received={} dispatched={} dropped={} drop_rate={:.1}%",
+                            self.name, recv, dispatched, dropped,
+                            if recv > 0 { dropped as f64 / recv as f64 * 100.0 } else { 0.0 }
+                        );
+                    }
+                    result
                 } else {
                     for entry in entries {
                         entry.release();
                     }
-                    log::warn!(
+                    log::debug!(
                         "No non-persistent runtime found for subscription '{}'",
                         self.name
                     );
                     Ok(())
                 }
+            }
+        }
+    }
+
+    pub fn record_non_persistent_drop(&self, count: u64) {
+        if self.runtime_mode == SubscriptionRuntimeMode::NonPersistent {
+            if let Some(runtime) = self.non_persistent_runtime.as_ref() {
+                runtime.record_drop(count);
             }
         }
     }
@@ -623,9 +658,9 @@ impl Subscription {
 
     pub async fn backlog_size(&self) -> Result<usize, String> {
         match self.runtime_mode {
-            SubscriptionRuntimeMode::PersistentStyle => {
-                Err("backlog inspection is not implemented for persistent-style runtime".to_string())
-            }
+            SubscriptionRuntimeMode::PersistentStyle => Err(
+                "backlog inspection is not implemented for persistent-style runtime".to_string(),
+            ),
             SubscriptionRuntimeMode::NonPersistent => Ok(0),
         }
     }
@@ -639,12 +674,16 @@ pub struct SubscriptionStats {
     pub sub_type: SubscriptionType,
     pub consumer_count: usize,
     pub total_permits: u32,
+    pub received_messages: u64,
+    pub dispatched_messages: u64,
     pub dropped_messages: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::broker::service::PendingMessage;
+    use crate::storage::MessageId;
     use crate::storage::Storage;
     use std::path::Path;
     use tokio::sync::{mpsc, Mutex, RwLock};
@@ -665,7 +704,7 @@ mod tests {
     }
 
     fn create_test_consumer(id: u64, subscription: Arc<RwLock<Subscription>>) -> Arc<Consumer> {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(8192);
         Arc::new(Consumer::new(
             id,
             format!("consumer-{}", id),
@@ -674,6 +713,25 @@ mod tests {
             tx,
             0,
         ))
+    }
+
+    fn create_test_consumer_with_capacity(
+        id: u64,
+        subscription: Arc<RwLock<Subscription>>,
+        capacity: usize,
+    ) -> (Arc<Consumer>, mpsc::Receiver<(u64, PendingMessage)>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (
+            Arc::new(Consumer::new(
+                id,
+                format!("consumer-{}", id),
+                subscription,
+                format!("conn-{}", id),
+                tx,
+                0,
+            )),
+            rx,
+        )
     }
 
     #[tokio::test]
@@ -743,6 +801,52 @@ mod tests {
         assert!(sub.remove_consumer(1).is_some());
         assert!(sub.remove_consumer(999).is_none());
         assert_eq!(sub.get_consumer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_non_persistent_dispatch_does_not_pause_on_unacked_budget() {
+        let subscription = Arc::new(RwLock::new(Subscription::new_with_runtime_mode(
+            "sub".to_string(),
+            "topic".to_string(),
+            SubscriptionType::Shared,
+            SubscriptionRuntimeMode::NonPersistent,
+            create_test_storage(),
+        )));
+
+        let (consumer, mut rx) = create_test_consumer_with_capacity(1, subscription.clone(), 8192);
+        consumer.add_permits(1).await;
+
+        {
+            let mut sub = subscription.write().await;
+            sub.add_consumer(consumer.clone())
+                .expect("consumer should register");
+            sub.consumer_flow(consumer.consumer_id, 1).await;
+        }
+
+        // Fill pending acks well past the current inflight-budget default.
+        for i in 0..50000u64 {
+            consumer.track_message_dispatched(&MessageId {
+                ledger: 0,
+                entry: i,
+                partition: -1,
+            }, 0).await;
+        }
+
+        subscription
+            .read()
+            .await
+            .send_non_persistent_entries(vec![NonPersistentEntry::create(
+                1,
+                1,
+                -1,
+                bytes::Bytes::new(),
+                bytes::Bytes::from_static(b"hello"),
+            )])
+            .await
+            .expect("dispatch should still proceed");
+
+        let delivered = rx.recv().await.expect("message should be delivered");
+        assert_eq!(delivered.1.payload, b"hello".to_vec());
     }
 
     #[tokio::test]

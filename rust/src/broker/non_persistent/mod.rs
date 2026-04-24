@@ -1,13 +1,12 @@
 /*
- * Non-persistent runtime module
+ * Non-persistent dispatcher/runtime module
  *
- * This module is intentionally skeletal for now. It marks the start of the
- * runtime-only split after the protocol layer, while external topic/protocol
- * entry points still remain unchanged.
+ * The topic path now dispatches immediately on publish. The remaining runtime
+ * surface is subscription-scoped and centered on the dispatcher family.
  */
 
 pub mod dispatcher;
 pub mod runtime;
 
 pub use self::dispatcher::NonPersistentDispatcherEnum;
-pub use self::runtime::{NonPersistentSubscriptionRuntime, NonPersistentTopicRuntime};
+pub use self::runtime::NonPersistentSubscriptionRuntime;

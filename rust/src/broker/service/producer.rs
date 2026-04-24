@@ -3,6 +3,7 @@
  * Inspired by Apache Pulsar's Producer design
  */
 
+use bytes::Bytes;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -77,13 +78,13 @@ impl Producer {
     /// 3. Delegates to Topic.publish_message()
     pub async fn publish_message(
         &self,
-        metadata: Option<&[u8]>,
-        payload: &[u8],
-    ) -> Result<crate::storage::MessageId, Box<dyn std::error::Error>> {
+        metadata: Option<Bytes>,
+        payload: Bytes,
+    ) -> Result<crate::storage::MessageId, Box<dyn std::error::Error + Send + Sync>> {
         log::debug!(
             "Producer {} publishing message (metadata={} bytes, payload={} bytes)",
             self.producer_id,
-            metadata.map(|value| value.len()).unwrap_or(0),
+            metadata.as_ref().map(|value| value.len()).unwrap_or(0),
             payload.len()
         );
 
@@ -101,7 +102,7 @@ impl Producer {
         let mut topic = self.topic.write().await;
         let message_id = topic.publish_message(metadata, payload).await?;
 
-        log::info!(
+        log::debug!(
             "Producer {} published message {}:{} to topic '{}'",
             self.producer_id,
             message_id.ledger,

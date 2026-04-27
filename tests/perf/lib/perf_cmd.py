@@ -52,20 +52,84 @@ def wait_for_log(path: Path, needle: str, timeout: float = 30.0) -> None:
     raise RuntimeError(f'timed out waiting for {needle!r} in {path}')
 
 
-def run_consumer_then_feed(consumer_cmd: list[str], producer_cmd: list[str], consumer_log: Path, producer_log: Path, consumer_timeout: float = 300.0, producer_timeout: float = 300.0) -> tuple[str, str, int, int]:
-    with consumer_log.open('w', encoding='utf-8') as consumer_fh:
-        consumer_proc = subprocess.Popen(consumer_cmd, stdout=consumer_fh, stderr=subprocess.STDOUT, text=True, env=ENV_BASE)
-    wait_for_log(consumer_log, 'Start receiving from')
-    producer_proc = run_sync(producer_cmd, producer_log, timeout=producer_timeout)
+def run_consumer_then_feed(
+    consumer_cmd: list[str],
+    producer_cmd: list[str],
+    consumer_log: Path,
+    producer_log: Path,
+    consumer_timeout: float = 300.0,
+    producer_timeout: float = 300.0,
+) -> tuple[str, str, int, int]:
+    with consumer_log.open("w", encoding="utf-8") as consumer_fh:
+        consumer_proc = subprocess.Popen(
+            consumer_cmd,
+            stdout=consumer_fh,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=ENV_BASE,
+        )
 
     try:
-        consumer_rc = consumer_proc.wait(timeout=consumer_timeout)
-    except subprocess.TimeoutExpired:
-        consumer_proc.terminate()
-        try:
-            consumer_rc = consumer_proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            consumer_proc.kill()
-            consumer_rc = consumer_proc.wait(timeout=5)
+        wait_for_log(consumer_log, "Start receiving from")
+    except Exception:
+        _terminate_process(consumer_proc)
+        raise
 
-    return consumer_log.read_text(encoding='utf-8', errors='replace'), producer_proc.stdout, consumer_rc, producer_proc.returncode
+    with producer_log.open("w", encoding="utf-8") as producer_fh:
+        producer_proc = subprocess.Popen(
+            producer_cmd,
+            stdout=producer_fh,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=ENV_BASE,
+        )
+
+    consumer_rc, producer_rc = _wait_both_or_kill(
+        consumer_proc,
+        producer_proc,
+        timeout=max(consumer_timeout, producer_timeout),
+    )
+
+    return (
+        consumer_log.read_text(encoding="utf-8", errors="replace"),
+        producer_log.read_text(encoding="utf-8", errors="replace"),
+        consumer_rc,
+        producer_rc,
+    )
+
+
+def _terminate_process(proc: subprocess.Popen) -> int:
+    if proc.poll() is not None:
+        return proc.returncode
+    proc.terminate()
+    try:
+        return proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return proc.wait(timeout=5)
+
+
+def _wait_both_or_kill(
+    consumer_proc: subprocess.Popen,
+    producer_proc: subprocess.Popen,
+    timeout: float,
+) -> tuple[int, int]:
+    deadline = time.monotonic() + timeout
+
+    while True:
+        consumer_rc = consumer_proc.poll()
+        producer_rc = producer_proc.poll()
+
+        if consumer_rc is not None and producer_rc is not None:
+            return consumer_rc, producer_rc
+
+        if consumer_rc is not None and consumer_rc != 0:
+            return consumer_rc, _terminate_process(producer_proc)
+
+        if producer_rc is not None and producer_rc != 0:
+            return _terminate_process(consumer_proc), producer_rc
+
+        if time.monotonic() >= deadline:
+            return _terminate_process(consumer_proc), _terminate_process(producer_proc)
+
+        time.sleep(0.2)

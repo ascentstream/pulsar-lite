@@ -5,10 +5,10 @@
 
 use crate::broker::broker_service::{SharedBrokerService, TopicRef};
 use crate::broker::service::consumer::PendingMessage;
-use crate::broker::service::ConnectionWriteState;
 use crate::broker::service::topic::{
     KeySharedHashRange, KeySharedMode, KeySharedPolicy, SubscriptionType,
 };
+use crate::broker::service::ConnectionWriteState;
 use crate::broker::service::{Consumer, SharedStorage};
 use crate::protocol::codec::{proto::pulsar::BaseCommand, PulsarFrameCodec};
 use crate::protocol::ServerCommand;

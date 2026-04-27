@@ -123,7 +123,6 @@ where
 
     /// Advertised broker service url returned from Lookup.
     broker_service_url: String,
-
 }
 
 impl<T> ServerCnx<T>

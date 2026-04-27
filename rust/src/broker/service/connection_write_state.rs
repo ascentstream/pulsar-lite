@@ -61,7 +61,10 @@ impl ConnectionWriteState {
 
     /// Compatibility helper for tests that want to simulate a buffered-bytes snapshot.
     pub fn release_bytes(&self, bytes: usize) {
-        let next = self.pending_bytes.load(Ordering::Acquire).saturating_sub(bytes);
+        let next = self
+            .pending_bytes
+            .load(Ordering::Acquire)
+            .saturating_sub(bytes);
         if next <= self.low_watermark_bytes {
             self.writable.store(true, Ordering::Release);
         }

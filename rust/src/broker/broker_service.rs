@@ -4,11 +4,14 @@
  * Inspired by Apache Pulsar's BrokerService
  */
 
+use crate::broker::service::topic::{
+    PartitionedTopic, PartitionedTopicStats, SharedPartitionedTopic, Topic, TopicPublishRate,
+    TopicStats,
+};
+use crate::storage::Storage;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use crate::broker::service::topic::{Topic, TopicStats, PartitionedTopic, PartitionedTopicStats, SharedPartitionedTopic};
-use crate::storage::Storage;
 
 /// Shared Topic wrapped in Arc<RwLock>
 pub type SharedTopic = Arc<RwLock<Topic>>;
@@ -42,6 +45,7 @@ pub struct BrokerService {
     storage: Arc<Mutex<Storage>>,
     /// Default number of partitions for topics (0 = non-partitioned)
     default_partitions: usize,
+    publish_rate: TopicPublishRate,
 }
 
 impl BrokerService {
@@ -52,13 +56,17 @@ impl BrokerService {
 
     /// Create a new BrokerService with custom default partition count
     pub fn with_config(storage: Arc<Mutex<Storage>>, default_partitions: usize) -> Self {
-        log::info!("Creating BrokerService (default_partitions={})", default_partitions);
+        log::info!(
+            "Creating BrokerService (default_partitions={})",
+            default_partitions
+        );
         Self {
             topics: HashMap::new(),
             partitioned_topics: HashMap::new(),
             partition_metadata: HashMap::new(),
             storage,
             default_partitions,
+            publish_rate: TopicPublishRate::default(),
         }
     }
 
@@ -71,6 +79,24 @@ impl BrokerService {
     pub fn set_default_partitions(&mut self, partitions: usize) {
         self.default_partitions = partitions;
         log::info!("Set default partitions to {}", partitions);
+    }
+
+    pub fn set_publish_rate_limits(&mut self, publish_rate: TopicPublishRate) {
+        self.publish_rate = publish_rate;
+        for topic in self.topics.values() {
+            if let Ok(mut guard) = topic.try_write() {
+                guard.set_publish_rate(publish_rate);
+            }
+        }
+        for partitioned in self.partitioned_topics.values() {
+            if let Ok(partitioned_guard) = partitioned.try_read() {
+                for partition in partitioned_guard.get_all_partitions() {
+                    if let Ok(mut topic_guard) = partition.try_write() {
+                        topic_guard.set_publish_rate(publish_rate);
+                    }
+                }
+            }
+        }
     }
 
     /// Restore persisted partition metadata at broker startup.
@@ -92,18 +118,23 @@ impl BrokerService {
             log::info!("Creating new topic: {}", topic_name);
             {
                 let mut guard = self.storage.lock().await;
-                if let Err(error) = guard
-                    .resources_mut()
-                    .ensure_topic(topic_name, false, 0, Storage::METADATA_VERSION)
-                {
+                if let Err(error) = guard.resources_mut().ensure_topic(
+                    topic_name,
+                    false,
+                    0,
+                    Storage::METADATA_VERSION,
+                ) {
                     log::warn!(
                         "Skipping metadata persistence for topic '{}': {}",
-                        topic_name, error
+                        topic_name,
+                        error
                     );
                 }
             }
-            let topic = Topic::new(topic_name.to_string(), self.storage.clone());
-            self.topics.insert(topic_name.to_string(), Arc::new(RwLock::new(topic)));
+            let mut topic = Topic::new(topic_name.to_string(), self.storage.clone());
+            topic.set_publish_rate(self.publish_rate);
+            self.topics
+                .insert(topic_name.to_string(), Arc::new(RwLock::new(topic)));
         }
 
         self.topics.get(topic_name).unwrap().clone()
@@ -151,7 +182,8 @@ impl BrokerService {
         if !self.partitioned_topics.contains_key(topic_name) {
             log::info!(
                 "Creating new partitioned topic: {} with {} partitions",
-                topic_name, partition_count
+                topic_name,
+                partition_count
             );
             {
                 let mut guard = self.storage.lock().await;
@@ -163,7 +195,8 @@ impl BrokerService {
                 ) {
                     log::warn!(
                         "Skipping metadata persistence for partitioned topic '{}': {}",
-                        topic_name, error
+                        topic_name,
+                        error
                     );
                 }
             }
@@ -172,8 +205,16 @@ impl BrokerService {
                 partition_count,
                 self.storage.clone(),
             );
-            self.partitioned_topics.insert(topic_name.to_string(), Arc::new(RwLock::new(partitioned_topic)));
-            self.partition_metadata.insert(topic_name.to_string(), partition_count);
+            for partition in partitioned_topic.get_all_partitions() {
+                let mut guard = partition.write().await;
+                guard.set_publish_rate(self.publish_rate);
+            }
+            self.partitioned_topics.insert(
+                topic_name.to_string(),
+                Arc::new(RwLock::new(partitioned_topic)),
+            );
+            self.partition_metadata
+                .insert(topic_name.to_string(), partition_count);
         }
 
         self.partitioned_topics.get(topic_name).unwrap().clone()
@@ -266,11 +307,16 @@ impl BrokerService {
             if let Some(base_name) = self.get_base_topic_name(topic_name) {
                 if let Some(partition_idx) = self.get_partition_index(topic_name) {
                     // Ensure the partitioned topic exists
-                    let partition_count = self.partition_metadata.get(&base_name).copied()
+                    let partition_count = self
+                        .partition_metadata
+                        .get(&base_name)
+                        .copied()
                         .unwrap_or(self.default_partitions);
 
                     if partition_count > 0 {
-                        let partitioned_topic = self.get_or_create_partitioned_topic(&base_name, partition_count).await;
+                        let partitioned_topic = self
+                            .get_or_create_partitioned_topic(&base_name, partition_count)
+                            .await;
                         let guard = partitioned_topic.read().await;
                         if let Some(partition) = guard.get_partition(partition_idx) {
                             return TopicRef::Partition(partition);
@@ -282,10 +328,15 @@ impl BrokerService {
 
         // Determine if it should be partitioned
         if self.should_be_partitioned(topic_name) {
-            let partition_count = self.partition_metadata.get(topic_name).copied()
+            let partition_count = self
+                .partition_metadata
+                .get(topic_name)
+                .copied()
                 .unwrap_or(self.default_partitions);
 
-            let partitioned_topic = self.get_or_create_partitioned_topic(topic_name, partition_count).await;
+            let partitioned_topic = self
+                .get_or_create_partitioned_topic(topic_name, partition_count)
+                .await;
             TopicRef::Partitioned(partitioned_topic)
         } else {
             let topic = self.get_or_create_topic(topic_name).await;
@@ -404,8 +455,8 @@ impl BrokerService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::broker::service::{Consumer, Producer};
     use crate::broker::service::topic::SubscriptionType;
+    use crate::broker::service::{Consumer, Producer};
     use std::time::Instant;
     use tokio::sync::mpsc;
 
@@ -427,7 +478,7 @@ mod tests {
         id: u64,
         subscription: Arc<RwLock<crate::broker::service::topic::Subscription>>,
     ) -> Arc<Consumer> {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(8192);
         Arc::new(Consumer::new(
             id,
             format!("consumer-{id}"),
@@ -596,7 +647,7 @@ mod tests {
                 .unwrap();
 
             // Create Consumer with Arc<Subscription> reference
-            let (tx, _rx) = mpsc::unbounded_channel();
+            let (tx, _rx) = mpsc::channel(8192);
             let consumer = Arc::new(Consumer::new(
                 1,
                 "consumer-1".to_string(),
@@ -649,7 +700,9 @@ mod tests {
         assert!(manager.get_partitioned_topic("nonexistent").is_none());
 
         // Create partitioned topic
-        manager.get_or_create_partitioned_topic("test-topic", 5).await;
+        manager
+            .get_or_create_partitioned_topic("test-topic", 5)
+            .await;
 
         // Topic exists
         assert!(manager.get_partitioned_topic("test-topic").is_some());
@@ -661,7 +714,9 @@ mod tests {
         let mut manager = BrokerService::new(storage);
 
         // Create partitioned topic
-        manager.get_or_create_partitioned_topic("test-topic", 3).await;
+        manager
+            .get_or_create_partitioned_topic("test-topic", 3)
+            .await;
         assert_eq!(manager.get_partitioned_topic_count(), 1);
 
         // Remove partitioned topic
@@ -683,13 +738,15 @@ mod tests {
         // Test partition name detection
         assert!(manager.is_partition_name("my-topic-partition-0"));
         assert!(manager.is_partition_name("persistent://public/default/topic-partition-5"));
-        assert!(manager.is_partition_name(
-            "persistent://public/default/metadata-partition-sub-partition-2"
-        ));
+        assert!(manager
+            .is_partition_name("persistent://public/default/metadata-partition-sub-partition-2"));
         assert!(!manager.is_partition_name("my-topic"));
 
         // Test base topic name extraction
-        assert_eq!(manager.get_base_topic_name("my-topic-partition-0"), Some("my-topic".to_string()));
+        assert_eq!(
+            manager.get_base_topic_name("my-topic-partition-0"),
+            Some("my-topic".to_string())
+        );
         assert_eq!(
             manager.get_base_topic_name("persistent://public/default/topic-partition-5"),
             Some("persistent://public/default/topic".to_string())
@@ -704,7 +761,10 @@ mod tests {
 
         // Test partition index extraction
         assert_eq!(manager.get_partition_index("my-topic-partition-0"), Some(0));
-        assert_eq!(manager.get_partition_index("my-topic-partition-10"), Some(10));
+        assert_eq!(
+            manager.get_partition_index("my-topic-partition-10"),
+            Some(10)
+        );
         assert_eq!(
             manager.get_partition_index(
                 "persistent://public/default/metadata-partition-sub-partition-2"

@@ -5,6 +5,7 @@
 
 use crate::broker::broker_service::{SharedBrokerService, TopicRef};
 use crate::broker::service::consumer::PendingMessage;
+use crate::broker::service::ConnectionWriteState;
 use crate::broker::service::topic::{
     KeySharedHashRange, KeySharedMode, KeySharedPolicy, SubscriptionType,
 };
@@ -22,10 +23,10 @@ pub async fn handle_subscribe<T>(
     framed: &mut Framed<T, PulsarFrameCodec>,
     cmd: BaseCommand,
     consumers: &mut HashMap<u64, Arc<Consumer>>,
-    next_consumer_id: &mut u64,
     broker_service: SharedBrokerService,
     connection_id: String,
-    message_tx: mpsc::UnboundedSender<(u64, PendingMessage)>,
+    message_tx: mpsc::Sender<(u64, PendingMessage)>,
+    connection_write_state: Arc<ConnectionWriteState>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -47,8 +48,9 @@ where
         _ => SubscriptionType::Exclusive,
     };
 
-    let consumer_id = *next_consumer_id;
-    *next_consumer_id += 1;
+    // Use the client-provided consumer_id — the Pulsar client generates this
+    // and references it in subsequent Flow/Ack/CloseConsumer commands.
+    let consumer_id = subscribe_cmd.consumer_id;
 
     let consumer_name = subscribe_cmd
         .consumer_name
@@ -112,6 +114,7 @@ where
             subscription_arc.clone(),
             connection_id,
             message_tx, // Pass the sender - Consumer will prepend its ID
+            connection_write_state.clone(),
             priority_level,
             key_shared_policy,
         ));
@@ -399,7 +402,7 @@ mod tests {
     use crate::storage::Storage;
     use futures::StreamExt;
     use prost::Message;
-    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::duplex;
     use tokio::sync::{Mutex, RwLock};
 
@@ -409,17 +412,23 @@ mod tests {
         HashMap<u64, Arc<Consumer>>,
         SharedBrokerService,
         SharedStorage,
-        mpsc::UnboundedSender<(u64, PendingMessage)>,
-        mpsc::UnboundedReceiver<(u64, PendingMessage)>,
+        mpsc::Sender<(u64, PendingMessage)>,
+        mpsc::Receiver<(u64, PendingMessage)>,
+        Arc<ConnectionWriteState>,
     ) {
         let (server_io, client_io) = duplex(4096);
         let server_framed = Framed::new(server_io, PulsarFrameCodec::new());
         let client_framed = Framed::new(client_io, PulsarFrameCodec::new());
-        let storage = Arc::new(Mutex::new(
-            Storage::new(Path::new("/tmp/test-consumer-handler-storage")).unwrap(),
-        ));
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        let storage_path =
+            std::env::temp_dir().join(format!("test-consumer-handler-storage-{unique_suffix}"));
+        let storage = Arc::new(Mutex::new(Storage::new(&storage_path).unwrap()));
         let broker_service = Arc::new(RwLock::new(BrokerService::with_config(storage.clone(), 0)));
-        let (message_tx, message_rx) = mpsc::unbounded_channel();
+        let (message_tx, message_rx) = mpsc::channel(8192);
+        let connection_write_state = Arc::new(ConnectionWriteState::new(64 * 1024, 32 * 1024));
 
         (
             server_framed,
@@ -429,6 +438,7 @@ mod tests {
             storage,
             message_tx,
             message_rx,
+            connection_write_state,
         )
     }
 
@@ -499,17 +509,17 @@ mod tests {
             _storage,
             message_tx,
             _message_rx,
+            connection_write_state,
         ) = create_subscribe_test_context().await;
-        let mut next_consumer_id = 0;
 
         handle_subscribe(
             &mut server_framed,
             build_subscribe_command("persistent://public/default/test-topic", 1, Some(3)),
             &mut consumers,
-            &mut next_consumer_id,
             broker_service,
             "conn-1".to_string(),
             message_tx,
+            connection_write_state,
         )
         .await
         .unwrap();
@@ -532,17 +542,17 @@ mod tests {
             _storage,
             message_tx,
             _message_rx,
+            connection_write_state,
         ) = create_subscribe_test_context().await;
-        let mut next_consumer_id = 0;
 
         handle_subscribe(
             &mut server_framed,
             build_subscribe_command("persistent://public/default/test-topic", 1, None),
             &mut consumers,
-            &mut next_consumer_id,
             broker_service,
             "conn-2".to_string(),
             message_tx,
+            connection_write_state,
         )
         .await
         .unwrap();
@@ -562,8 +572,8 @@ mod tests {
             storage,
             message_tx,
             _message_rx,
+            connection_write_state,
         ) = create_subscribe_test_context().await;
-        let mut next_consumer_id = 0;
 
         let topic = {
             let mut broker = broker_service.write().await;
@@ -581,10 +591,10 @@ mod tests {
             &mut server_framed,
             build_subscribe_command(topic_name, 1, None),
             &mut consumers,
-            &mut next_consumer_id,
             broker_service,
             "conn-3".to_string(),
             message_tx,
+            connection_write_state,
         )
         .await
         .unwrap();
@@ -602,7 +612,10 @@ mod tests {
 
         {
             let mut topic_guard = topic.write().await;
-            topic_guard.publish_message(None, b"hello").await.unwrap();
+            topic_guard
+                .publish_message(None, bytes::Bytes::from_static(b"hello"))
+                .await
+                .unwrap();
             topic_guard.dispatch_to_subscriptions().await;
         }
 
@@ -643,8 +656,8 @@ mod tests {
             storage,
             message_tx,
             _message_rx,
+            connection_write_state,
         ) = create_subscribe_test_context().await;
-        let mut next_consumer_id = 0;
 
         let topic = {
             let mut broker = broker_service.write().await;
@@ -662,10 +675,10 @@ mod tests {
             &mut server_framed,
             build_subscribe_command(topic_name, 0, None),
             &mut consumers,
-            &mut next_consumer_id,
             broker_service,
             "conn-4".to_string(),
             message_tx,
+            connection_write_state,
         )
         .await
         .unwrap();
@@ -683,7 +696,10 @@ mod tests {
 
         {
             let mut topic_guard = topic.write().await;
-            topic_guard.publish_message(None, b"hello").await.unwrap();
+            topic_guard
+                .publish_message(None, bytes::Bytes::from_static(b"hello"))
+                .await
+                .unwrap();
             topic_guard.dispatch_to_subscriptions().await;
         }
 
@@ -722,8 +738,9 @@ mod tests {
             _storage,
             message_tx,
             _message_rx,
+            connection_write_state,
         ) = create_subscribe_test_context().await;
-        let mut next_consumer_id = 0;
+
         let topic_name = "non-persistent://public/default/test-key-shared";
 
         {
@@ -755,10 +772,10 @@ mod tests {
                 }),
             ),
             &mut consumers,
-            &mut next_consumer_id,
             broker_service.clone(),
             "conn-5".to_string(),
             message_tx,
+            connection_write_state,
         )
         .await
         .unwrap();

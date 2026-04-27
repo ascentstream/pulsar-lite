@@ -3,16 +3,17 @@
  * Entry point for the broker service
  */
 
+use futures::SinkExt;
 use pulsar_lite::broker::handle_connection;
+use pulsar_lite::broker::service::topic::TopicPublishRate;
 use pulsar_lite::broker::{BrokerService, ConnectionLimiter};
 use pulsar_lite::config::Config;
 use pulsar_lite::protocol::codec::PulsarFrameCodec;
 use pulsar_lite::protocol::ServerCommand;
 use pulsar_lite::storage::Storage;
-use futures::SinkExt;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Duration;
 use tokio_util::codec::Framed;
@@ -27,7 +28,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter_level(config.log_level.parse().unwrap_or(log::LevelFilter::Info))
         .init();
 
-    log::info!("Starting Pulsar Lite binary protocol server on {}", config.addr);
+    log::info!(
+        "Starting Pulsar Lite binary protocol server on {}",
+        config.addr
+    );
     log::info!("Database path: {:?}", config.db_path);
     log::info!("Default partitions: {}", config.default_partitions);
     log::info!(
@@ -42,9 +46,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.max_connections_per_ip
     );
     log::info!(
-        "Non-persistent limits: max_concurrent_per_connection={}, max_message_size={}B",
+        "Non-persistent limits: max_concurrent_per_connection={}, max_pending_publish={}, max_message_size={}B",
         config.max_concurrent_non_persistent_messages_per_connection,
+        config.max_pending_publish_requests_per_connection,
         config.max_message_size_bytes
+    );
+    log::info!(
+        "Topic publish rate limits: messages_per_sec={}, bytes_per_sec={}",
+        config.publish_rate_messages_per_sec,
+        config.publish_rate_bytes_per_sec
     );
 
     // Initialize storage
@@ -56,6 +66,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize broker service with configuration
     let mut broker = BrokerService::with_config(storage.clone(), config.default_partitions);
+    broker.set_publish_rate_limits(TopicPublishRate {
+        messages_per_sec: config.publish_rate_messages_per_sec,
+        bytes_per_sec: config.publish_rate_bytes_per_sec,
+    });
     broker.restore_partition_metadata(restored_partition_metadata);
     let broker_service = Arc::new(RwLock::new(broker));
     log::info!("BrokerService initialized");
@@ -68,7 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
     let connection_liveness_check_timeout =
         Duration::from_secs(config.connection_liveness_check_timeout_secs);
-    let connection_limiter = ConnectionLimiter::new(config.max_connections, config.max_connections_per_ip);
+    let connection_limiter =
+        ConnectionLimiter::new(config.max_connections, config.max_connections_per_ip);
 
     loop {
         let (socket, peer_addr) = listener.accept().await?;
@@ -102,9 +117,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 handshake_timeout,
                 connection_liveness_check_timeout,
                 config.max_concurrent_non_persistent_messages_per_connection,
+                config.max_pending_publish_requests_per_connection,
                 config.max_message_size_bytes,
                 advertised_broker_url,
-            ).await {
+                config.pulsar_channel_write_buffer_high_water_mark_bytes,
+                config.pulsar_channel_write_buffer_low_water_mark_bytes,
+            )
+            .await
+            {
                 log::error!("Connection error from {}: {}", peer_addr, e);
             }
             log::info!("Connection closed from {}", peer_addr);

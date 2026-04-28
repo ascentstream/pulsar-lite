@@ -67,21 +67,26 @@ class BrokerSampler(threading.Thread):
             writer.writerows(self.samples)
 
 
+def _config_text(config: BrokerConfig, db_path: str) -> str:
+    config_text = BASE_CONFIG.read_text(encoding='utf-8')
+    config_text = re.sub(r'^addr\s*=\s*".*"$', f'addr = "127.0.0.1:{config.port}"', config_text, flags=re.MULTILINE)
+    config_text = re.sub(r'^db_path\s*=\s*".*"$', f'db_path = "{db_path}"', config_text, flags=re.MULTILINE)
+    config_text = re.sub(r'^default_partitions\s*=\s*\d+$', f'default_partitions = {config.default_partitions}', config_text, flags=re.MULTILINE)
+    return config_text
+
+
 class BrokerProcess:
     def __init__(self, config: BrokerConfig):
         self.config = config
         self.proc: subprocess.Popen[str] | None = None
+        self.broker_pid: int | None = None
         self.workdir: Path | None = None
         self.log_path: Path | None = None
         self.sampler: BrokerSampler | None = None
 
     def start(self) -> None:
         temp_dir = Path(tempfile.mkdtemp(prefix=f'pulsar-lite-{self.config.name}-', dir='/tmp'))
-        config_text = BASE_CONFIG.read_text(encoding='utf-8')
-        config_text = re.sub(r'^addr\s*=\s*".*"$', f'addr = "127.0.0.1:{self.config.port}"', config_text, flags=re.MULTILINE)
-        config_text = re.sub(r'^db_path\s*=\s*".*"$', f'db_path = "{temp_dir / "pulsar-lite.db"}"', config_text, flags=re.MULTILINE)
-        config_text = re.sub(r'^default_partitions\s*=\s*\d+$', f'default_partitions = {self.config.default_partitions}', config_text, flags=re.MULTILINE)
-        (temp_dir / 'pulsar-lite.toml').write_text(config_text, encoding='utf-8')
+        (temp_dir / 'pulsar-lite.toml').write_text(_config_text(self.config, str(temp_dir / 'pulsar-lite.db')), encoding='utf-8')
         self.log_path = temp_dir / 'broker.log'
         log_file = self.log_path.open('w', encoding='utf-8')
         self.proc = subprocess.Popen(
@@ -94,7 +99,8 @@ class BrokerProcess:
         )
         self.workdir = temp_dir
         self._wait_for_port()
-        self.sampler = BrokerSampler(self.proc.pid)
+        self.broker_pid = self.proc.pid
+        self.sampler = BrokerSampler(self.broker_pid)
         self.sampler.start()
 
     def _wait_for_port(self, timeout: float = 15.0) -> None:
@@ -122,6 +128,7 @@ class BrokerProcess:
                 self.proc.wait(timeout=5)
         if self.sampler:
             self.sampler.join(timeout=2)
+        self.broker_pid = None
         return metrics
 
     def restart(self) -> None:
@@ -140,3 +147,96 @@ class BrokerProcess:
             'broker_peak_cpu_pct': round(max(cpu_values), 3),
             'broker_peak_rss_mb': round(max(rss_values), 3),
         }
+
+
+class DockerBrokerProcess(BrokerProcess):
+    def __init__(self, config: BrokerConfig, image_tag: str, cpuset_cpus: str, memory: str):
+        super().__init__(config)
+        self.image_tag = image_tag
+        self.cpuset_cpus = cpuset_cpus
+        self.memory = memory
+        self.container_name: str | None = None
+
+    def start(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix=f'pulsar-lite-{self.config.name}-', dir='/tmp'))
+        (temp_dir / 'pulsar-lite.toml').write_text(_config_text(self.config, '/work/pulsar-lite.db'), encoding='utf-8')
+        self.log_path = temp_dir / 'broker.log'
+        self.container_name = f'pulsar-lite-perf-{temp_dir.name}'
+        log_file = self.log_path.open('w', encoding='utf-8')
+        self.proc = subprocess.Popen(
+            [
+                'docker',
+                'run',
+                '--rm',
+                '--name',
+                self.container_name,
+                '--network',
+                'host',
+                '--cpuset-cpus',
+                self.cpuset_cpus,
+                '--memory',
+                self.memory,
+                '--memory-swap',
+                self.memory,
+                '-v',
+                f'{temp_dir}:/work',
+                '-w',
+                '/work',
+                '-e',
+                'RUST_BACKTRACE=1',
+                self.image_tag,
+                '/app/pulsar-lite',
+            ],
+            cwd=temp_dir,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env={**os.environ, 'RUST_BACKTRACE': '1'},
+        )
+        self.workdir = temp_dir
+        self._wait_for_port()
+        self.broker_pid = self._container_pid()
+        self.sampler = BrokerSampler(self.broker_pid)
+        self.sampler.start()
+
+    def _container_pid(self) -> int:
+        if not self.container_name:
+            raise RuntimeError('docker container name is not set')
+        proc = subprocess.run(
+            ['docker', 'inspect', '--format', '{{.State.Pid}}', self.container_name],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        pid_text = proc.stdout.strip()
+        if not pid_text or pid_text == '0':
+            raise RuntimeError(f'docker container {self.container_name} has no host pid')
+        return int(pid_text)
+
+    def stop(self) -> dict[str, float]:
+        metrics = self.metrics()
+        if self.sampler:
+            self.sampler.stop()
+        if self.container_name:
+            subprocess.run(
+                ['docker', 'stop', self.container_name],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait(timeout=5)
+        if self.sampler:
+            self.sampler.join(timeout=2)
+        self.broker_pid = None
+        self.container_name = None
+        return metrics

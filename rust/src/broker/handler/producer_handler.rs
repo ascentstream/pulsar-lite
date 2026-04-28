@@ -131,10 +131,12 @@ where
         // following Pulsar's dispatch-or-drop semantics.
         producer.record_message_sent(frame.payload.len()).await;
 
-        let message_id = {
+        let publish = {
             let mut topic_guard = topic.write().await;
-            topic_guard.publish_message(frame.metadata, frame.payload).await?
+            topic_guard.prepare_non_persistent_publish(frame.metadata, frame.payload)?
         };
+        let message_id = publish.message_id();
+        publish.dispatch_sequential().await;
 
         // Send SendReceipt response
         let response = ServerCommand::SendReceipt {

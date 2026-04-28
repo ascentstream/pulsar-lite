@@ -6,8 +6,9 @@
 use super::{
     KeySharedPolicy, Subscription, SubscriptionRuntimeMode, SubscriptionStats, SubscriptionType,
 };
+
 use crate::broker::service::{Consumer, Producer, SharedStorage};
-use crate::storage::{NonPersistentEntry, Storage};
+use crate::storage::{MessageId, NonPersistentEntry, Storage};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::fmt;
@@ -17,6 +18,37 @@ use tokio::sync::RwLock;
 
 /// Type alias for shared subscription
 pub type SharedSubscription = Arc<RwLock<Subscription>>;
+
+pub struct NonPersistentPublish {
+    message_id: MessageId,
+    entry: NonPersistentEntry,
+    subscriptions: Vec<SharedSubscription>,
+}
+
+impl NonPersistentPublish {
+    pub fn message_id(&self) -> MessageId {
+        self.message_id.clone()
+    }
+    pub async fn dispatch_sequential(self) {
+        let entry = self.entry;
+        for subscription in self.subscriptions {
+            let result = {
+                let sub_guard = subscription.read().await;
+                sub_guard
+                    .send_non_persistent_entries(vec![entry.retained_duplicate()])
+                    .await
+            };
+
+            if let Err(e) = result {
+                log::error!(
+                    "Failed to dispatch non-persistent entry to subscription: {}",
+                    e
+                )
+            }
+        }
+        entry.release();
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TopicPublishRate {
@@ -161,6 +193,77 @@ impl Topic {
 
     pub fn set_publish_rate(&mut self, limits: TopicPublishRate) {
         self.publish_rate_limiter.set_limits(limits);
+    }
+
+    fn build_non_persistent_publish(
+        &self,
+        metadata: Option<Bytes>,
+        payload: Bytes,
+    ) -> NonPersistentPublish {
+        let message_id = MessageId {
+            ledger: 0,
+            entry: 0,
+            partition: self.partition,
+        };
+
+        let entry = NonPersistentEntry::create(
+            message_id.ledger,
+            message_id.entry,
+            message_id.partition,
+            metadata.unwrap_or_default(),
+            payload,
+        );
+
+        let subscriptions = self.subscriptions.values().cloned().collect();
+
+        NonPersistentPublish {
+            message_id,
+            entry,
+            subscriptions,
+        }
+    }
+
+    fn validate_publish_rate(
+        &mut self,
+        metadata: Option<&Bytes>,
+        payload_len: usize,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let total_bytes = metadata
+            .map(|value| value.len() as u64)
+            .unwrap_or(0)
+            .saturating_add(payload_len as u64);
+
+        if !self.publish_rate_limiter.allow_publish(1, total_bytes) {
+            return Err(Box::new(TopicPublishRateExceeded {
+                topic_name: self.name.clone(),
+            }));
+        }
+        Ok(())
+    }
+
+    pub fn prepare_non_persistent_publish(
+        &mut self,
+        metadata: Option<Bytes>,
+        payload: Bytes,
+    ) -> Result<NonPersistentPublish, Box<dyn std::error::Error + Send + Sync>> {
+        if self.runtime_mode != TopicRuntimeMode::NonPersistent {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "prepare_non_persistent_publish called for persistent-style topic",
+            )));
+        }
+
+        log::debug!(
+            "Publishing non-persistent message to topic '{}' partition '{}' (metadata={} bytes, payload={} bytes)",
+            self.name,
+            self.partition,
+            metadata.as_ref().map(|value| value.len()).unwrap_or(0),
+            payload.len()
+        );
+
+        self.validate_publish_rate(metadata.as_ref(), payload.len())?;
+
+        Ok(self.build_non_persistent_publish(metadata, payload))
     }
 
     /// Extract partition ID from topic name
@@ -375,16 +478,7 @@ impl Topic {
             payload.len()
         );
 
-        let total_bytes = metadata
-            .as_ref()
-            .map(|value| value.len() as u64)
-            .unwrap_or(0)
-            .saturating_add(payload.len() as u64);
-        if !self.publish_rate_limiter.allow_publish(1, total_bytes) {
-            return Err(Box::new(TopicPublishRateExceeded {
-                topic_name: self.name.clone(),
-            }));
-        }
+        self.validate_publish_rate(metadata.as_ref(), payload.len())?;
 
         let message_id = match self.runtime_mode {
             TopicRuntimeMode::PersistentStyle => {
@@ -392,40 +486,10 @@ impl Topic {
                 guard.append_message(&self.name, self.partition, &payload)?
             }
             TopicRuntimeMode::NonPersistent => {
-                let entry = NonPersistentEntry::create(
-                    0,
-                    0,
-                    self.partition,
-                    metadata.unwrap_or_default(),
-                    payload,
-                );
-                let subscriptions: Vec<_> = self
-                    .subscriptions
-                    .iter()
-                    .map(|(sub_name, subscription)| (sub_name.clone(), subscription.clone()))
-                    .collect();
-
-                for (sub_name, subscription) in subscriptions {
-                    let sub_guard = subscription.read().await;
-                    let result = sub_guard
-                        .send_non_persistent_entries(vec![entry.retained_duplicate()])
-                        .await;
-                    if let Err(e) = result {
-                        log::error!(
-                            "Failed to dispatch non-persistent entry to subscription '{}' on topic '{}': {}",
-                            sub_name,
-                            self.name,
-                            e
-                        );
-                    }
-                }
-                entry.release();
-
-                crate::storage::MessageId {
-                    ledger: 0,
-                    entry: 0,
-                    partition: self.partition,
-                }
+                let publish = self.build_non_persistent_publish(metadata, payload);
+                let message_id = publish.message_id();
+                publish.dispatch_sequential().await;
+                message_id
             }
         };
 
@@ -676,6 +740,36 @@ mod tests {
         let (consumer_id, pending) = rx.recv().await.expect("message dispatched");
         assert_eq!(consumer_id, 1);
         assert_eq!(pending.metadata, metadata);
+        assert_eq!(pending.payload, b"hello".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_non_persistent_publish_does_not_dispatch_until_requested() {
+        let storage = create_test_storage();
+        let mut topic = Topic::new("test-topic".to_string(), storage);
+        topic.set_runtime_mode(TopicRuntimeMode::NonPersistent);
+
+        let subscription = topic
+            .get_or_create_subscription("sub1", SubscriptionType::Exclusive)
+            .await
+            .unwrap();
+        let (consumer, mut rx) = create_test_consumer_with_rx(1, subscription.clone());
+        consumer.add_permits(1).await;
+        {
+            let mut sub_guard = subscription.write().await;
+            sub_guard.add_consumer(consumer).unwrap();
+        }
+
+        let publish = topic
+            .prepare_non_persistent_publish(None, Bytes::from_static(b"hello"))
+            .unwrap();
+
+        assert!(rx.try_recv().is_err());
+
+        publish.dispatch_sequential().await;
+
+        let (consumer_id, pending) = rx.recv().await.expect("message dispatched");
+        assert_eq!(consumer_id, 1);
         assert_eq!(pending.payload, b"hello".to_vec());
     }
 

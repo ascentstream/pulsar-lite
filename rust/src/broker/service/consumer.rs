@@ -9,8 +9,8 @@ use std::sync::{
     Arc,
 };
 
-use super::ConnectionWriteState;
 use super::topic::SubscriptionType;
+use super::ConnectionWriteState;
 use super::{PendingAck, PendingAcksMap};
 use tokio::sync::{mpsc, RwLock};
 
@@ -74,11 +74,13 @@ impl DispatchReservation {
     /// Consumes self. After this call, resources belong to the connection write path.
     pub fn send(mut self) {
         self.committed = true;
-        let permit = self.owned_permit.take().expect("owned_permit always present");
+        let permit = self
+            .owned_permit
+            .take()
+            .expect("owned_permit always present");
         let message = self.message.take().expect("message always present");
         permit.send((self.consumer_id, message));
     }
-
 }
 
 impl Drop for DispatchReservation {

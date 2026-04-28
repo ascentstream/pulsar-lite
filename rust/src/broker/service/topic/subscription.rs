@@ -825,11 +825,16 @@ mod tests {
 
         // Fill pending acks well past the current inflight-budget default.
         for i in 0..50000u64 {
-            consumer.track_message_dispatched(&MessageId {
-                ledger: 0,
-                entry: i,
-                partition: -1,
-            }, 0).await;
+            consumer
+                .track_message_dispatched(
+                    &MessageId {
+                        ledger: 0,
+                        entry: i,
+                        partition: -1,
+                    },
+                    0,
+                )
+                .await;
         }
 
         subscription

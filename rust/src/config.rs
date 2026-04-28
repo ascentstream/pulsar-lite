@@ -202,8 +202,14 @@ mod tests {
         assert_eq!(config.max_message_size_bytes, 5 * 1024 * 1024);
         assert_eq!(config.publish_rate_messages_per_sec, 0);
         assert_eq!(config.publish_rate_bytes_per_sec, 0);
-        assert_eq!(config.pulsar_channel_write_buffer_high_water_mark_bytes, 64 * 1024);
-        assert_eq!(config.pulsar_channel_write_buffer_low_water_mark_bytes, 32 * 1024);
+        assert_eq!(
+            config.pulsar_channel_write_buffer_high_water_mark_bytes,
+            64 * 1024
+        );
+        assert_eq!(
+            config.pulsar_channel_write_buffer_low_water_mark_bytes,
+            32 * 1024
+        );
     }
 
     #[test]

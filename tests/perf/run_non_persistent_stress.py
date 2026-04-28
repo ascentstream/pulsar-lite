@@ -23,7 +23,8 @@ from pathlib import Path
 # --- lib imports (run from repo root or with sys.path adjusted) ---
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib import ROOT
-from lib.broker import BrokerConfig, BrokerProcess
+from lib.broker import BrokerConfig, BrokerProcess, DockerBrokerProcess
+from lib.docker_image import build_broker_image
 from lib.observability import PerfCollector
 from lib.parsing import parse_consumer_output, parse_producer_output
 from lib.perf_cmd import (
@@ -32,6 +33,7 @@ from lib.perf_cmd import (
     run_consumer_then_feed,
     run_sync,
 )
+from lib.run_metadata import collect_run_metadata
 
 # ---------------------------------------------------------------------------
 # Data definitions
@@ -164,6 +166,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         nargs="*",
         help="Optional scenario names to run. Defaults to all scenarios.",
     )
+    parser.add_argument(
+        "--broker-backend",
+        choices=["local", "docker"],
+        default="local",
+        help="Broker launch backend. local uses rust/target/release/pulsar-lite; docker builds and runs a constrained broker container.",
+    )
+
+    parser.add_argument(
+        "--docker-cpuset",
+        default="0-3",
+        help="CPU set passed to docker run --cpuset-cpus when --broker-backend=docker.",
+    )
+
+    parser.add_argument(
+        "--docker-memory",
+        default="4g",
+        help="Memory limit passed to docker run --memory and --memory-swap when --broker-backend=docker.",
+    )
+
+    parser.add_argument(
+        "--skip-docker-build",
+        action="store_true",
+        help="Reuse an existing Docker image instead of rebuilding it before the run.",
+    )
+
     return parser
 
 
@@ -332,7 +359,7 @@ def main(argv: list[str] | None = None) -> None:
     print("=== Non-persistent stress test ===", file=sys.stderr)
     args = build_arg_parser().parse_args(argv)
     scenarios = select_scenarios(args.scenarios)
-    ensure_prereqs()
+    ensure_prereqs(require_broker_bin=args.broker_backend == "local")
 
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_base = LOGS_ROOT / run_id
@@ -340,14 +367,43 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Run ID: {run_id}", file=sys.stderr)
     print(f"Artifacts: {log_base}", file=sys.stderr)
 
+    docker_image_metadata: dict | None = None
+    if args.broker_backend == "docker":
+        print("Preparing Docker broker image ...", file=sys.stderr)
+        docker_image_metadata = build_broker_image(
+            skip_docker_build=args.skip_docker_build,
+        )
+        print(f"  Docker image: {docker_image_metadata['docker_image_tag']}", file=sys.stderr)
+
+    run_metadata = collect_run_metadata(args)
+    if docker_image_metadata is not None:
+        run_metadata["docker_image"] = docker_image_metadata
+
+    metadata_path = log_base / "metadata.json"
+    metadata_path.write_text(
+        json.dumps(run_metadata, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    print(f"Metadata: {metadata_path}", file=sys.stderr)
+
     # Start brokers
     broker_procs: dict[str, BrokerProcess] = {}
     for name, cfg in BROKERS.items():
         print(f"Starting broker [{name}] on port {cfg.port} ...", file=sys.stderr)
-        bp = BrokerProcess(cfg)
+        if args.broker_backend == "docker":
+            if docker_image_metadata is None:
+                raise RuntimeError("docker image metadata missing")
+            bp = DockerBrokerProcess(
+                cfg,
+                image_tag=docker_image_metadata["docker_image_tag"],
+                cpuset_cpus=args.docker_cpuset,
+                memory=args.docker_memory,
+            )
+        else:
+            bp = BrokerProcess(cfg)
         bp.start()
         broker_procs[name] = bp
-        print(f"  Broker [{name}] PID={bp.proc.pid}", file=sys.stderr)
+        print(f"  Broker [{name}] PID={bp.broker_pid}", file=sys.stderr)
 
     scenario_results: list[dict] = []
 
@@ -368,9 +424,9 @@ def main(argv: list[str] | None = None) -> None:
             # Start perf recording (must be after restart to capture the new PID)
             perf_data_path = scenario_dir / "perf.data"
             perf_collector: PerfCollector | None = None
-            if broker_proc.proc:
+            if broker_proc.broker_pid:
                 perf_collector = PerfCollector(
-                    pid=broker_proc.proc.pid,
+                    pid=broker_proc.broker_pid,
                     duration=scenario.estimated_duration + 30,
                     perf_data_path=perf_data_path,
                 )
@@ -455,6 +511,7 @@ def main(argv: list[str] | None = None) -> None:
     output = {
         "run_id": run_id,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "metadata": run_metadata,
         "scenarios": scenario_results,
         "broker_stop_metrics": broker_stop_metrics,
     }

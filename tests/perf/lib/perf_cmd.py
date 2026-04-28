@@ -7,12 +7,24 @@ from pathlib import Path
 from . import BROKER_BIN, CLASSPATH_FILE, ENV_BASE, JAVA, PULSAR_ROOT, PULSAR_TESTCLIENT_JAR
 
 
-def ensure_prereqs() -> None:
-    if not BROKER_BIN.exists():
+def ensure_prereqs(*, require_broker_bin: bool = True) -> None:
+    if require_broker_bin and not BROKER_BIN.exists():
         raise FileNotFoundError(f'broker binary missing: {BROKER_BIN}')
     if not PULSAR_TESTCLIENT_JAR.exists():
-        raise FileNotFoundError(f'pulsar-testclient jar missing: {PULSAR_TESTCLIENT_JAR}')
+        raise FileNotFoundError(
+            f'pulsar-testclient jar missing: {PULSAR_TESTCLIENT_JAR}\n'
+            'Set PULSAR_ROOT=/path/to/pulsar or '
+            'PULSAR_TESTCLIENT_JAR=/path/to/pulsar-testclient.jar.\n'
+            'If using a Pulsar source checkout, build it with:\n'
+            '  mvn -pl pulsar-testclient -am -DskipTests package'
+        )
     if not CLASSPATH_FILE.exists():
+        if not PULSAR_ROOT.exists():
+            raise FileNotFoundError(
+                f'pulsar source checkout missing: {PULSAR_ROOT}\n'
+                'Set PULSAR_ROOT=/path/to/pulsar, or set '
+                'PULSAR_TESTCLIENT_CLASSPATH_FILE to an existing runtime classpath file.'
+            )
         CLASSPATH_FILE.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(
             ['mvn', '-pl', 'pulsar-testclient', 'dependency:build-classpath',

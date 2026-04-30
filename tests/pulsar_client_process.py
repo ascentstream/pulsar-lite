@@ -19,21 +19,24 @@ def main() -> int:
     parser.add_argument("--ready-file")
     args = parser.parse_args()
 
-    client = pulsar.Client(args.url)
-    consumer = client.subscribe(
-        args.topic,
-        args.subscription,
-        consumer_name=args.consumer_name,
-        consumer_type=pulsar.ConsumerType.Shared,
-        initial_position=pulsar.InitialPosition.Earliest,
-        receiver_queue_size=1,
-    )
-
     try:
+        client = pulsar.Client(args.url)
+        consumer = client.subscribe(
+            args.topic,
+            args.subscription,
+            consumer_name=args.consumer_name,
+            consumer_type=pulsar.ConsumerType.Shared,
+            initial_position=pulsar.InitialPosition.Earliest,
+            receiver_queue_size=1,
+        )
         if args.ready_file:
             Path(args.ready_file).write_text(f"{READY_SENTINEL}\n", encoding="utf-8")
         while True:
             time.sleep(1)
+    except Exception as exc:
+        if args.ready_file:
+            Path(args.ready_file).write_text(f"ERROR:{exc!r}\n",encoding="utf-8")
+        raise
     finally:
         consumer.close()
         client.close()

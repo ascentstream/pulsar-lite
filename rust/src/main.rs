@@ -3,6 +3,7 @@
  * Entry point for the broker service
  */
 
+use clap::Parser;
 use futures::SinkExt;
 use pulsar_lite::broker::handle_connection;
 use pulsar_lite::broker::service::topic::TopicPublishRate;
@@ -12,16 +13,44 @@ use pulsar_lite::protocol::codec::PulsarFrameCodec;
 use pulsar_lite::protocol::ServerCommand;
 use pulsar_lite::storage::Storage;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Duration;
 use tokio_util::codec::Framed;
 
+#[derive(Debug, Parser)]
+#[command(name = "pulsar-lite")]
+#[command(about = "Embedded lightweight message queue compatible with Apache Pulsar")]
+struct Cli {
+    /// Path to the broker config file.
+    #[arg(long, default_value = "pulsar-lite.toml")]
+    config: PathBuf,
+
+    /// Broker listen address, for example 127.0.0.1:6650.
+    #[arg(long)]
+    addr: Option<String>,
+
+    /// Local storage path for the embedded broker.
+    #[arg(long = "db-path")]
+    db_path: Option<PathBuf>,
+
+    /// Log level: error, warn, info, debug, or trace.
+    #[arg(long = "log-level")]
+    log_level: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
     // Load configuration
-    let config = Config::from_file_or_default("pulsar-lite.toml");
+    let config = Config::from_file_or_default(&cli.config).with_cli_overrides(
+        cli.addr,
+        cli.db_path,
+        cli.log_level,
+    );
 
     // Initialize logger
     env_logger::Builder::from_default_env()

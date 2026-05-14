@@ -170,6 +170,25 @@ impl Config {
         })
     }
 
+    /// Apply command-line overrides after loading the config file.
+    pub fn with_cli_overrides(
+        mut self,
+        addr: Option<String>,
+        db_path: Option<PathBuf>,
+        log_level: Option<String>,
+    ) -> Self {
+        if let Some(addr) = addr {
+            self.addr = addr;
+        }
+        if let Some(db_path) = db_path {
+            self.db_path = db_path;
+        }
+        if let Some(log_level) = log_level {
+            self.log_level = log_level;
+        }
+        self
+    }
+
     /// Save configuration to file
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Box<dyn std::error::Error>> {
         let content = toml::to_string_pretty(self)?;
@@ -277,5 +296,40 @@ mod tests {
             parsed.pulsar_channel_write_buffer_low_water_mark_bytes,
             config.pulsar_channel_write_buffer_low_water_mark_bytes
         );
+    }
+
+    #[test]
+    fn test_with_cli_overrides_keeps_unspecified_config_values() {
+        let config = Config {
+            addr: "127.0.0.1:6650".to_string(),
+            db_path: PathBuf::from("/tmp/from-config.db"),
+            default_partitions: 3,
+            log_level: "info".to_string(),
+            keep_alive_interval_secs: 15,
+            handshake_timeout_secs: 10,
+            connection_liveness_check_timeout_secs: 5,
+            max_connections: 100,
+            max_connections_per_ip: 8,
+            max_concurrent_non_persistent_messages_per_connection: 10000,
+            max_pending_publish_requests_per_connection: 2000,
+            max_message_size_bytes: 2048,
+            publish_rate_messages_per_sec: 123,
+            publish_rate_bytes_per_sec: 456,
+            pulsar_channel_write_buffer_high_water_mark_bytes: 96 * 1024,
+            pulsar_channel_write_buffer_low_water_mark_bytes: 48 * 1024,
+        };
+
+        let overridden = config.with_cli_overrides(
+            Some("127.0.0.1:6651".to_string()),
+            Some(PathBuf::from("/tmp/from-cli.db")),
+            Some("debug".to_string()),
+        );
+
+        assert_eq!(overridden.addr, "127.0.0.1:6651");
+        assert_eq!(overridden.db_path, PathBuf::from("/tmp/from-cli.db"));
+        assert_eq!(overridden.log_level, "debug");
+        assert_eq!(overridden.default_partitions, 3);
+        assert_eq!(overridden.keep_alive_interval_secs, 15);
+        assert_eq!(overridden.max_connections, 100);
     }
 }

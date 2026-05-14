@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pulsar-lite"
-version = "0.2.0"
+version = "0.1.0"
 description = "Embedded lightweight message queue compatible with Apache Pulsar - Milvus Lite style experience"
 authors = [{name = "Pulsar Lite Team", email = "pulsar-lite@example.com"}]
 license = {text = "Apache-2.0"}
@@ -39,6 +39,9 @@ Repository = "https://github.com/yourusername/pulsar-lite"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+pulsar_lite = ["bin/pulsar-lite", "bin/pulsar-lite.exe"]
 
 [tool.black]
 line-length = 100

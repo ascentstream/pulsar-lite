@@ -13,13 +13,9 @@ import pytest
 from test_support import persistent_topic
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-METADATA_PATH = REPO_ROOT / "rust" / "pulsar-lite.metadata.json"
-
-
-def _load_metadata_document() -> dict:
-    assert METADATA_PATH.exists(), f"Metadata file not found: {METADATA_PATH}"
-    return json.loads(METADATA_PATH.read_text(encoding="utf-8"))
+def _load_metadata_document(metadata_path: Path) -> dict:
+    assert metadata_path.exists(), f"Metadata file not found: {metadata_path}"
+    return json.loads(metadata_path.read_text(encoding="utf-8"))
 
 
 def _resource_file_key(document: dict) -> str:
@@ -39,12 +35,14 @@ def _persistent_topics(document: dict) -> dict:
     return namespace_node["domains"]["persistent"]
 
 
-def _wait_for_partitioned_topic(topic: str, timeout_secs: float = 5.0) -> tuple[dict, int]:
+def _wait_for_partitioned_topic(
+    metadata_path: Path, topic: str, timeout_secs: float = 5.0
+) -> tuple[dict, int]:
     deadline = time.monotonic() + timeout_secs
     last_document: dict | None = None
 
     while time.monotonic() < deadline:
-        last_document = _load_metadata_document()
+        last_document = _load_metadata_document(metadata_path)
         partition_count = (
             last_document.get("partitioned_topics", {}).get(topic, {}).get("partitions")
         )
@@ -58,13 +56,13 @@ def _wait_for_partitioned_topic(topic: str, timeout_secs: float = 5.0) -> tuple[
     )
 
 
-def _wait_for_metadata(assertion, timeout_secs: float = 5.0) -> dict:
+def _wait_for_metadata(metadata_path: Path, assertion, timeout_secs: float = 5.0) -> dict:
     deadline = time.monotonic() + timeout_secs
     last_document = None
     last_error: AssertionError | None = None
 
     while time.monotonic() < deadline:
-        last_document = _load_metadata_document()
+        last_document = _load_metadata_document(metadata_path)
         try:
             assertion(last_document)
             return last_document
@@ -77,7 +75,9 @@ def _wait_for_metadata(assertion, timeout_secs: float = 5.0) -> dict:
     raise AssertionError("Timed out waiting for metadata assertion")
 
 
-def test_metadata_snapshot_persists_topic_and_subscription(broker_url, unique_name):
+def test_metadata_snapshot_persists_topic_and_subscription(
+    broker_url, broker_metadata_path, unique_name
+):
     topic = persistent_topic(unique_name("metadata-topic"))
     subscription = unique_name("metadata-sub")
     client = pulsar.Client(broker_url)
@@ -120,11 +120,13 @@ def test_metadata_snapshot_persists_topic_and_subscription(broker_url, unique_na
             for topic_node in partition_topic_nodes.values()
         )
 
-    document = _wait_for_metadata(_assert)
+    document = _wait_for_metadata(broker_metadata_path, _assert)
     assert _resource_file_key(document)
 
 
-def test_partitioned_topic_metadata_is_recorded_in_shared_metadata_file(broker_url, unique_name):
+def test_partitioned_topic_metadata_is_recorded_in_shared_metadata_file(
+    broker_url, broker_metadata_path, unique_name
+):
     topic = persistent_topic(unique_name("metadata-partitioned"))
     subscription = unique_name("metadata-sub")
     client = pulsar.Client(broker_url)
@@ -145,7 +147,7 @@ def test_partitioned_topic_metadata_is_recorded_in_shared_metadata_file(broker_u
         client.close()
 
     topic_name = topic.rsplit("/", 1)[-1]
-    document, partition_count = _wait_for_partitioned_topic(topic)
+    document, partition_count = _wait_for_partitioned_topic(broker_metadata_path, topic)
     persistent_topics = _persistent_topics(document)
     assert partition_count > 0
     assert topic_name not in persistent_topics
@@ -154,7 +156,9 @@ def test_partitioned_topic_metadata_is_recorded_in_shared_metadata_file(broker_u
     )
 
 
-def test_partition_subscription_is_persisted_under_concrete_partition_topic(broker_url, unique_name):
+def test_partition_subscription_is_persisted_under_concrete_partition_topic(
+    broker_url, broker_metadata_path, unique_name
+):
     topic = persistent_topic(unique_name("metadata-partition-sub"))
     subscription = unique_name("metadata-sub")
     client = pulsar.Client(broker_url)
@@ -174,7 +178,7 @@ def test_partition_subscription_is_persisted_under_concrete_partition_topic(brok
     finally:
         client.close()
 
-    document, partition_count = _wait_for_partitioned_topic(topic)
+    document, partition_count = _wait_for_partitioned_topic(broker_metadata_path, topic)
     persistent_topics = _persistent_topics(document)
     assert partition_count > 0
     assert topic.rsplit("/", 1)[-1] not in persistent_topics
@@ -186,7 +190,9 @@ def test_partition_subscription_is_persisted_under_concrete_partition_topic(brok
     )
 
 
-def test_partitioned_topic_persists_all_partitions_and_partition_count(broker_url, unique_name):
+def test_partitioned_topic_persists_all_partitions_and_partition_count(
+    broker_url, broker_metadata_path, unique_name
+):
     topic = persistent_topic(unique_name("metadata-multi-partition"))
     subscription = unique_name("metadata-sub")
     client = pulsar.Client(broker_url)
@@ -207,7 +213,7 @@ def test_partitioned_topic_persists_all_partitions_and_partition_count(broker_ur
         client.close()
 
     topic_name = topic.rsplit("/", 1)[-1]
-    document, partition_count = _wait_for_partitioned_topic(topic)
+    document, partition_count = _wait_for_partitioned_topic(broker_metadata_path, topic)
     persistent_topics = _persistent_topics(document)
     expected_partition_topics = {
         f"{topic_name}-partition-{index}" for index in range(partition_count)

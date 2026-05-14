@@ -14,10 +14,18 @@ Pulsar Lite - 嵌入式轻量级消息队列
     producer = client.create_producer("my-topic")
     producer.send(b"Hello World!")
     client.close()
+
+    # 显式启动 broker，然后使用官方 pulsar-client
+    from pulsar_lite import start_broker
+    import pulsar
+
+    broker = start_broker("./milvus_demo.db")
+    client = pulsar.Client(broker.url)
 """
 
-__version__ = "0.2.0"
+__version__ = "0.1.0"
 
 from .client import PulsarClient
+from .process_manager import BrokerHandle, start_broker
 
-__all__ = ["PulsarClient", "__version__"]
+__all__ = ["BrokerHandle", "PulsarClient", "start_broker", "__version__"]

@@ -10,9 +10,30 @@ import subprocess
 import time
 import threading
 import socket
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 from .binary_finder import find_pulsar_lite_binary
+
+
+@dataclass
+class BrokerHandle:
+    """Handle for an embedded Pulsar Lite broker process."""
+
+    db_path: str
+    url: str
+    port: int
+
+    def stop(self):
+        """Release this handle and stop the broker when no clients remain."""
+        process_manager.stop_server(self.db_path)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+        return False
 
 
 class ProcessManager:
@@ -52,11 +73,35 @@ class ProcessManager:
         while port < 6700:
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.bind(('', port))
+                    s.bind(("127.0.0.1", port))
                     return port
             except OSError:
                 port += 1
         raise RuntimeError("No available port found")
+
+    def _wait_until_ready(self, process: subprocess.Popen, port: int, timeout: float = 10.0):
+        """Wait until the broker accepts TCP connections on the selected port."""
+        deadline = time.time() + timeout
+        last_error = None
+
+        while time.time() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError("Pulsar Lite server exited before accepting connections")
+
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+                    return
+            except OSError as error:
+                last_error = error
+                time.sleep(0.1)
+
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except Exception:
+            process.kill()
+            process.wait()
+        raise RuntimeError(f"Pulsar Lite server did not become ready on port {port}: {last_error}")
 
     def _is_remote_uri(self, uri: str) -> bool:
         """判断是否为远程 URI"""
@@ -92,6 +137,7 @@ class ProcessManager:
 
             # 查找可用端口
             port = self._find_free_port()
+            addr = f"127.0.0.1:{port}"
 
             # 确保数据库目录存在
             db_dir = Path(db_path).parent
@@ -101,25 +147,34 @@ class ProcessManager:
             env = {**os.environ, "RUST_LOG": "info"}
             log_file = open("/tmp/pulsar-lite.log", "a")
             process = subprocess.Popen(
-                [self._binary_path],
+                [
+                    self._binary_path,
+                    "--addr",
+                    addr,
+                    "--db-path",
+                    db_path,
+                ],
                 env=env,
                 stdout=log_file,
                 stderr=log_file,
                 cwd=str(db_dir)
             )
 
-            # 等待服务器启动
-            time.sleep(1.0)
-
-            # 检查进程是否还在运行
-            if process.poll() is not None:
-                raise RuntimeError(f"Pulsar Lite server failed to start for {db_path}")
+            try:
+                self._wait_until_ready(process, port)
+            except RuntimeError as error:
+                raise RuntimeError(f"Pulsar Lite server failed to start for {db_path}: {error}") from error
 
             # 保存进程信息
             self._processes[db_path] = (process, 1, port)
             print(f"Started Pulsar Lite server for {db_path}, ref_count=1, port={port}, pid={process.pid}")
 
             return f"pulsar://localhost:{port}", port
+
+    def start_broker(self, db_path: str) -> BrokerHandle:
+        """Start or reuse an embedded broker and return an explicit lifecycle handle."""
+        url, port = self.start_server(db_path)
+        return BrokerHandle(db_path=str(Path(db_path).absolute()), url=url, port=port)
 
     def stop_server(self, db_path: str):
         """
@@ -174,3 +229,8 @@ class ProcessManager:
 
 # 全局单例
 process_manager = ProcessManager()
+
+
+def start_broker(db_path: str) -> BrokerHandle:
+    """Start or reuse an embedded Pulsar Lite broker."""
+    return process_manager.start_broker(db_path)

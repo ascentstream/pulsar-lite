@@ -11,6 +11,7 @@ import pytest
 
 DEFAULT_BROKER_URL = "pulsar://localhost:6650"
 DEFAULT_LOG_PATH = Path("/tmp/pulsar-lite.log")
+DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "rust" / "pulsar-lite.db"
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "rust" / "pulsar-lite.toml"
 
 
@@ -50,6 +51,21 @@ def broker_url() -> str:
 @pytest.fixture(scope="session")
 def broker_log_path() -> Path:
     return Path(os.environ.get("PULSAR_LITE_LOG_FILE", str(DEFAULT_LOG_PATH)))
+
+
+@pytest.fixture(scope="session")
+def broker_db_path() -> Path:
+    return Path(os.environ.get("PULSAR_LITE_DB_PATH", str(DEFAULT_DB_PATH)))
+
+
+@pytest.fixture(scope="session")
+def broker_metadata_path(broker_db_path: Path) -> Path:
+    return Path(
+        os.environ.get(
+            "PULSAR_LITE_METADATA_FILE",
+            str(broker_db_path.with_suffix(".metadata.json")),
+        )
+    )
 
 
 @pytest.fixture(scope="session")

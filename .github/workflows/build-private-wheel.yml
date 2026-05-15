@@ -57,6 +57,9 @@ jobs:
           cp rust/target/release/pulsar-lite python/src/pulsar_lite/bin/pulsar-lite
           chmod +x python/src/pulsar_lite/bin/pulsar-lite
 
+      - name: Inspect broker binary architecture
+        run: file python/src/pulsar_lite/bin/pulsar-lite
+
       - name: Build private Python wheel
         working-directory: python
         run: uv build --wheel --out-dir dist-private

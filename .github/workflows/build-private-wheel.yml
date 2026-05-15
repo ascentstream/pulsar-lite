@@ -1,0 +1,58 @@
+name: Build Private Python Wheel
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux-wheel:
+    name: Build Linux private wheel
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build Rust broker
+        run: cargo build --manifest-path rust/Cargo.toml --release
+
+      - name: Copy broker binary into Python package
+        run: |
+          mkdir -p python/src/pulsar_lite/bin
+          cp rust/target/release/pulsar-lite python/src/pulsar_lite/bin/pulsar-lite
+          chmod +x python/src/pulsar_lite/bin/pulsar-lite
+
+      - name: Build private Python wheel
+        working-directory: python
+        run: uv build --wheel --out-dir dist-private
+
+      - name: Inspect wheel contents
+        working-directory: python
+        run: |
+          python -m zipfile -l dist-private/*.whl | grep pulsar_lite/bin/pulsar-lite
+
+      - name: Upload private wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulsar-lite-linux-wheel
+          path: python/dist-private/*.whl
+          if-no-files-found: error
+          retention-days: 14

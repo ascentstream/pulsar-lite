@@ -169,7 +169,7 @@ mod tests {
 
     fn create_test_topic() -> Arc<RwLock<Topic>> {
         let storage = StdArc::new(Mutex::new(
-            Storage::new(Path::new("/tmp/test-producer-storage")).unwrap(),
+            Storage::new_memory(Path::new("/tmp/test-producer-storage")).unwrap(),
         ));
         Arc::new(RwLock::new(Topic::new("test-topic".to_string(), storage)))
     }

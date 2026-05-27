@@ -462,7 +462,7 @@ mod tests {
 
     fn create_test_storage() -> Arc<Mutex<Storage>> {
         let dir = tempfile::tempdir().unwrap();
-        Arc::new(Mutex::new(Storage::new(dir.path()).unwrap()))
+        Arc::new(Mutex::new(Storage::new_memory(dir.path()).unwrap()))
     }
 
     fn create_test_producer(id: u64, topic_ref: SharedTopic) -> Arc<Producer> {

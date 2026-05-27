@@ -776,7 +776,9 @@ mod tests {
         Framed<DuplexStream, PulsarFrameCodec>,
     ) {
         let (server, client) = duplex(4096);
-        let storage = Arc::new(Mutex::new(Storage::new(Path::new("./test.db")).unwrap()));
+        let storage = Arc::new(Mutex::new(
+            Storage::new_memory(Path::new("./test.db")).unwrap(),
+        ));
         let broker = Arc::new(RwLock::new(BrokerService::with_config(storage.clone(), 0)));
         let server_cnx = ServerCnx::new(
             server,

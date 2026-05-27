@@ -338,7 +338,7 @@ mod tests {
 
     fn create_test_storage() -> crate::broker::service::SharedStorage {
         Arc::new(Mutex::new(
-            Storage::new(Path::new("/tmp/test-sticky-dispatcher-storage")).unwrap(),
+            Storage::new_memory(Path::new("/tmp/test-sticky-dispatcher-storage")).unwrap(),
         ))
     }
 

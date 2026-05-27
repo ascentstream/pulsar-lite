@@ -193,7 +193,7 @@ mod tests {
 
     fn create_test_storage() -> SharedStorage {
         Arc::new(Mutex::new(
-            Storage::new(Path::new("/tmp/test-np-shared-dispatcher-storage")).unwrap(),
+            Storage::new_memory(Path::new("/tmp/test-np-shared-dispatcher-storage")).unwrap(),
         ))
     }
 

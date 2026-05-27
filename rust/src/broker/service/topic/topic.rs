@@ -124,7 +124,7 @@ impl std::error::Error for TopicPublishRateExceeded {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TopicRuntimeMode {
     #[default]
-    PersistentStyle,
+    Persistent,
     NonPersistent,
 }
 
@@ -151,7 +151,7 @@ impl Topic {
     fn runtime_mode_from_topic_name(name: &str) -> TopicRuntimeMode {
         match Storage::parse_topic_name(name) {
             Ok(parsed) if parsed.domain == "non-persistent" => TopicRuntimeMode::NonPersistent,
-            _ => TopicRuntimeMode::PersistentStyle,
+            _ => TopicRuntimeMode::Persistent,
         }
     }
 
@@ -249,7 +249,7 @@ impl Topic {
         if self.runtime_mode != TopicRuntimeMode::NonPersistent {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "prepare_non_persistent_publish called for persistent-style topic",
+                "prepare_non_persistent_publish called for persistent topic",
             )));
         }
 
@@ -371,7 +371,7 @@ impl Topic {
         key_shared_policy: Option<KeySharedPolicy>,
     ) -> Result<SharedSubscription, String> {
         if !self.subscriptions.contains_key(subscription_name) {
-            if self.runtime_mode == TopicRuntimeMode::PersistentStyle {
+            if self.runtime_mode == TopicRuntimeMode::Persistent {
                 {
                     let mut guard = self.storage.lock().await;
                     if let Err(e) = guard.subscribe(&self.name, subscription_name) {
@@ -386,7 +386,7 @@ impl Topic {
                 self.name.clone(),
                 sub_type,
                 match self.runtime_mode {
-                    TopicRuntimeMode::PersistentStyle => SubscriptionRuntimeMode::PersistentStyle,
+                    TopicRuntimeMode::Persistent => SubscriptionRuntimeMode::Persistent,
                     TopicRuntimeMode::NonPersistent => SubscriptionRuntimeMode::NonPersistent,
                 },
                 properties,
@@ -463,7 +463,7 @@ impl Topic {
     // ==================== Message Publishing ====================
 
     /// Publish a message to this topic
-    /// Persistent-style topics store into the managed-ledger-like backend.
+    /// Persistent topics store into the managed-ledger-like backend.
     /// Non-persistent topics append only to runtime memory and avoid storage.
     pub async fn publish_message(
         &mut self,
@@ -481,7 +481,7 @@ impl Topic {
         self.validate_publish_rate(metadata.as_ref(), payload.len())?;
 
         let message_id = match self.runtime_mode {
-            TopicRuntimeMode::PersistentStyle => {
+            TopicRuntimeMode::Persistent => {
                 let mut guard = self.storage.lock().await;
                 guard.append_message(&self.name, self.partition, &payload)?
             }
@@ -511,7 +511,7 @@ impl Topic {
     pub async fn dispatch_to_subscriptions(&mut self) {
         let subscription_count = self.subscriptions.len();
         match self.runtime_mode {
-            TopicRuntimeMode::PersistentStyle => {
+            TopicRuntimeMode::Persistent => {
                 if subscription_count == 0 {
                     log::debug!(
                         "No subscriptions on topic '{}', skipping dispatch",
@@ -581,7 +581,7 @@ impl Topic {
 
     pub async fn get_last_message_id(&self) -> Result<Option<crate::storage::MessageId>, String> {
         match self.runtime_mode {
-            TopicRuntimeMode::PersistentStyle => Ok(self
+            TopicRuntimeMode::Persistent => Ok(self
                 .storage
                 .lock()
                 .await
@@ -618,7 +618,7 @@ mod tests {
 
     fn create_test_storage() -> SharedStorage {
         StdArc::new(Mutex::new(
-            Storage::new(Path::new("/tmp/test-topic-storage")).unwrap(),
+            Storage::new_memory(Path::new("/tmp/test-topic-storage")).unwrap(),
         ))
     }
 
@@ -1207,6 +1207,17 @@ mod tests {
         );
 
         assert_eq!(topic.runtime_mode(), TopicRuntimeMode::NonPersistent);
+    }
+
+    #[tokio::test]
+    async fn test_persistent_topic_domain_sets_runtime_mode() {
+        let storage = create_test_storage();
+        let topic = Topic::new(
+            "persistent://public/default/test-topic".to_string(),
+            storage,
+        );
+
+        assert_eq!(topic.runtime_mode(), TopicRuntimeMode::Persistent);
     }
 
     #[tokio::test]

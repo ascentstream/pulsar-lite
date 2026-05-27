@@ -97,7 +97,7 @@ mod tests {
 
     fn create_test_broker_service() -> SharedBrokerService {
         Arc::new(RwLock::new(BrokerService::new(Arc::new(Mutex::new(
-            Storage::new(Path::new("/tmp/test-lookup-handler")).unwrap(),
+            Storage::new_memory(Path::new("/tmp/test-lookup-handler")).unwrap(),
         )))))
     }
 

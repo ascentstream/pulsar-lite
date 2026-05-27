@@ -425,7 +425,7 @@ mod tests {
             .as_nanos();
         let storage_path =
             std::env::temp_dir().join(format!("test-consumer-handler-storage-{unique_suffix}"));
-        let storage = Arc::new(Mutex::new(Storage::new(&storage_path).unwrap()));
+        let storage = Arc::new(Mutex::new(Storage::new_memory(&storage_path).unwrap()));
         let broker_service = Arc::new(RwLock::new(BrokerService::with_config(storage.clone(), 0)));
         let (message_tx, message_rx) = mpsc::channel(8192);
         let connection_write_state = Arc::new(ConnectionWriteState::new(64 * 1024, 32 * 1024));

@@ -10,7 +10,7 @@ pub use managed_ledger::{
     InMemoryManagedCursor, InMemoryManagedLedger, InMemoryManagedLedgerFactory,
     InMemoryManagedLedgerStorage, ManagedCursor, ManagedCursorState, ManagedLedger,
     ManagedLedgerConfig, ManagedLedgerFactory, ManagedLedgerPosition, ManagedLedgerStorage,
-    MessageId, NonPersistentEntry, SubscriptionCursor,
+    ManagedLedgerStore, MessageId, NonPersistentEntry, SubscriptionCursor,
 };
 pub use metadata::{
     DomainNode, JsonFileMetadataStore, MetadataBackend, MetadataDocument, MetadataFileNode,
@@ -21,29 +21,62 @@ pub use resources::{
     BaseResources, NamespaceResources, PulsarResources, TenantResources, TopicResources,
 };
 
-/// In-memory storage engine used by the current MVP runtime.
-/// This is still the only concrete storage entry point today. Runtime message
-/// state will continue moving into the managed-ledger-style path, while broker
-/// resource semantics live under `storage::resources`.
+/// Broker storage facade.
+///
+/// Topic runtime selection happens above this layer from the topic URL domain.
+/// Persistent topics use this facade's managed-ledger store, while
+/// non-persistent topics use their in-memory runtime path.
 #[derive(Debug)]
 pub struct Storage {
     // Aggregated broker resource access aligned with PulsarResources.
     resources: PulsarResources,
-    // In-memory managed-ledger-style message state.
-    managed_ledger: InMemoryManagedLedgerStorage,
+    // Persistent-topic managed-ledger state.
+    managed_ledger: ManagedLedgerStore,
 }
 
 impl Storage {
     pub(crate) const METADATA_VERSION: u32 = 2;
 
     /// Create a new storage instance.
+    #[cfg(feature = "rocksdb-storage")]
     pub fn new(path: &Path) -> Result<Self> {
+        Self::new_rocksdb(path)
+    }
+
+    /// Create a new storage instance.
+    #[cfg(not(feature = "rocksdb-storage"))]
+    pub fn new(path: &Path) -> Result<Self> {
+        Self::new_memory(path)
+    }
+
+    /// Create a new storage instance backed by the in-memory managed-ledger store.
+    pub fn new_memory(path: &Path) -> Result<Self> {
         info!("In-memory storage initialized (MVP version)");
         let storage = Self {
             resources: PulsarResources::new(path)?,
-            managed_ledger: InMemoryManagedLedgerStorage::new(),
+            managed_ledger: ManagedLedgerStore::memory(),
         };
         Ok(storage)
+    }
+
+    /// Create a new storage instance backed by RocksDB managed-ledger state.
+    #[cfg(feature = "rocksdb-storage")]
+    pub fn new_rocksdb(path: &Path) -> Result<Self> {
+        info!("RocksDB managed-ledger storage initialized");
+        let rocksdb_path = path.with_extension("rocksdb");
+        let storage = Self {
+            resources: PulsarResources::new(path)?,
+            managed_ledger: ManagedLedgerStore::rocksdb(&rocksdb_path)?,
+        };
+        Ok(storage)
+    }
+
+    /// RocksDB storage requires the `rocksdb-storage` feature.
+    #[cfg(not(feature = "rocksdb-storage"))]
+    pub fn new_rocksdb(_path: &Path) -> Result<Self> {
+        Err(anyhow::anyhow!(
+            "managed ledger store 'rocksdb' requires the rocksdb-storage feature"
+        ))
     }
 
     pub fn resources(&self) -> &PulsarResources {
@@ -192,7 +225,139 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!("test-storage-{unique}.db"));
-        Storage::new(&path).unwrap()
+        Storage::new_memory(&path).unwrap()
+    }
+
+    #[test]
+    fn new_memory_uses_memory_managed_ledger_store() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("storage.db");
+        let mut storage = Storage::new_memory(&db_path).unwrap();
+
+        let topic = "persistent://public/default/memory-store-test";
+        storage.create_topic(topic).unwrap();
+        let message_id = storage.append_message(topic, -1, b"memory").unwrap();
+
+        assert_eq!(message_id.entry, 0);
+        assert_eq!(
+            storage.get_message_by_id(topic, &message_id).unwrap().1,
+            b"memory".to_vec()
+        );
+    }
+
+    #[cfg(feature = "rocksdb-storage")]
+    #[test]
+    fn new_uses_rocksdb_managed_ledger_store_when_feature_enabled() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("storage.db");
+        let topic = "persistent://public/default/default-rocksdb-store-test";
+
+        let message_id = {
+            let mut storage = Storage::new(&db_path).unwrap();
+            storage.create_topic(topic).unwrap();
+            storage
+                .append_message(topic, -1, b"default-durable")
+                .unwrap()
+        };
+
+        let storage = Storage::new(&db_path).unwrap();
+        assert_eq!(
+            storage.get_message_by_id(topic, &message_id).unwrap().1,
+            b"default-durable".to_vec()
+        );
+    }
+
+    #[cfg(feature = "rocksdb-storage")]
+    #[test]
+    fn new_rocksdb_persists_messages_across_reopen() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("storage.db");
+        let topic = "persistent://public/default/rocksdb-store-test";
+
+        let message_id = {
+            let mut storage = Storage::new_rocksdb(&db_path).unwrap();
+            storage.create_topic(topic).unwrap();
+            storage.append_message(topic, -1, b"durable").unwrap()
+        };
+
+        let storage = Storage::new_rocksdb(&db_path).unwrap();
+        assert_eq!(
+            storage.get_message_by_id(topic, &message_id).unwrap().1,
+            b"durable".to_vec()
+        );
+    }
+
+    #[cfg(feature = "rocksdb-storage")]
+    #[test]
+    fn rocksdb_persists_cumulative_cursor_across_reopen() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("storage.db");
+        let topic = "persistent://public/default/rocksdb-cursor-test";
+        let subscription = "sub";
+
+        let acked = {
+            let mut storage = Storage::new_rocksdb(&db_path).unwrap();
+            storage.create_topic(topic).unwrap();
+            storage.subscribe(topic, subscription).unwrap();
+            storage.append_message(topic, -1, b"0").unwrap();
+            let msg1 = storage.append_message(topic, -1, b"1").unwrap();
+            storage
+                .ack_message(topic, subscription, msg1.clone())
+                .unwrap();
+            msg1
+        };
+
+        let mut storage = Storage::new_rocksdb(&db_path).unwrap();
+        assert_eq!(
+            storage
+                .get_next_unassigned_message(topic, subscription, 1)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            storage.get_mark_delete_position(topic, subscription),
+            Some(acked.entry)
+        );
+    }
+
+    #[cfg(feature = "rocksdb-storage")]
+    #[test]
+    fn rocksdb_persists_shared_ack_holes_across_reopen() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("storage.db");
+        let topic = "persistent://public/default/rocksdb-shared-holes-test";
+        let subscription = "sub";
+
+        let (msg0, msg1, msg2) = {
+            let mut storage = Storage::new_rocksdb(&db_path).unwrap();
+            storage.create_topic(topic).unwrap();
+            storage.subscribe(topic, subscription).unwrap();
+            let msg0 = storage.append_message(topic, -1, b"0").unwrap();
+            let msg1 = storage.append_message(topic, -1, b"1").unwrap();
+            let msg2 = storage.append_message(topic, -1, b"2").unwrap();
+
+            storage
+                .ack_message_shared(topic, subscription, msg2.clone())
+                .unwrap();
+            storage
+                .ack_message_shared(topic, subscription, msg1.clone())
+                .unwrap();
+            assert_eq!(storage.get_mark_delete_position(topic, subscription), None);
+            (msg0, msg1, msg2)
+        };
+
+        let mut storage = Storage::new_rocksdb(&db_path).unwrap();
+        assert!(storage.is_acknowledged_shared(topic, subscription, &msg1));
+        assert!(storage.is_acknowledged_shared(topic, subscription, &msg2));
+        assert_eq!(storage.get_mark_delete_position(topic, subscription), None);
+
+        storage
+            .ack_message_shared(topic, subscription, msg0)
+            .unwrap();
+        assert_eq!(
+            storage.get_mark_delete_position(topic, subscription),
+            Some(2)
+        );
     }
 
     #[test]
@@ -283,7 +448,7 @@ mod tests {
     fn metadata_ensure_is_idempotent_and_persists_partitioned_topics() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("storage.db");
-        let mut storage = Storage::new(&db_path).unwrap();
+        let mut storage = Storage::new_memory(&db_path).unwrap();
 
         let topic = "persistent://public/default/test";
         storage
@@ -322,7 +487,7 @@ mod tests {
             3
         );
 
-        let reloaded = Storage::new(&db_path).unwrap();
+        let reloaded = Storage::new_memory(&db_path).unwrap();
         let metadata = reloaded.resources().get_topic_metadata(topic).unwrap();
         assert!(metadata.partitioned);
         assert_eq!(metadata.partition_count, 3);
@@ -333,7 +498,7 @@ mod tests {
     fn partition_topics_are_persisted_as_concrete_topics() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("storage.db");
-        let mut storage = Storage::new(&db_path).unwrap();
+        let mut storage = Storage::new_memory(&db_path).unwrap();
 
         let base_topic = "persistent://public/default/test";
         let partition_topic = "persistent://public/default/test-partition-0";
@@ -382,7 +547,7 @@ mod tests {
         let metadata_path = db_path.with_extension("metadata.json");
         fs::write(&metadata_path, "{not-json").unwrap();
 
-        let error = Storage::new(&db_path).unwrap_err();
+        let error = Storage::new_memory(&db_path).unwrap_err();
         assert!(error.to_string().contains("Failed to parse metadata file"));
     }
 
@@ -404,7 +569,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = Storage::new(&db_path).unwrap_err();
+        let error = Storage::new_memory(&db_path).unwrap_err();
         assert!(error
             .to_string()
             .contains("old flat MetadataSnapshot format is no longer supported"));

@@ -232,6 +232,32 @@ mod tests {
     }
 
     #[test]
+    fn test_config_ignores_legacy_managed_ledger_store() {
+        let parsed: Config = toml::from_str(
+            r#"
+addr = "127.0.0.1:6650"
+db_path = "/tmp/storage.db"
+managed_ledger_store = "rocksdb"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.addr, "127.0.0.1:6650");
+        assert_eq!(parsed.db_path, PathBuf::from("/tmp/storage.db"));
+    }
+
+    #[test]
+    fn test_config_serialization_omits_managed_ledger_store() {
+        let config = Config::default();
+        let toml_str = toml::to_string(&config).unwrap();
+
+        assert!(
+            !toml_str.contains("managed_ledger_store"),
+            "topic persistence must be derived from topic URL, not config"
+        );
+    }
+
+    #[test]
     fn test_config_serialization() {
         let config = Config {
             addr: "127.0.0.1:6650".to_string(),

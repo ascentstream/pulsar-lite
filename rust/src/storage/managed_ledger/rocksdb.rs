@@ -1,17 +1,16 @@
 use super::{
-    ack_shared, is_message_acknowledged, ManagedLedgerStorage, MessageId, SubscriptionCursor,
+    ManagedCursor, ManagedCursorState, ManagedLedger, ManagedLedgerConfig, ManagedLedgerFactory,
+    ManagedLedgerPosition, ManagedLedgerStorage, MessageId,
 };
 use anyhow::Result;
 use rocksdb::{Options, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LedgerState {
-    ledger_id: u64,
-    next_entry_id: u64,
-}
+const DEFAULT_MAX_ENTRIES_PER_LEDGER: u64 = 50_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredEntry {
@@ -34,107 +33,50 @@ impl RocksDbManagedLedgerStorage {
         })
     }
 
-    fn ledger_key(topic: &str) -> Vec<u8> {
-        format!("ledger|{topic}").into_bytes()
+    fn managed_cursor_key(ledger_name: &str, cursor_name: &str) -> Vec<u8> {
+        format!("/managed-ledgers/{ledger_name}/{cursor_name}").into_bytes()
     }
 
-    fn entry_key(topic: &str, ledger_id: u64, entry_id: u64) -> Vec<u8> {
-        format!("entry|{topic}|{ledger_id:020}|{entry_id:020}").into_bytes()
+    fn managed_ledger_key(ledger_name: &str) -> Vec<u8> {
+        format!("/managed-ledgers/{ledger_name}").into_bytes()
     }
 
-    fn entry_prefix(topic: &str) -> Vec<u8> {
-        format!("entry|{topic}|").into_bytes()
+    fn managed_entry_key(ledger_name: &str, ledger_id: u64, entry_id: u64) -> Vec<u8> {
+        format!("managed_entry|{ledger_name}|{ledger_id:020}|{entry_id:020}").into_bytes()
     }
 
-    fn cursor_key(topic: &str, subscription: &str) -> Vec<u8> {
-        format!("cursor|{topic}|{subscription}").into_bytes()
+    fn managed_entry_prefix(ledger_name: &str) -> Vec<u8> {
+        format!("managed_entry|{ledger_name}|").into_bytes()
     }
 
-    fn ack_hole_key(topic: &str, subscription: &str, entry_id: u64) -> Vec<u8> {
-        format!("hole|{topic}|{subscription}|{entry_id:020}").into_bytes()
-    }
-
-    fn ack_hole_prefix(topic: &str, subscription: &str) -> Vec<u8> {
-        format!("hole|{topic}|{subscription}|").into_bytes()
-    }
-
-    fn read_ledger_state(&self, topic: &str) -> Result<Option<LedgerState>> {
-        self.db
-            .get(Self::ledger_key(topic))?
-            .map(|bytes| bincode::deserialize(&bytes).map_err(Into::into))
-            .transpose()
-    }
-
-    fn ensure_ledger_state(&self, topic: &str) -> Result<LedgerState> {
-        if let Some(state) = self.read_ledger_state(topic)? {
-            return Ok(state);
+    fn managed_ledger_name(topic: &str) -> String {
+        if let Some((domain, rest)) = topic.split_once("://") {
+            let mut parts = rest.splitn(3, '/');
+            if let (Some(tenant), Some(namespace), Some(local_name)) =
+                (parts.next(), parts.next(), parts.next())
+            {
+                return format!("{tenant}/{namespace}/{domain}/{local_name}");
+            }
         }
 
-        let state = LedgerState {
-            ledger_id: 0,
-            next_entry_id: 0,
-        };
-        self.db
-            .put(Self::ledger_key(topic), bincode::serialize(&state)?)?;
-        Ok(state)
+        topic.to_string()
     }
 
-    fn read_cursor(&self, topic: &str, subscription: &str) -> Result<SubscriptionCursor> {
-        let mark_delete = self
-            .db
-            .get(Self::cursor_key(topic, subscription))?
-            .map(|bytes| {
-                if bytes.is_empty() {
-                    Ok(None)
-                } else {
-                    bincode::deserialize(&bytes)
-                }
-            })
-            .transpose()?
-            .flatten();
+    fn encode_cursor_name(name: &str) -> String {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let mut encoded = String::with_capacity(name.len());
 
-        let prefix = Self::ack_hole_prefix(topic, subscription);
-        let mut acked_holes = BTreeSet::new();
-        for item in self.db.prefix_iterator(&prefix) {
-            let (key, _) = item?;
-            let Some(suffix) = key.strip_prefix(prefix.as_slice()) else {
-                break;
-            };
-            let entry = std::str::from_utf8(suffix)?.parse::<u64>()?;
-            acked_holes.insert(entry);
+        for byte in name.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                encoded.push(byte as char);
+            } else {
+                encoded.push('%');
+                encoded.push(HEX[(byte >> 4) as usize] as char);
+                encoded.push(HEX[(byte & 0x0f) as usize] as char);
+            }
         }
 
-        Ok(SubscriptionCursor {
-            mark_delete,
-            acked_holes,
-        })
-    }
-
-    fn write_cursor(
-        &self,
-        topic: &str,
-        subscription: &str,
-        before: &SubscriptionCursor,
-        after: &SubscriptionCursor,
-    ) -> Result<()> {
-        let mut batch = WriteBatch::default();
-        match after.mark_delete {
-            Some(mark_delete) => batch.put(
-                Self::cursor_key(topic, subscription),
-                bincode::serialize(&Some(mark_delete))?,
-            ),
-            None => batch.delete(Self::cursor_key(topic, subscription)),
-        }
-
-        for entry in before.acked_holes.difference(&after.acked_holes) {
-            batch.delete(Self::ack_hole_key(topic, subscription, *entry));
-        }
-        for entry in after.acked_holes.difference(&before.acked_holes) {
-            batch.put(Self::ack_hole_key(topic, subscription, *entry), []);
-        }
-
-        self.db.write(batch)?;
-        Ok(())
+        encoded
     }
 }
 

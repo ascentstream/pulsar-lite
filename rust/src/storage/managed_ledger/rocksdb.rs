@@ -21,15 +21,16 @@ struct StoredEntry {
 /// RocksDB-backed managed-ledger store for persistent topics.
 #[derive(Debug)]
 pub struct RocksDbManagedLedgerStorage {
-    db: DB,
+    factory: RocksDBManagedLedgerFactory,
 }
 
 impl RocksDbManagedLedgerStorage {
     pub fn open(path: &Path) -> Result<Self> {
         let mut options = Options::default();
         options.create_if_missing(true);
+        let db = Arc::new(DB::open(&options, path)?);
         Ok(Self {
-            db: DB::open(&options, path)?,
+            factory: RocksDBManagedLedgerFactory::new(db),
         })
     }
 
@@ -82,37 +83,23 @@ impl RocksDbManagedLedgerStorage {
 
 impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
     fn create_topic(&mut self, name: &str) -> Result<()> {
-        self.ensure_ledger_state(name)?;
+        let ledger_name = RocksDbManagedLedgerStorage::managed_ledger_name(name);
+        self.factory.open_ledger(&ledger_name)?;
         Ok(())
     }
 
     fn append_message(&mut self, topic: &str, partition: i32, data: &[u8]) -> Result<MessageId> {
-        let mut state = self.ensure_ledger_state(topic)?;
-        let message_id = MessageId {
-            ledger: state.ledger_id,
-            entry: state.next_entry_id,
-            partition,
-        };
-        state.next_entry_id += 1;
-
-        let stored_entry = StoredEntry {
-            partition,
-            payload: data.to_vec(),
-        };
-
-        let mut batch = WriteBatch::default();
-        batch.put(
-            Self::entry_key(topic, message_id.ledger, message_id.entry),
-            bincode::serialize(&stored_entry)?,
-        );
-        batch.put(Self::ledger_key(topic), bincode::serialize(&state)?);
-        self.db.write(batch)?;
-
-        Ok(message_id)
+        let ledger_name = RocksDbManagedLedgerStorage::managed_ledger_name(topic);
+        let mut ledger = self.factory.open_ledger(&ledger_name)?;
+        let position = ledger.add_entry_with_partition(partition, data)?;
+        Ok(MessageId::from(position))
     }
 
-    fn subscribe(&mut self, topic: &str, _subscription: &str) -> Result<()> {
-        self.ensure_ledger_state(topic)?;
+    fn subscribe(&mut self, topic: &str, subscription: &str) -> Result<()> {
+        let ledger_name = RocksDbManagedLedgerStorage::managed_ledger_name(topic);
+        let cursor_name = RocksDbManagedLedgerStorage::encode_cursor_name(subscription);
+        let mut ledger = self.factory.open_ledger(&ledger_name)?;
+        ledger.open_cursor(&cursor_name)?;
         Ok(())
     }
 
@@ -122,9 +109,13 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         subscription: &str,
         _consumer_id: u64,
     ) -> Result<Option<(MessageId, Vec<u8>)>> {
-        let cursor = self.read_cursor(topic, subscription)?;
+        let ledger_name = RocksDbManagedLedgerStorage::managed_ledger_name(topic);
+        let cursor_name = RocksDbManagedLedgerStorage::encode_cursor_name(subscription);
+        let mut ledger = self.factory.open_ledger(&ledger_name)?;
+        let cursor = ledger.open_cursor(&cursor_name)?;
         for (message_id, payload) in self.get_messages(topic) {
-            if is_message_acknowledged(Some(&cursor), message_id.entry) {
+            let position = ManagedLedgerPosition::from(&message_id);
+            if is_managed_position_acknowledged(cursor.state(), &position) {
                 continue;
             }
             return Ok(Some((message_id, payload)));
@@ -138,11 +129,11 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         subscription: &str,
         message_id: MessageId,
     ) -> Result<()> {
-        self.db.put(
-            Self::cursor_key(topic, subscription),
-            bincode::serialize(&Some(message_id.entry))?,
-        )?;
-        Ok(())
+        let ledger_name = RocksDbManagedLedgerStorage::managed_ledger_name(topic);
+        let cursor_name = RocksDbManagedLedgerStorage::encode_cursor_name(subscription);
+        let mut ledger = self.factory.open_ledger(&ledger_name)?;
+        let mut cursor = ledger.open_cursor(&cursor_name)?;
+        cursor.mark_delete(ManagedLedgerPosition::from(message_id))
     }
 
     fn ack_message_shared(
@@ -151,10 +142,15 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         subscription: &str,
         message_id: MessageId,
     ) -> Result<()> {
-        let before = self.read_cursor(topic, subscription)?;
-        let mut after = before.clone();
-        ack_shared(&mut after, message_id.entry);
-        self.write_cursor(topic, subscription, &before, &after)
+        let ledger_name = RocksDbManagedLedgerStorage::managed_ledger_name(topic);
+        let cursor_name = RocksDbManagedLedgerStorage::encode_cursor_name(subscription);
+        let mut ledger = self.factory.open_ledger(&ledger_name)?;
+        let mut cursor = ledger.open_cursor(&cursor_name)?;
+        ack_managed_cursor_shared(
+            &mut cursor,
+            ManagedLedgerPosition::from(message_id),
+            &ledger.info,
+        )
     }
 
     fn get_message_by_id(
@@ -162,51 +158,19 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         topic: &str,
         message_id: &MessageId,
     ) -> Option<(MessageId, Vec<u8>)> {
-        let bytes = self
-            .db
-            .get(Self::entry_key(topic, message_id.ledger, message_id.entry))
-            .ok()
-            .flatten()?;
-        let stored_entry: StoredEntry = bincode::deserialize(&bytes).ok()?;
-        if stored_entry.partition != message_id.partition {
-            return None;
-        }
-        Some((message_id.clone(), stored_entry.payload))
+        let ledger_name = RocksDbManagedLedgerStorage::managed_ledger_name(topic);
+        self.factory
+            .open_ledger(&ledger_name)
+            .ok()?
+            .get_message_by_id(message_id)
     }
 
     fn get_messages(&self, topic: &str) -> Vec<(MessageId, Vec<u8>)> {
-        let prefix = Self::entry_prefix(topic);
-        let mut messages = Vec::new();
-        for item in self.db.prefix_iterator(&prefix) {
-            let Ok((key, value)) = item else {
-                continue;
-            };
-            let Some(suffix) = key.strip_prefix(prefix.as_slice()) else {
-                continue;
-            };
-            let Ok(suffix) = std::str::from_utf8(suffix) else {
-                continue;
-            };
-            let mut parts = suffix.split('|');
-            let Some(ledger) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
-                continue;
-            };
-            let Some(entry) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
-                continue;
-            };
-            let Ok(stored_entry) = bincode::deserialize::<StoredEntry>(&value) else {
-                continue;
-            };
-            messages.push((
-                MessageId {
-                    ledger,
-                    entry,
-                    partition: stored_entry.partition,
-                },
-                stored_entry.payload,
-            ));
-        }
-        messages
+        let ledger_name = RocksDbManagedLedgerStorage::managed_ledger_name(topic);
+        self.factory
+            .open_ledger(&ledger_name)
+            .map(|ledger| ledger.messages())
+            .unwrap_or_default()
     }
 
     fn is_acknowledged_shared(
@@ -215,14 +179,452 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         subscription: &str,
         message_id: &MessageId,
     ) -> bool {
-        self.read_cursor(topic, subscription)
-            .map(|cursor| is_message_acknowledged(Some(&cursor), message_id.entry))
+        let ledger_name = RocksDbManagedLedgerStorage::managed_ledger_name(topic);
+        let cursor_name = RocksDbManagedLedgerStorage::encode_cursor_name(subscription);
+        let mut ledger = match self.factory.open_ledger(&ledger_name) {
+            Ok(ledger) => ledger,
+            Err(_) => return false,
+        };
+        ledger
+            .open_cursor(&cursor_name)
+            .map(|cursor| {
+                is_managed_position_acknowledged(
+                    cursor.state(),
+                    &ManagedLedgerPosition::from(message_id),
+                )
+            })
             .unwrap_or(false)
     }
 
     fn get_mark_delete_position(&self, topic: &str, subscription: &str) -> Option<u64> {
-        self.read_cursor(topic, subscription)
-            .ok()
-            .and_then(|cursor| cursor.mark_delete)
+        let ledger_name = RocksDbManagedLedgerStorage::managed_ledger_name(topic);
+        let cursor_name = RocksDbManagedLedgerStorage::encode_cursor_name(subscription);
+        let mut ledger = self.factory.open_ledger(&ledger_name).ok()?;
+        let cursor = ledger.open_cursor(&cursor_name).ok()?;
+        cursor
+            .state()
+            .mark_delete
+            .as_ref()
+            .map(|position| position.entry_id)
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredManagedCursorState {
+    mark_delete: Option<ManagedLedgerPosition>,
+    individually_deleted_entries: BTreeSet<ManagedLedgerPosition>,
+}
+
+impl From<ManagedCursorState> for StoredManagedCursorState {
+    fn from(value: ManagedCursorState) -> Self {
+        Self {
+            mark_delete: value.mark_delete,
+            individually_deleted_entries: value.individually_deleted_entries,
+        }
+    }
+}
+
+impl From<StoredManagedCursorState> for ManagedCursorState {
+    fn from(value: StoredManagedCursorState) -> Self {
+        Self {
+            mark_delete: value.mark_delete,
+            individually_deleted_entries: value.individually_deleted_entries,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RocksDBManagedCursor {
+    ledger_name: String,
+    name: String,
+    db: Arc<DB>,
+    state: ManagedCursorState,
+}
+
+impl RocksDBManagedCursor {
+    pub fn open(ledger_name: &str, name: &str, db: Arc<DB>) -> Result<Self> {
+        let key = RocksDbManagedLedgerStorage::managed_cursor_key(ledger_name, name);
+        let state = db
+            .get(key)?
+            .map(|bytes| bincode::deserialize::<StoredManagedCursorState>(&bytes))
+            .transpose()?
+            .map(ManagedCursorState::from)
+            .unwrap_or_default();
+
+        Ok(Self {
+            ledger_name: ledger_name.to_string(),
+            name: name.to_string(),
+            db,
+            state,
+        })
+    }
+
+    fn persist_state(&self) -> Result<()> {
+        let key = RocksDbManagedLedgerStorage::managed_cursor_key(&self.ledger_name, &self.name);
+        let stored = StoredManagedCursorState::from(self.state.clone());
+        self.db.put(key, bincode::serialize(&stored)?)?;
+        Ok(())
+    }
+}
+
+impl ManagedCursor for RocksDBManagedCursor {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn state(&self) -> &ManagedCursorState {
+        &self.state
+    }
+
+    fn mark_delete(&mut self, position: ManagedLedgerPosition) -> Result<()> {
+        self.state.mark_delete = Some(position);
+        self.persist_state()
+    }
+
+    fn delete_individual(&mut self, position: ManagedLedgerPosition) -> Result<()> {
+        self.state.individually_deleted_entries.insert(position);
+        self.persist_state()
+    }
+}
+
+fn is_managed_position_acknowledged(
+    cursor: &ManagedCursorState,
+    position: &ManagedLedgerPosition,
+) -> bool {
+    cursor
+        .mark_delete
+        .as_ref()
+        .is_some_and(|mark_delete| position <= mark_delete)
+        || cursor.individually_deleted_entries.contains(position)
+}
+
+fn first_position(info: &StoredManagedLedgerInfo, partition: i32) -> Option<ManagedLedgerPosition> {
+    info.ledgers
+        .iter()
+        .find(|ledger| ledger.entries > 0)
+        .map(|ledger| ManagedLedgerPosition {
+            ledger_id: ledger.ledger_id,
+            entry_id: 0,
+            partition,
+        })
+}
+
+fn next_position(
+    position: &ManagedLedgerPosition,
+    info: &StoredManagedLedgerInfo,
+) -> Option<ManagedLedgerPosition> {
+    let current_ledger = info
+        .ledgers
+        .iter()
+        .find(|ledger| ledger.ledger_id == position.ledger_id)?;
+
+    if position.entry_id + 1 < current_ledger.entries {
+        return Some(ManagedLedgerPosition {
+            ledger_id: position.ledger_id,
+            entry_id: position.entry_id + 1,
+            partition: position.partition,
+        });
+    }
+
+    info.ledgers
+        .iter()
+        .find(|ledger| ledger.ledger_id > position.ledger_id && ledger.entries > 0)
+        .map(|ledger| ManagedLedgerPosition {
+            ledger_id: ledger.ledger_id,
+            entry_id: 0,
+            partition: position.partition,
+        })
+}
+
+fn ack_managed_cursor_shared(
+    cursor: &mut RocksDBManagedCursor,
+    position: ManagedLedgerPosition,
+    info: &StoredManagedLedgerInfo,
+) -> Result<()> {
+    if is_managed_position_acknowledged(cursor.state(), &position) {
+        return Ok(());
+    }
+
+    match cursor.state().mark_delete.as_ref() {
+        None if Some(position.clone()) == first_position(info, position.partition) => {
+            cursor.mark_delete(position)?
+        }
+        None => cursor.delete_individual(position)?,
+        Some(mark_delete) if Some(position.clone()) == next_position(mark_delete, info) => {
+            cursor.mark_delete(position)?
+        }
+        Some(mark_delete) if position > *mark_delete => cursor.delete_individual(position)?,
+        Some(_) => {}
+    }
+
+    while let Some(mark_delete) = cursor.state().mark_delete.clone() {
+        let Some(next) = next_position(&mark_delete, info) else {
+            break;
+        };
+        if cursor.state.individually_deleted_entries.remove(&next) {
+            cursor.mark_delete(next)?;
+        } else {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredLedgerInfo {
+    ledger_id: u64,
+    entries: u64,
+    size: u64,
+    timestamp: u64,
+    is_offloaded: bool,
+    offloaded_context_uuid: Option<String>,
+}
+
+impl StoredLedgerInfo {
+    fn new(ledger_id: u64) -> Self {
+        Self {
+            ledger_id,
+            entries: 0,
+            size: 0,
+            timestamp: 0,
+            is_offloaded: false,
+            offloaded_context_uuid: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredManagedLedgerInfo {
+    ledgers: Vec<StoredLedgerInfo>,
+}
+
+impl StoredManagedLedgerInfo {
+    fn new() -> Self {
+        Self {
+            ledgers: vec![StoredLedgerInfo::new(0)],
+        }
+    }
+
+    fn current_ledger_mut(&mut self) -> &mut StoredLedgerInfo {
+        if self.ledgers.is_empty() {
+            self.ledgers.push(StoredLedgerInfo::new(0));
+        }
+        self.ledgers.last_mut().expect("ledger info is initialized")
+    }
+
+    fn ensure_writable_ledger(&mut self, max_entries_per_ledger: u64) {
+        let current_ledger = self.current_ledger_mut();
+        if current_ledger.entries >= max_entries_per_ledger {
+            let next_ledger_id = current_ledger.ledger_id + 1;
+            self.ledgers.push(StoredLedgerInfo::new(next_ledger_id));
+        }
+    }
+
+    fn roll_over_current_ledger_if_full(&mut self, max_entries_per_ledger: u64) {
+        let current_ledger = self.current_ledger_mut();
+        if current_ledger.entries >= max_entries_per_ledger {
+            current_ledger.timestamp = current_time_millis();
+            let next_ledger_id = current_ledger.ledger_id + 1;
+            self.ledgers.push(StoredLedgerInfo::new(next_ledger_id));
+        }
+    }
+}
+
+fn current_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone)]
+pub struct RocksDBManagedLedger {
+    name: String,
+    db: Arc<DB>,
+    info: StoredManagedLedgerInfo,
+    entries: Vec<(ManagedLedgerPosition, Vec<u8>)>,
+    max_entries_per_ledger: u64,
+}
+
+impl RocksDBManagedLedger {
+    pub fn open(name: &str, db: Arc<DB>) -> Result<Self> {
+        Self::open_with_config(name, db, &ManagedLedgerConfig::default())
+    }
+
+    fn open_with_config(name: &str, db: Arc<DB>, config: &ManagedLedgerConfig) -> Result<Self> {
+        let key = RocksDbManagedLedgerStorage::managed_ledger_key(name);
+        let mut info = db
+            .get(&key)?
+            .map(|bytes| bincode::deserialize::<StoredManagedLedgerInfo>(&bytes))
+            .transpose()?
+            .unwrap_or_else(StoredManagedLedgerInfo::new);
+        let max_entries_per_ledger = config
+            .max_entries_per_ledger
+            .unwrap_or(DEFAULT_MAX_ENTRIES_PER_LEDGER)
+            .max(1);
+
+        info.ensure_writable_ledger(max_entries_per_ledger);
+
+        db.put(&key, bincode::serialize(&info)?)?;
+
+        Ok(Self {
+            name: name.to_string(),
+            entries: Self::load_entries(name, &db)?,
+            db,
+            info,
+            max_entries_per_ledger,
+        })
+    }
+
+    fn load_entries(name: &str, db: &DB) -> Result<Vec<(ManagedLedgerPosition, Vec<u8>)>> {
+        let prefix = RocksDbManagedLedgerStorage::managed_entry_prefix(name);
+        let mut entries = Vec::new();
+
+        for item in db.prefix_iterator(&prefix) {
+            let (key, value) = item?;
+            let Some(suffix) = key.strip_prefix(prefix.as_slice()) else {
+                break;
+            };
+            let suffix = std::str::from_utf8(suffix)?;
+            let mut parts = suffix.split('|');
+            let Some(ledger_id) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
+                continue;
+            };
+            let Some(entry_id) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
+                continue;
+            };
+            let stored_entry: StoredEntry = bincode::deserialize(&value)?;
+
+            entries.push((
+                ManagedLedgerPosition {
+                    ledger_id,
+                    entry_id,
+                    partition: stored_entry.partition,
+                },
+                stored_entry.payload,
+            ));
+        }
+
+        entries.sort_by_key(|(position, _)| {
+            (position.ledger_id, position.entry_id, position.partition)
+        });
+        Ok(entries)
+    }
+
+    fn add_entry_with_partition(
+        &mut self,
+        partition: i32,
+        payload: &[u8],
+    ) -> Result<ManagedLedgerPosition> {
+        let mut next_info = self.info.clone();
+        next_info.ensure_writable_ledger(self.max_entries_per_ledger);
+        let current_ledger = next_info.current_ledger_mut();
+        let position = ManagedLedgerPosition {
+            ledger_id: current_ledger.ledger_id,
+            entry_id: current_ledger.entries,
+            partition,
+        };
+        current_ledger.entries += 1;
+        current_ledger.size += payload.len() as u64;
+        next_info.roll_over_current_ledger_if_full(self.max_entries_per_ledger);
+
+        let stored_entry = StoredEntry {
+            partition,
+            payload: payload.to_vec(),
+        };
+
+        let mut batch = WriteBatch::default();
+        batch.put(
+            RocksDbManagedLedgerStorage::managed_entry_key(
+                &self.name,
+                position.ledger_id,
+                position.entry_id,
+            ),
+            bincode::serialize(&stored_entry)?,
+        );
+        batch.put(
+            RocksDbManagedLedgerStorage::managed_ledger_key(&self.name),
+            bincode::serialize(&next_info)?,
+        );
+        self.db.write(batch)?;
+
+        self.info = next_info;
+        self.entries.push((position.clone(), payload.to_vec()));
+
+        Ok(position)
+    }
+
+    fn get_message_by_id(&self, message_id: &MessageId) -> Option<(MessageId, Vec<u8>)> {
+        self.entries
+            .iter()
+            .find(|(position, _)| {
+                position.ledger_id == message_id.ledger
+                    && position.entry_id == message_id.entry
+                    && position.partition == message_id.partition
+            })
+            .map(|(_, payload)| (message_id.clone(), payload.clone()))
+    }
+
+    fn messages(&self) -> Vec<(MessageId, Vec<u8>)> {
+        self.entries
+            .iter()
+            .map(|(position, payload)| (MessageId::from(position), payload.clone()))
+            .collect()
+    }
+}
+
+impl ManagedLedger for RocksDBManagedLedger {
+    type Cursor = RocksDBManagedCursor;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn add_entry(&mut self, payload: &[u8]) -> Result<ManagedLedgerPosition> {
+        self.add_entry_with_partition(-1, payload)
+    }
+
+    fn open_cursor(&mut self, name: &str) -> Result<Self::Cursor> {
+        RocksDBManagedCursor::open(&self.name, name, Arc::clone(&self.db))
+    }
+
+    fn read_entry(&self, position: &ManagedLedgerPosition) -> Option<&[u8]> {
+        self.entries
+            .iter()
+            .find(|(stored_position, _)| stored_position == position)
+            .map(|(_, payload)| payload.as_slice())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RocksDBManagedLedgerFactory {
+    db: Arc<DB>,
+}
+
+impl RocksDBManagedLedgerFactory {
+    pub fn new(db: Arc<DB>) -> Self {
+        Self { db }
+    }
+
+    fn open_ledger(&self, name: &str) -> Result<RocksDBManagedLedger> {
+        RocksDBManagedLedger::open(name, Arc::clone(&self.db))
+    }
+
+    fn open_ledger_with_config(
+        &self,
+        name: &str,
+        config: &ManagedLedgerConfig,
+    ) -> Result<RocksDBManagedLedger> {
+        RocksDBManagedLedger::open_with_config(name, Arc::clone(&self.db), config)
+    }
+}
+
+impl ManagedLedgerFactory for RocksDBManagedLedgerFactory {
+    type Ledger = RocksDBManagedLedger;
+
+    fn open(&mut self, name: &str, config: &ManagedLedgerConfig) -> Result<Self::Ledger> {
+        self.open_ledger_with_config(name, config)
+    }
+}
+

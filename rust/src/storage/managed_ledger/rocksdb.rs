@@ -628,3 +628,472 @@ impl ManagedLedgerFactory for RocksDBManagedLedgerFactory {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn open_test_db(path: &Path) -> Arc<DB> {
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        Arc::new(DB::open(&options, path).unwrap())
+    }
+
+    fn position(ledger_id: u64, entry_id: u64) -> ManagedLedgerPosition {
+        ManagedLedgerPosition {
+            ledger_id,
+            entry_id,
+            partition: -1,
+        }
+    }
+
+    fn read_managed_ledger_info(db: &DB, ledger_name: &str) -> StoredManagedLedgerInfo {
+        let bytes = db
+            .get(RocksDbManagedLedgerStorage::managed_ledger_key(ledger_name))
+            .unwrap()
+            .expect("managed ledger info should exist");
+        bincode::deserialize(&bytes).unwrap()
+    }
+
+    #[test]
+    fn managed_metadata_keys_follow_pulsar_path_shape() {
+        assert_eq!(
+            RocksDbManagedLedgerStorage::managed_ledger_key("tenant/namespace/persistent/topic"),
+            b"/managed-ledgers/tenant/namespace/persistent/topic".to_vec()
+        );
+        assert_eq!(
+            RocksDbManagedLedgerStorage::managed_cursor_key(
+                "tenant/namespace/persistent/topic",
+                "sub-a",
+            ),
+            b"/managed-ledgers/tenant/namespace/persistent/topic/sub-a".to_vec()
+        );
+    }
+
+    #[test]
+    fn managed_ledger_name_normalizes_pulsar_urls_and_keeps_plain_names() {
+        assert_eq!(
+            RocksDbManagedLedgerStorage::managed_ledger_name("persistent://public/default/test"),
+            "public/default/persistent/test"
+        );
+        assert_eq!(
+            RocksDbManagedLedgerStorage::managed_ledger_name(
+                "persistent://public/default/test-partition-0",
+            ),
+            "public/default/persistent/test-partition-0"
+        );
+        assert_eq!(
+            RocksDbManagedLedgerStorage::managed_ledger_name("test-topic"),
+            "test-topic"
+        );
+    }
+
+    #[test]
+    fn cursor_name_percent_encoding_preserves_path_segment_boundary() {
+        assert_eq!(
+            RocksDbManagedLedgerStorage::encode_cursor_name("sub-a"),
+            "sub-a"
+        );
+        assert_eq!(
+            RocksDbManagedLedgerStorage::encode_cursor_name("team/a"),
+            "team%2Fa"
+        );
+        assert_eq!(
+            RocksDbManagedLedgerStorage::encode_cursor_name("team%2Fa"),
+            "team%252Fa"
+        );
+    }
+
+    #[test]
+    fn managed_cursor_mark_delete_recovers_after_reopen() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("cursor-mark-delete");
+        let mark_delete = position(3, 11);
+
+        {
+            let db = open_test_db(&db_path);
+            let mut cursor = RocksDBManagedCursor::open("ledger-a", "sub-a", db).unwrap();
+            cursor.mark_delete(mark_delete.clone()).unwrap();
+        }
+
+        let db = open_test_db(&db_path);
+        let cursor = RocksDBManagedCursor::open("ledger-a", "sub-a", db).unwrap();
+
+        assert_eq!(cursor.state().mark_delete, Some(mark_delete));
+    }
+
+    #[test]
+    fn managed_cursor_individual_delete_recovers_after_reopen() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("cursor-individual-delete");
+        let deleted = position(5, 17);
+
+        {
+            let db = open_test_db(&db_path);
+            let mut cursor = RocksDBManagedCursor::open("ledger-a", "sub-a", db).unwrap();
+            cursor.delete_individual(deleted.clone()).unwrap();
+        }
+
+        let db = open_test_db(&db_path);
+        let cursor = RocksDBManagedCursor::open("ledger-a", "sub-a", db).unwrap();
+
+        assert!(cursor
+            .state()
+            .individually_deleted_entries
+            .contains(&deleted));
+    }
+
+    #[test]
+    fn managed_cursor_state_is_isolated_by_ledger_and_cursor_name() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("cursor-isolation");
+        let ledger_a_sub_a = position(1, 2);
+        let ledger_a_sub_b = position(1, 7);
+
+        {
+            let db = open_test_db(&db_path);
+            let mut cursor_a =
+                RocksDBManagedCursor::open("ledger-a", "sub-a", Arc::clone(&db)).unwrap();
+            let mut cursor_b =
+                RocksDBManagedCursor::open("ledger-a", "sub-b", Arc::clone(&db)).unwrap();
+
+            cursor_a.mark_delete(ledger_a_sub_a.clone()).unwrap();
+            cursor_b.mark_delete(ledger_a_sub_b.clone()).unwrap();
+        }
+
+        let db = open_test_db(&db_path);
+        let cursor_a = RocksDBManagedCursor::open("ledger-a", "sub-a", Arc::clone(&db)).unwrap();
+        let cursor_b = RocksDBManagedCursor::open("ledger-a", "sub-b", Arc::clone(&db)).unwrap();
+        let cursor_c = RocksDBManagedCursor::open("ledger-b", "sub-a", db).unwrap();
+
+        assert_eq!(cursor_a.state().mark_delete, Some(ledger_a_sub_a));
+        assert_eq!(cursor_b.state().mark_delete, Some(ledger_a_sub_b));
+        assert_eq!(cursor_c.state().mark_delete, None);
+    }
+
+    #[test]
+    fn managed_ledger_entry_recovers_after_reopen() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("ledger-entry-recovery");
+
+        let first_position = {
+            let db = open_test_db(&db_path);
+            let mut ledger = RocksDBManagedLedger::open("ledger-a", db).unwrap();
+            ledger.add_entry(b"first").unwrap()
+        };
+
+        let db = open_test_db(&db_path);
+        let ledger = RocksDBManagedLedger::open("ledger-a", Arc::clone(&db)).unwrap();
+
+        assert_eq!(first_position.ledger_id, 0);
+        assert_eq!(first_position.entry_id, 0);
+        assert_eq!(
+            ledger.read_entry(&first_position),
+            Some(b"first".as_slice())
+        );
+    }
+
+    #[test]
+    fn managed_ledger_next_entry_id_is_derived_from_last_ledger_entries() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("ledger-next-entry");
+
+        {
+            let db = open_test_db(&db_path);
+            let mut ledger = RocksDBManagedLedger::open("ledger-a", db).unwrap();
+            assert_eq!(ledger.add_entry(b"first").unwrap().entry_id, 0);
+            assert_eq!(ledger.add_entry(b"second").unwrap().entry_id, 1);
+        }
+
+        let db = open_test_db(&db_path);
+        let mut ledger = RocksDBManagedLedger::open("ledger-a", db).unwrap();
+        let third_position = ledger.add_entry(b"third").unwrap();
+
+        assert_eq!(third_position.ledger_id, 0);
+        assert_eq!(third_position.entry_id, 2);
+        assert_eq!(
+            ledger.read_entry(&third_position),
+            Some(b"third".as_slice())
+        );
+    }
+
+    #[test]
+    fn managed_ledger_rolls_over_after_max_entries_like_pulsar() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("ledger-rollover");
+        let db = open_test_db(&db_path);
+        let config = ManagedLedgerConfig {
+            max_entries_per_ledger: Some(2),
+            ..ManagedLedgerConfig::default()
+        };
+        let mut factory = RocksDBManagedLedgerFactory::new(Arc::clone(&db));
+
+        {
+            let mut ledger = factory.open("ledger-a", &config).unwrap();
+            assert_eq!(ledger.add_entry(b"first").unwrap(), position(0, 0));
+            assert_eq!(ledger.add_entry(b"second").unwrap(), position(0, 1));
+            assert_eq!(ledger.add_entry(b"third").unwrap(), position(1, 0));
+        }
+
+        let ledger = factory.open("ledger-a", &config).unwrap();
+
+        assert_eq!(ledger.info.ledgers.len(), 2);
+        assert_eq!(ledger.info.ledgers[0].ledger_id, 0);
+        assert_eq!(ledger.info.ledgers[0].entries, 2);
+        assert_eq!(ledger.info.ledgers[1].ledger_id, 1);
+        assert_eq!(ledger.info.ledgers[1].entries, 1);
+        assert_eq!(
+            ledger.read_entry(&position(0, 0)),
+            Some(b"first".as_slice())
+        );
+        assert_eq!(
+            ledger.read_entry(&position(0, 1)),
+            Some(b"second".as_slice())
+        );
+        assert_eq!(
+            ledger.read_entry(&position(1, 0)),
+            Some(b"third".as_slice())
+        );
+    }
+
+    #[test]
+    fn managed_ledger_rollover_metadata_is_persisted_in_rocksdb() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("ledger-rollover-metadata");
+        let db = open_test_db(&db_path);
+        let config = ManagedLedgerConfig {
+            max_entries_per_ledger: Some(2),
+            ..ManagedLedgerConfig::default()
+        };
+        let mut factory = RocksDBManagedLedgerFactory::new(Arc::clone(&db));
+
+        {
+            let mut ledger = factory.open("ledger-a", &config).unwrap();
+            ledger.add_entry(b"first").unwrap();
+            ledger.add_entry(b"second").unwrap();
+            ledger.add_entry(b"third").unwrap();
+        }
+
+        let info = read_managed_ledger_info(&db, "ledger-a");
+
+        assert_eq!(info.ledgers.len(), 2);
+        assert_eq!(info.ledgers[0].ledger_id, 0);
+        assert_eq!(info.ledgers[0].entries, 2);
+        assert_eq!(
+            info.ledgers[0].size,
+            b"first".len() as u64 + b"second".len() as u64
+        );
+        assert!(info.ledgers[0].timestamp > 0);
+        assert_eq!(info.ledgers[1].ledger_id, 1);
+        assert_eq!(info.ledgers[1].entries, 1);
+        assert_eq!(info.ledgers[1].size, b"third".len() as u64);
+        assert_eq!(info.ledgers[1].timestamp, 0);
+    }
+
+    #[test]
+    fn managed_ledger_reopen_continues_from_persisted_rollover_metadata() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("ledger-rollover-reopen");
+        let config = ManagedLedgerConfig {
+            max_entries_per_ledger: Some(2),
+            ..ManagedLedgerConfig::default()
+        };
+
+        {
+            let db = open_test_db(&db_path);
+            let mut factory = RocksDBManagedLedgerFactory::new(db);
+            let mut ledger = factory.open("ledger-a", &config).unwrap();
+            assert_eq!(ledger.add_entry(b"first").unwrap(), position(0, 0));
+            assert_eq!(ledger.add_entry(b"second").unwrap(), position(0, 1));
+        }
+
+        {
+            let db = open_test_db(&db_path);
+            let mut factory = RocksDBManagedLedgerFactory::new(Arc::clone(&db));
+            let mut ledger = factory.open("ledger-a", &config).unwrap();
+            assert_eq!(ledger.add_entry(b"third").unwrap(), position(1, 0));
+            assert_eq!(ledger.add_entry(b"fourth").unwrap(), position(1, 1));
+            assert_eq!(ledger.add_entry(b"fifth").unwrap(), position(2, 0));
+
+            let info = read_managed_ledger_info(&db, "ledger-a");
+            assert_eq!(info.ledgers.len(), 3);
+            assert_eq!(info.ledgers[0].entries, 2);
+            assert_eq!(info.ledgers[1].entries, 2);
+            assert_eq!(info.ledgers[2].entries, 1);
+        }
+
+        let db = open_test_db(&db_path);
+        let ledger = RocksDBManagedLedger::open_with_config("ledger-a", db, &config).unwrap();
+        assert_eq!(
+            ledger.read_entry(&position(0, 0)),
+            Some(b"first".as_slice())
+        );
+        assert_eq!(
+            ledger.read_entry(&position(1, 0)),
+            Some(b"third".as_slice())
+        );
+        assert_eq!(
+            ledger.read_entry(&position(2, 0)),
+            Some(b"fifth".as_slice())
+        );
+    }
+
+    #[test]
+    fn shared_ack_advances_contiguously_across_rolled_ledgers() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("ledger-rollover-shared-ack");
+        let db = open_test_db(&db_path);
+        let config = ManagedLedgerConfig {
+            max_entries_per_ledger: Some(2),
+            ..ManagedLedgerConfig::default()
+        };
+        let mut factory = RocksDBManagedLedgerFactory::new(Arc::clone(&db));
+        let mut ledger = factory.open("ledger-a", &config).unwrap();
+        let first = ledger.add_entry(b"first").unwrap();
+        let second = ledger.add_entry(b"second").unwrap();
+        let third = ledger.add_entry(b"third").unwrap();
+        let mut cursor = ledger.open_cursor("sub-a").unwrap();
+
+        ack_managed_cursor_shared(&mut cursor, third.clone(), &ledger.info).unwrap();
+        assert_eq!(cursor.state().mark_delete, None);
+        assert!(cursor.state().individually_deleted_entries.contains(&third));
+
+        ack_managed_cursor_shared(&mut cursor, first, &ledger.info).unwrap();
+        ack_managed_cursor_shared(&mut cursor, second, &ledger.info).unwrap();
+
+        assert_eq!(cursor.state().mark_delete, Some(third));
+        assert!(cursor.state().individually_deleted_entries.is_empty());
+    }
+
+    #[test]
+    fn managed_ledger_open_cursor_recovers_cursor_state() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("ledger-cursor-recovery");
+        let mark_delete = position(0, 3);
+
+        {
+            let db = open_test_db(&db_path);
+            let mut ledger = RocksDBManagedLedger::open("ledger-a", db).unwrap();
+            let mut cursor = ledger.open_cursor("sub-a").unwrap();
+            cursor.mark_delete(mark_delete.clone()).unwrap();
+        }
+
+        let db = open_test_db(&db_path);
+        let mut ledger = RocksDBManagedLedger::open("ledger-a", db).unwrap();
+        let cursor = ledger.open_cursor("sub-a").unwrap();
+
+        assert_eq!(cursor.state().mark_delete, Some(mark_delete));
+    }
+
+    #[test]
+    fn storage_writes_managed_ledger_keys_instead_of_legacy_keys() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("storage-managed-keyspace");
+        let topic = "tenant/namespace/persistent/topic";
+        let subscription = "sub-a";
+
+        let message_id = {
+            let mut storage = RocksDbManagedLedgerStorage::open(&db_path).unwrap();
+            let message_id = storage.append_message(topic, 7, b"payload").unwrap();
+            storage
+                .ack_message_shared(topic, subscription, message_id.clone())
+                .unwrap();
+            message_id
+        };
+
+        let db = open_test_db(&db_path);
+
+        assert!(db
+            .get(RocksDbManagedLedgerStorage::managed_ledger_key(topic))
+            .unwrap()
+            .is_some());
+        assert!(db
+            .get(RocksDbManagedLedgerStorage::managed_cursor_key(
+                topic,
+                subscription
+            ))
+            .unwrap()
+            .is_some());
+        assert!(db
+            .get(RocksDbManagedLedgerStorage::managed_entry_key(
+                topic,
+                message_id.ledger,
+                message_id.entry
+            ))
+            .unwrap()
+            .is_some());
+
+        assert!(db.get(format!("ledger|{topic}")).unwrap().is_none());
+        assert!(db
+            .get(format!(
+                "entry|{topic}|{:020}|{:020}",
+                message_id.ledger, message_id.entry
+            ))
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get(format!("cursor|{topic}|{subscription}"))
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get(format!(
+                "hole|{topic}|{subscription}|{:020}",
+                message_id.entry
+            ))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn storage_normalizes_topic_url_and_encodes_cursor_name() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("storage-normalized-keyspace");
+        let topic = "persistent://public/default/test";
+        let ledger_name = "public/default/persistent/test";
+        let subscription = "team/a";
+        let cursor_name = "team%2Fa";
+
+        let message_id = {
+            let mut storage = RocksDbManagedLedgerStorage::open(&db_path).unwrap();
+            let message_id = storage.append_message(topic, -1, b"payload").unwrap();
+            storage
+                .ack_message_shared(topic, subscription, message_id.clone())
+                .unwrap();
+            message_id
+        };
+
+        let db = open_test_db(&db_path);
+
+        assert!(db
+            .get(RocksDbManagedLedgerStorage::managed_ledger_key(ledger_name))
+            .unwrap()
+            .is_some());
+        assert!(db
+            .get(RocksDbManagedLedgerStorage::managed_cursor_key(
+                ledger_name,
+                cursor_name
+            ))
+            .unwrap()
+            .is_some());
+        assert!(db
+            .get(RocksDbManagedLedgerStorage::managed_entry_key(
+                ledger_name,
+                message_id.ledger,
+                message_id.entry
+            ))
+            .unwrap()
+            .is_some());
+
+        assert!(db
+            .get(RocksDbManagedLedgerStorage::managed_ledger_key(topic))
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get(RocksDbManagedLedgerStorage::managed_cursor_key(
+                ledger_name,
+                subscription
+            ))
+            .unwrap()
+            .is_none());
+    }
+}

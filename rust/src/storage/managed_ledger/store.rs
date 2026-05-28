@@ -1,6 +1,6 @@
-#[cfg(feature = "rocksdb-storage")]
-use super::RocksDbManagedLedgerStorage;
 use super::{InMemoryManagedLedgerStorage, ManagedLedgerStorage, MessageId};
+#[cfg(feature = "rocksdb-storage")]
+use crate::storage::rocksdb::RocksDbManagedLedgerStorage;
 use anyhow::Result;
 #[cfg(feature = "rocksdb-storage")]
 use std::path::Path;

@@ -29,56 +29,74 @@ impl RocksDBManagedLedger {
         config: &ManagedLedgerConfig,
     ) -> Result<Self> {
         let key = keys::managed_ledger_key(name);
-        let mut info = db
-            .get(&key)?
-            .map(|bytes| bincode::deserialize::<StoredManagedLedgerInfo>(&bytes))
-            .transpose()?
-            .unwrap_or_else(StoredManagedLedgerInfo::new);
         let max_entries_per_ledger = config
             .max_entries_per_ledger
             .unwrap_or(DEFAULT_MAX_ENTRIES_PER_LEDGER)
             .max(1);
 
-        info.ensure_writable_ledger(max_entries_per_ledger);
+        let mut info = match db.get(&key)? {
+            Some(bytes) => bincode::deserialize::<StoredManagedLedgerInfo>(&bytes)?,
+            None => StoredManagedLedgerInfo::new(Self::allocate_ledger_id(&db)?),
+        };
+
+        if info.ledgers.is_empty() {
+            info.ensure_initialized(Self::allocate_ledger_id(&db)?);
+        }
+        if info.current_ledger_is_full(max_entries_per_ledger) {
+            let next_ledger_id = Self::allocate_ledger_id(&db)?;
+            info.roll_over_current_ledger(next_ledger_id);
+        }
 
         db.put(&key, bincode::serialize(&info)?)?;
 
         Ok(Self {
             name: name.to_string(),
-            entries: Self::load_entries(name, &db)?,
+            entries: Self::load_entries(&info, &db)?,
             db,
             info,
             max_entries_per_ledger,
         })
     }
 
-    fn load_entries(name: &str, db: &DB) -> Result<Vec<(ManagedLedgerPosition, Vec<u8>)>> {
-        let prefix = keys::managed_entry_prefix(name);
+    fn allocate_ledger_id(db: &DB) -> Result<u64> {
+        let key = keys::ledger_id_allocator_key();
+        let next_ledger_id = db
+            .get(&key)?
+            .map(|bytes| bincode::deserialize::<u64>(&bytes))
+            .transpose()?
+            .unwrap_or_default();
+        db.put(key, bincode::serialize(&(next_ledger_id + 1))?)?;
+        Ok(next_ledger_id)
+    }
+
+    fn load_entries(
+        info: &StoredManagedLedgerInfo,
+        db: &DB,
+    ) -> Result<Vec<(ManagedLedgerPosition, Vec<u8>)>> {
         let mut entries = Vec::new();
 
-        for item in db.prefix_iterator(&prefix) {
-            let (key, value) = item?;
-            let Some(suffix) = key.strip_prefix(prefix.as_slice()) else {
-                break;
-            };
-            let suffix = std::str::from_utf8(suffix)?;
-            let mut parts = suffix.split('|');
-            let Some(ledger_id) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
-                continue;
-            };
-            let Some(entry_id) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
-                continue;
-            };
-            let stored_entry: StoredEntry = bincode::deserialize(&value)?;
+        for ledger in &info.ledgers {
+            let prefix = keys::managed_entry_prefix(ledger.ledger_id);
+            for item in db.prefix_iterator(&prefix) {
+                let (key, value) = item?;
+                let Some(suffix) = key.strip_prefix(prefix.as_slice()) else {
+                    break;
+                };
+                let suffix = std::str::from_utf8(suffix)?;
+                let Some(entry_id) = suffix.parse::<u64>().ok() else {
+                    continue;
+                };
+                let stored_entry: StoredEntry = bincode::deserialize(&value)?;
 
-            entries.push((
-                ManagedLedgerPosition {
-                    ledger_id,
-                    entry_id,
-                    partition: stored_entry.partition,
-                },
-                stored_entry.payload,
-            ));
+                entries.push((
+                    ManagedLedgerPosition {
+                        ledger_id: ledger.ledger_id,
+                        entry_id,
+                        partition: stored_entry.partition,
+                    },
+                    stored_entry.payload,
+                ));
+            }
         }
 
         entries.sort_by_key(|(position, _)| {
@@ -93,7 +111,10 @@ impl RocksDBManagedLedger {
         payload: &[u8],
     ) -> Result<ManagedLedgerPosition> {
         let mut next_info = self.info.clone();
-        next_info.ensure_writable_ledger(self.max_entries_per_ledger);
+        if next_info.current_ledger_is_full(self.max_entries_per_ledger) {
+            let next_ledger_id = Self::allocate_ledger_id(&self.db)?;
+            next_info.roll_over_current_ledger(next_ledger_id);
+        }
         let current_ledger = next_info.current_ledger_mut();
         let position = ManagedLedgerPosition {
             ledger_id: current_ledger.ledger_id,
@@ -102,7 +123,10 @@ impl RocksDBManagedLedger {
         };
         current_ledger.entries += 1;
         current_ledger.size += payload.len() as u64;
-        next_info.roll_over_current_ledger_if_full(self.max_entries_per_ledger);
+        if next_info.current_ledger_is_full(self.max_entries_per_ledger) {
+            let next_ledger_id = Self::allocate_ledger_id(&self.db)?;
+            next_info.roll_over_current_ledger(next_ledger_id);
+        }
 
         let stored_entry = StoredEntry {
             partition,
@@ -111,7 +135,7 @@ impl RocksDBManagedLedger {
 
         let mut batch = WriteBatch::default();
         batch.put(
-            keys::managed_entry_key(&self.name, position.ledger_id, position.entry_id),
+            keys::managed_entry_key(position.ledger_id, position.entry_id),
             bincode::serialize(&stored_entry)?,
         );
         batch.put(

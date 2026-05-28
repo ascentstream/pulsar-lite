@@ -6,12 +6,16 @@ pub(super) fn managed_ledger_key(ledger_name: &str) -> Vec<u8> {
     format!("/managed-ledgers/{ledger_name}").into_bytes()
 }
 
-pub(super) fn managed_entry_key(ledger_name: &str, ledger_id: u64, entry_id: u64) -> Vec<u8> {
-    format!("managed_entry|{ledger_name}|{ledger_id:020}|{entry_id:020}").into_bytes()
+pub(super) fn ledger_id_allocator_key() -> Vec<u8> {
+    b"managed_ledger|next_ledger_id".to_vec()
 }
 
-pub(super) fn managed_entry_prefix(ledger_name: &str) -> Vec<u8> {
-    format!("managed_entry|{ledger_name}|").into_bytes()
+pub(super) fn managed_entry_key(ledger_id: u64, entry_id: u64) -> Vec<u8> {
+    format!("entry|{ledger_id:020}|{entry_id:020}").into_bytes()
+}
+
+pub(super) fn managed_entry_prefix(ledger_id: u64) -> Vec<u8> {
+    format!("entry|{ledger_id:020}|").into_bytes()
 }
 
 pub(super) fn managed_ledger_name(topic: &str) -> String {

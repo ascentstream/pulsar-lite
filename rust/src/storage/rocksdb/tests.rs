@@ -48,6 +48,18 @@ fn managed_metadata_keys_follow_pulsar_path_shape() {
 }
 
 #[test]
+fn entry_keys_follow_bookkeeper_style_ledger_entry_lookup() {
+    assert_eq!(
+        keys::managed_entry_key(42, 7),
+        b"entry|00000000000000000042|00000000000000000007".to_vec()
+    );
+    assert_eq!(
+        keys::managed_entry_prefix(42),
+        b"entry|00000000000000000042|".to_vec()
+    );
+}
+
+#[test]
 fn managed_ledger_name_normalizes_pulsar_urls_and_keeps_plain_names() {
     assert_eq!(
         keys::managed_ledger_name("persistent://public/default/test"),
@@ -302,6 +314,76 @@ fn managed_ledger_reopen_continues_from_persisted_rollover_metadata() {
 }
 
 #[test]
+fn managed_ledger_ids_are_global_across_topics() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("ledger-id-global");
+    let db = open_test_db(&db_path);
+
+    let mut orders =
+        RocksDBManagedLedger::open("public/default/persistent/orders", Arc::clone(&db)).unwrap();
+    let mut payments =
+        RocksDBManagedLedger::open("public/default/persistent/payments", Arc::clone(&db)).unwrap();
+
+    let orders_position = orders.add_entry(b"order-1").unwrap();
+    let payments_position = payments.add_entry(b"payment-1").unwrap();
+
+    assert_ne!(orders_position.ledger_id, payments_position.ledger_id);
+    assert_eq!(orders_position.entry_id, 0);
+    assert_eq!(payments_position.entry_id, 0);
+    assert!(db
+        .get(keys::managed_entry_key(
+            orders_position.ledger_id,
+            orders_position.entry_id
+        ))
+        .unwrap()
+        .is_some());
+    assert!(db
+        .get(keys::managed_entry_key(
+            payments_position.ledger_id,
+            payments_position.entry_id
+        ))
+        .unwrap()
+        .is_some());
+    assert!(db
+        .get(format!(
+            "managed_entry|public/default/persistent/orders|{:020}|{:020}",
+            orders_position.ledger_id, orders_position.entry_id
+        ))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn rolled_ledgers_allocate_global_ledger_ids() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("ledger-rollover-global-id");
+    let db = open_test_db(&db_path);
+    let config = ManagedLedgerConfig {
+        max_entries_per_ledger: Some(1),
+        ..ManagedLedgerConfig::default()
+    };
+    let mut factory = RocksDBManagedLedgerFactory::new(Arc::clone(&db));
+
+    let mut orders = factory.open("orders", &config).unwrap();
+    let mut payments = factory.open("payments", &config).unwrap();
+
+    let orders_first = orders.add_entry(b"order-1").unwrap();
+    let payments_first = payments.add_entry(b"payment-1").unwrap();
+    let orders_second = orders.add_entry(b"order-2").unwrap();
+
+    assert_ne!(orders_first.ledger_id, payments_first.ledger_id);
+    assert_ne!(orders_second.ledger_id, orders_first.ledger_id);
+    assert_ne!(orders_second.ledger_id, payments_first.ledger_id);
+    assert_eq!(orders_second.entry_id, 0);
+
+    let orders_info = read_managed_ledger_info(&db, "orders");
+    let payments_info = read_managed_ledger_info(&db, "payments");
+    assert_eq!(orders_info.ledgers[0].ledger_id, orders_first.ledger_id);
+    assert_eq!(orders_info.ledgers[1].ledger_id, orders_second.ledger_id);
+    assert_eq!(payments_info.ledgers[0].ledger_id, payments_first.ledger_id);
+}
+
+#[test]
 fn shared_ack_advances_contiguously_across_rolled_ledgers() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("ledger-rollover-shared-ack");
@@ -372,11 +454,7 @@ fn storage_writes_managed_ledger_keys_instead_of_legacy_keys() {
         .unwrap()
         .is_some());
     assert!(db
-        .get(keys::managed_entry_key(
-            topic,
-            message_id.ledger,
-            message_id.entry
-        ))
+        .get(keys::managed_entry_key(message_id.ledger, message_id.entry))
         .unwrap()
         .is_some());
 
@@ -430,13 +508,16 @@ fn storage_normalizes_topic_url_and_encodes_cursor_name() {
         .unwrap()
         .is_some());
     assert!(db
-        .get(keys::managed_entry_key(
-            ledger_name,
-            message_id.ledger,
-            message_id.entry
-        ))
+        .get(keys::managed_entry_key(message_id.ledger, message_id.entry))
         .unwrap()
         .is_some());
+    assert!(db
+        .get(format!(
+            "managed_entry|{ledger_name}|{:020}|{:020}",
+            message_id.ledger, message_id.entry
+        ))
+        .unwrap()
+        .is_none());
 
     assert!(db.get(keys::managed_ledger_key(topic)).unwrap().is_none());
     assert!(db

@@ -8,6 +8,7 @@ use crate::storage::{
     ManagedCursor, ManagedLedger, ManagedLedgerConfig, ManagedLedgerFactory, ManagedLedgerPosition,
     ManagedLedgerStorage,
 };
+use prost::Message;
 use rocksdb::{Options, DB};
 use std::path::Path;
 use std::sync::Arc;
@@ -32,7 +33,11 @@ fn read_managed_ledger_info(db: &DB, ledger_name: &str) -> StoredManagedLedgerIn
         .get(keys::managed_ledger_key(ledger_name))
         .unwrap()
         .expect("managed ledger info should exist");
-    bincode::deserialize(&bytes).unwrap()
+    StoredManagedLedgerInfo::decode(&bytes).unwrap()
+}
+
+fn read_raw_value(db: &DB, key: Vec<u8>) -> Vec<u8> {
+    db.get(key).unwrap().expect("value should exist").to_vec()
 }
 
 #[test]
@@ -57,6 +62,49 @@ fn entry_keys_follow_bookkeeper_style_ledger_entry_lookup() {
         keys::managed_entry_prefix(42),
         b"entry|00000000000000000042|".to_vec()
     );
+}
+
+#[test]
+fn managed_ledger_info_value_is_protobuf_encoded() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("ledger-info-protobuf");
+    let db = open_test_db(&db_path);
+
+    {
+        let mut ledger = RocksDBManagedLedger::open("ledger-a", Arc::clone(&db)).unwrap();
+        ledger.add_entry(b"first").unwrap();
+    }
+
+    let bytes = read_raw_value(&db, keys::managed_ledger_key("ledger-a"));
+    let info = super::metadata::proto::ManagedLedgerInfo::decode(bytes.as_slice()).unwrap();
+
+    assert_eq!(info.ledger_info.len(), 1);
+    assert_eq!(info.ledger_info[0].ledger_id, 0);
+    assert_eq!(info.ledger_info[0].entries, Some(1));
+    assert_eq!(info.ledger_info[0].size, Some(b"first".len() as i64));
+}
+
+#[test]
+fn managed_cursor_state_value_is_protobuf_encoded() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("cursor-info-protobuf");
+    let db = open_test_db(&db_path);
+    let mark_delete = position(0, 3);
+    let deleted = position(0, 5);
+
+    {
+        let mut cursor = RocksDBManagedCursor::open("ledger-a", "sub-a", Arc::clone(&db)).unwrap();
+        cursor.mark_delete(mark_delete).unwrap();
+        cursor.delete_individual(deleted).unwrap();
+    }
+
+    let bytes = read_raw_value(&db, keys::managed_cursor_key("ledger-a", "sub-a"));
+    let info = super::metadata::proto::ManagedCursorInfo::decode(bytes.as_slice()).unwrap();
+
+    assert_eq!(info.cursors_ledger_id, -1);
+    assert_eq!(info.mark_delete_ledger_id, Some(0));
+    assert_eq!(info.mark_delete_entry_id, Some(3));
+    assert_eq!(info.individual_deleted_messages.len(), 1);
 }
 
 #[test]

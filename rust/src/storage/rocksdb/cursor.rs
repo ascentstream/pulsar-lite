@@ -19,7 +19,7 @@ impl RocksDBManagedCursor {
         let key = keys::managed_cursor_key(ledger_name, name);
         let state = db
             .get(key)?
-            .map(|bytes| bincode::deserialize::<StoredManagedCursorState>(&bytes))
+            .map(|bytes| StoredManagedCursorState::decode(&bytes))
             .transpose()?
             .map(ManagedCursorState::from)
             .unwrap_or_default();
@@ -35,7 +35,7 @@ impl RocksDBManagedCursor {
     fn persist_state(&self) -> Result<()> {
         let key = keys::managed_cursor_key(&self.ledger_name, &self.name);
         let stored = StoredManagedCursorState::from(self.state.clone());
-        self.db.put(key, bincode::serialize(&stored)?)?;
+        self.db.put(key, stored.encode_to_vec())?;
         Ok(())
     }
 }

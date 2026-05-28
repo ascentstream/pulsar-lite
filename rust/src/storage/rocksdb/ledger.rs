@@ -35,7 +35,7 @@ impl RocksDBManagedLedger {
             .max(1);
 
         let mut info = match db.get(&key)? {
-            Some(bytes) => bincode::deserialize::<StoredManagedLedgerInfo>(&bytes)?,
+            Some(bytes) => StoredManagedLedgerInfo::decode(&bytes)?,
             None => StoredManagedLedgerInfo::new(Self::allocate_ledger_id(&db)?),
         };
 
@@ -47,7 +47,7 @@ impl RocksDBManagedLedger {
             info.roll_over_current_ledger(next_ledger_id);
         }
 
-        db.put(&key, bincode::serialize(&info)?)?;
+        db.put(&key, info.encode_to_vec())?;
 
         Ok(Self {
             name: name.to_string(),
@@ -140,7 +140,7 @@ impl RocksDBManagedLedger {
         );
         batch.put(
             keys::managed_ledger_key(&self.name),
-            bincode::serialize(&next_info)?,
+            next_info.encode_to_vec(),
         );
         self.db.write(batch)?;
 

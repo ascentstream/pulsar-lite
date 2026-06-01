@@ -1,4 +1,5 @@
 use super::cursor::{ack_managed_cursor_shared, RocksDBManagedCursor};
+use super::entrylog::EntryLogStore;
 use super::factory::RocksDBManagedLedgerFactory;
 use super::keys;
 use super::ledger::RocksDBManagedLedger;
@@ -38,6 +39,84 @@ fn read_managed_ledger_info(db: &DB, ledger_name: &str) -> StoredManagedLedgerIn
 
 fn read_raw_value(db: &DB, key: Vec<u8>) -> Vec<u8> {
     db.get(key).unwrap().expect("value should exist").to_vec()
+}
+
+#[test]
+fn entrylog_appends_and_reads_entry_payload() {
+    let dir = tempdir().unwrap();
+    let store = EntryLogStore::open(dir.path()).unwrap();
+
+    let index = store.append(7, 3, 2, b"payload").unwrap();
+    let entry = store.read(&index).unwrap();
+
+    assert_eq!(index.ledger_id, 7);
+    assert_eq!(index.entry_id, 3);
+    assert_eq!(index.file_id, 0);
+    assert_eq!(index.offset, 0);
+    assert_eq!(index.len, 40 + b"payload".len() as u64);
+    assert_eq!(index.partition, 2);
+    assert_eq!(entry.partition, 2);
+    assert_eq!(entry.payload, b"payload");
+}
+
+#[test]
+fn entrylog_appends_multiple_entries_with_stable_offsets() {
+    let dir = tempdir().unwrap();
+    let store = EntryLogStore::open(dir.path()).unwrap();
+
+    let first = store.append(7, 0, -1, b"first").unwrap();
+    let second = store.append(7, 1, -1, b"second").unwrap();
+
+    assert_eq!(first.file_id, second.file_id);
+    assert_eq!(second.offset, first.offset + first.len);
+    assert_eq!(store.read(&first).unwrap().payload, b"first");
+    assert_eq!(store.read(&second).unwrap().payload, b"second");
+}
+
+#[test]
+fn entrylog_rejects_index_for_different_position() {
+    let dir = tempdir().unwrap();
+    let store = EntryLogStore::open(dir.path()).unwrap();
+    let mut index = store.append(7, 3, -1, b"payload").unwrap();
+
+    index.entry_id = 4;
+
+    let err = store.read(&index).unwrap_err().to_string();
+    assert!(err.contains("entrylog position does not match index"));
+}
+
+#[test]
+fn entrylog_rejects_index_when_checksum_does_not_match_record() {
+    let dir = tempdir().unwrap();
+    let store = EntryLogStore::open(dir.path()).unwrap();
+    let mut index = store.append(7, 3, -1, b"payload").unwrap();
+
+    index.checksum = index.checksum.wrapping_add(1);
+
+    let err = store.read(&index).unwrap_err().to_string();
+    assert!(err.contains("entrylog checksum mismatch"));
+}
+
+#[test]
+fn entrylog_reopen_allocates_next_file_id() {
+    let dir = tempdir().unwrap();
+
+    let first = {
+        let store = EntryLogStore::open(dir.path()).unwrap();
+        store.append(7, 0, -1, b"first").unwrap()
+    };
+
+    let second = {
+        let store = EntryLogStore::open(dir.path()).unwrap();
+        store.append(7, 1, -1, b"second").unwrap()
+    };
+
+    let store = EntryLogStore::open(dir.path()).unwrap();
+
+    assert_eq!(second.file_id, first.file_id + 1);
+    assert_eq!(second.offset, 0);
+    assert_eq!(store.read(&first).unwrap().payload, b"first");
+    assert_eq!(store.read(&second).unwrap().payload, b"second");
 }
 
 #[test]

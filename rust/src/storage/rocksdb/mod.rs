@@ -1,4 +1,5 @@
 mod cursor;
+mod entrylog;
 mod factory;
 mod keys;
 mod ledger;

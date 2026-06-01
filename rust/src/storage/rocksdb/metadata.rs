@@ -13,12 +13,6 @@ pub(super) mod proto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct StoredEntry {
-    pub(super) partition: i32,
-    pub(super) payload: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct StoredEntryLocation {
     pub(super) file_id: u64,
     pub(super) offset: u64,

@@ -1,4 +1,3 @@
-use super::metadata::StoredEntry;
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
 use std::fs::OpenOptions;
@@ -22,6 +21,12 @@ pub(super) struct EntryIndex {
     pub len: u64,
     pub checksum: u64,
     pub partition: i32,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct EntryRecord {
+    pub(super) partition: i32,
+    pub(super) payload: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -138,7 +143,7 @@ impl EntryLogStore {
         })
     }
 
-    pub(super) fn read(&self, index: &EntryIndex) -> Result<StoredEntry> {
+    pub(super) fn read(&self, index: &EntryIndex) -> Result<EntryRecord> {
         let path = self.entry_log_path(index.file_id);
         let mut file = OpenOptions::new().read(true).open(&path)?;
 
@@ -181,6 +186,6 @@ impl EntryLogStore {
             bail!("entrylog checksum mismatch");
         }
 
-        Ok(StoredEntry { partition, payload })
+        Ok(EntryRecord { partition, payload })
     }
 }

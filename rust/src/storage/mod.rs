@@ -1,6 +1,8 @@
 mod managed_ledger;
 mod metadata;
 mod resources;
+#[cfg(feature = "rocksdb-storage")]
+pub(crate) mod rocksdb;
 
 use anyhow::Result;
 use log::{debug, info, warn};

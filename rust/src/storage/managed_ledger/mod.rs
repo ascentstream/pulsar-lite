@@ -10,8 +10,6 @@ mod cursor;
 mod factory;
 mod ledger;
 mod memory;
-#[cfg(feature = "rocksdb-storage")]
-mod rocksdb;
 mod storage;
 mod store;
 mod types;
@@ -26,8 +24,6 @@ pub use memory::{
     InMemoryManagedCursor, InMemoryManagedLedger, InMemoryManagedLedgerFactory,
     InMemoryManagedLedgerStorage,
 };
-#[cfg(feature = "rocksdb-storage")]
-pub use rocksdb::RocksDbManagedLedgerStorage;
 pub use storage::ManagedLedgerStorage;
 pub use store::ManagedLedgerStore;
 pub use types::{ManagedLedgerPosition, MessageId, NonPersistentEntry};

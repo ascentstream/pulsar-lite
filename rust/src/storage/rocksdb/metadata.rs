@@ -1,3 +1,4 @@
+use super::entrylog::EntryIndex;
 use crate::storage::{ManagedCursorState, ManagedLedgerPosition};
 use anyhow::{anyhow, Result};
 use prost::Message;
@@ -15,6 +16,27 @@ pub(super) mod proto {
 pub(super) struct StoredEntry {
     pub(super) partition: i32,
     pub(super) payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct StoredEntryLocation {
+    pub(super) file_id: u64,
+    pub(super) offset: u64,
+    pub(super) len: u64,
+    pub(super) checksum: u64,
+    pub(super) partition: i32,
+}
+
+impl From<EntryIndex> for StoredEntryLocation {
+    fn from(value: EntryIndex) -> Self {
+        Self {
+            file_id: value.file_id,
+            offset: value.offset,
+            len: value.len,
+            checksum: value.checksum,
+            partition: value.partition,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

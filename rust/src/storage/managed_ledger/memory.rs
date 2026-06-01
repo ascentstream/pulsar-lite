@@ -236,19 +236,13 @@ impl ManagedLedger for InMemoryManagedLedger {
         Ok(InMemoryManagedCursor::new(name))
     }
 
-    fn read_entry(&self, position: &ManagedLedgerPosition) -> Option<&[u8]> {
+    fn read_entry(&self, position: &ManagedLedgerPosition) -> Option<Vec<u8>> {
         self.entries
-            .get(position.entry_id as usize)
-            .and_then(|(message_id, data)| {
-                if message_id.ledger == position.ledger_id
-                    && message_id.entry == position.entry_id
-                    && message_id.partition == position.partition
-                {
-                    Some(data.as_slice())
-                } else {
-                    None
-                }
+            .iter()
+            .find(|(message_id, _)| {
+                message_id.ledger == position.ledger_id && message_id.entry == position.entry_id
             })
+            .map(|(_, payload)| payload.clone())
     }
 }
 

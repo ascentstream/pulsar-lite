@@ -11,5 +11,5 @@ pub trait ManagedLedger: Send + Sync {
 
     fn open_cursor(&mut self, name: &str) -> Result<Self::Cursor>;
 
-    fn read_entry(&self, position: &ManagedLedgerPosition) -> Option<&[u8]>;
+    fn read_entry(&self, position: &ManagedLedgerPosition) -> Option<Vec<u8>>;
 }

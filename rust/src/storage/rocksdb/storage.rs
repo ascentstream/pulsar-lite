@@ -1,4 +1,5 @@
 use super::cursor::{ack_managed_cursor_shared, is_managed_position_acknowledged};
+use super::entrylog::EntryLogStore;
 use super::factory::RocksDBManagedLedgerFactory;
 use super::keys;
 use anyhow::Result;
@@ -21,8 +22,10 @@ impl RocksDbManagedLedgerStorage {
         let mut options = Options::default();
         options.create_if_missing(true);
         let db = Arc::new(DB::open(&options, path)?);
+        let entry_log = Arc::new(EntryLogStore::open(path)?);
+
         Ok(Self {
-            factory: RocksDBManagedLedgerFactory::new(db),
+            factory: RocksDBManagedLedgerFactory::new(db, entry_log),
         })
     }
 }

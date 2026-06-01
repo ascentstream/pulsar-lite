@@ -21,6 +21,10 @@ fn open_test_db(path: &Path) -> Arc<DB> {
     Arc::new(DB::open(&options, path).unwrap())
 }
 
+fn open_test_entry_log(path: &Path) -> Arc<EntryLogStore> {
+    Arc::new(EntryLogStore::open(path).unwrap())
+}
+
 fn position(ledger_id: u64, entry_id: u64) -> ManagedLedgerPosition {
     ManagedLedgerPosition {
         ledger_id,
@@ -150,7 +154,9 @@ fn managed_ledger_info_value_is_protobuf_encoded() {
     let db = open_test_db(&db_path);
 
     {
-        let mut ledger = RocksDBManagedLedger::open("ledger-a", Arc::clone(&db)).unwrap();
+        let entry_log = open_test_entry_log(&db_path);
+        let mut ledger =
+            RocksDBManagedLedger::open("ledger-a", Arc::clone(&db), entry_log).unwrap();
         ledger.add_entry(b"first").unwrap();
     }
 
@@ -280,17 +286,19 @@ fn managed_ledger_entry_recovers_after_reopen() {
 
     let first_position = {
         let db = open_test_db(&db_path);
-        let mut ledger = RocksDBManagedLedger::open("ledger-a", db).unwrap();
+        let entry_log = open_test_entry_log(&db_path);
+        let mut ledger = RocksDBManagedLedger::open("ledger-a", db, entry_log).unwrap();
         ledger.add_entry(b"first").unwrap()
     };
 
     let db = open_test_db(&db_path);
-    let ledger = RocksDBManagedLedger::open("ledger-a", Arc::clone(&db)).unwrap();
+    let entry_log = open_test_entry_log(&db_path);
+    let ledger = RocksDBManagedLedger::open("ledger-a", Arc::clone(&db), entry_log).unwrap();
 
     assert_eq!(first_position.ledger_id, 0);
     assert_eq!(first_position.entry_id, 0);
     assert_eq!(
-        ledger.read_entry(&first_position),
+        ledger.read_entry(&first_position).as_deref(),
         Some(b"first".as_slice())
     );
 }
@@ -302,19 +310,21 @@ fn managed_ledger_next_entry_id_is_derived_from_last_ledger_entries() {
 
     {
         let db = open_test_db(&db_path);
-        let mut ledger = RocksDBManagedLedger::open("ledger-a", db).unwrap();
+        let entry_log = open_test_entry_log(&db_path);
+        let mut ledger = RocksDBManagedLedger::open("ledger-a", db, entry_log).unwrap();
         assert_eq!(ledger.add_entry(b"first").unwrap().entry_id, 0);
         assert_eq!(ledger.add_entry(b"second").unwrap().entry_id, 1);
     }
 
     let db = open_test_db(&db_path);
-    let mut ledger = RocksDBManagedLedger::open("ledger-a", db).unwrap();
+    let entry_log = open_test_entry_log(&db_path);
+    let mut ledger = RocksDBManagedLedger::open("ledger-a", db, entry_log).unwrap();
     let third_position = ledger.add_entry(b"third").unwrap();
 
     assert_eq!(third_position.ledger_id, 0);
     assert_eq!(third_position.entry_id, 2);
     assert_eq!(
-        ledger.read_entry(&third_position),
+        ledger.read_entry(&third_position).as_deref(),
         Some(b"third".as_slice())
     );
 }
@@ -328,7 +338,8 @@ fn managed_ledger_rolls_over_after_max_entries_like_pulsar() {
         max_entries_per_ledger: Some(2),
         ..ManagedLedgerConfig::default()
     };
-    let mut factory = RocksDBManagedLedgerFactory::new(Arc::clone(&db));
+    let entry_log = open_test_entry_log(&db_path);
+    let mut factory = RocksDBManagedLedgerFactory::new(Arc::clone(&db), entry_log);
 
     {
         let mut ledger = factory.open("ledger-a", &config).unwrap();
@@ -345,15 +356,15 @@ fn managed_ledger_rolls_over_after_max_entries_like_pulsar() {
     assert_eq!(ledger.info.ledgers[1].ledger_id, 1);
     assert_eq!(ledger.info.ledgers[1].entries, 1);
     assert_eq!(
-        ledger.read_entry(&position(0, 0)),
+        ledger.read_entry(&position(0, 0)).as_deref(),
         Some(b"first".as_slice())
     );
     assert_eq!(
-        ledger.read_entry(&position(0, 1)),
+        ledger.read_entry(&position(0, 1)).as_deref(),
         Some(b"second".as_slice())
     );
     assert_eq!(
-        ledger.read_entry(&position(1, 0)),
+        ledger.read_entry(&position(1, 0)).as_deref(),
         Some(b"third".as_slice())
     );
 }
@@ -367,7 +378,8 @@ fn managed_ledger_rollover_metadata_is_persisted_in_rocksdb() {
         max_entries_per_ledger: Some(2),
         ..ManagedLedgerConfig::default()
     };
-    let mut factory = RocksDBManagedLedgerFactory::new(Arc::clone(&db));
+    let entry_log = open_test_entry_log(&db_path);
+    let mut factory = RocksDBManagedLedgerFactory::new(Arc::clone(&db), entry_log);
 
     {
         let mut ledger = factory.open("ledger-a", &config).unwrap();
@@ -403,7 +415,8 @@ fn managed_ledger_reopen_continues_from_persisted_rollover_metadata() {
 
     {
         let db = open_test_db(&db_path);
-        let mut factory = RocksDBManagedLedgerFactory::new(db);
+        let entry_log = open_test_entry_log(&db_path);
+        let mut factory = RocksDBManagedLedgerFactory::new(db, entry_log);
         let mut ledger = factory.open("ledger-a", &config).unwrap();
         assert_eq!(ledger.add_entry(b"first").unwrap(), position(0, 0));
         assert_eq!(ledger.add_entry(b"second").unwrap(), position(0, 1));
@@ -411,7 +424,8 @@ fn managed_ledger_reopen_continues_from_persisted_rollover_metadata() {
 
     {
         let db = open_test_db(&db_path);
-        let mut factory = RocksDBManagedLedgerFactory::new(Arc::clone(&db));
+        let entry_log = open_test_entry_log(&db_path);
+        let mut factory = RocksDBManagedLedgerFactory::new(Arc::clone(&db), entry_log);
         let mut ledger = factory.open("ledger-a", &config).unwrap();
         assert_eq!(ledger.add_entry(b"third").unwrap(), position(1, 0));
         assert_eq!(ledger.add_entry(b"fourth").unwrap(), position(1, 1));
@@ -425,17 +439,19 @@ fn managed_ledger_reopen_continues_from_persisted_rollover_metadata() {
     }
 
     let db = open_test_db(&db_path);
-    let ledger = RocksDBManagedLedger::open_with_config("ledger-a", db, &config).unwrap();
+    let entry_log = open_test_entry_log(&db_path);
+    let ledger =
+        RocksDBManagedLedger::open_with_config("ledger-a", db, entry_log, &config).unwrap();
     assert_eq!(
-        ledger.read_entry(&position(0, 0)),
+        ledger.read_entry(&position(0, 0)).as_deref(),
         Some(b"first".as_slice())
     );
     assert_eq!(
-        ledger.read_entry(&position(1, 0)),
+        ledger.read_entry(&position(1, 0)).as_deref(),
         Some(b"third".as_slice())
     );
     assert_eq!(
-        ledger.read_entry(&position(2, 0)),
+        ledger.read_entry(&position(2, 0)).as_deref(),
         Some(b"fifth".as_slice())
     );
 }
@@ -445,11 +461,20 @@ fn managed_ledger_ids_are_global_across_topics() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("ledger-id-global");
     let db = open_test_db(&db_path);
+    let entry_log = open_test_entry_log(&db_path);
 
-    let mut orders =
-        RocksDBManagedLedger::open("public/default/persistent/orders", Arc::clone(&db)).unwrap();
-    let mut payments =
-        RocksDBManagedLedger::open("public/default/persistent/payments", Arc::clone(&db)).unwrap();
+    let mut orders = RocksDBManagedLedger::open(
+        "public/default/persistent/orders",
+        Arc::clone(&db),
+        Arc::clone(&entry_log),
+    )
+    .unwrap();
+    let mut payments = RocksDBManagedLedger::open(
+        "public/default/persistent/payments",
+        Arc::clone(&db),
+        Arc::clone(&entry_log),
+    )
+    .unwrap();
 
     let orders_position = orders.add_entry(b"order-1").unwrap();
     let payments_position = payments.add_entry(b"payment-1").unwrap();
@@ -489,7 +514,8 @@ fn rolled_ledgers_allocate_global_ledger_ids() {
         max_entries_per_ledger: Some(1),
         ..ManagedLedgerConfig::default()
     };
-    let mut factory = RocksDBManagedLedgerFactory::new(Arc::clone(&db));
+    let entry_log = open_test_entry_log(&db_path);
+    let mut factory = RocksDBManagedLedgerFactory::new(Arc::clone(&db), entry_log);
 
     let mut orders = factory.open("orders", &config).unwrap();
     let mut payments = factory.open("payments", &config).unwrap();
@@ -519,7 +545,8 @@ fn shared_ack_advances_contiguously_across_rolled_ledgers() {
         max_entries_per_ledger: Some(2),
         ..ManagedLedgerConfig::default()
     };
-    let mut factory = RocksDBManagedLedgerFactory::new(Arc::clone(&db));
+    let entry_log = open_test_entry_log(&db_path);
+    let mut factory = RocksDBManagedLedgerFactory::new(Arc::clone(&db), entry_log);
     let mut ledger = factory.open("ledger-a", &config).unwrap();
     let first = ledger.add_entry(b"first").unwrap();
     let second = ledger.add_entry(b"second").unwrap();
@@ -545,13 +572,15 @@ fn managed_ledger_open_cursor_recovers_cursor_state() {
 
     {
         let db = open_test_db(&db_path);
-        let mut ledger = RocksDBManagedLedger::open("ledger-a", db).unwrap();
+        let entry_log = open_test_entry_log(&db_path);
+        let mut ledger = RocksDBManagedLedger::open("ledger-a", db, entry_log).unwrap();
         let mut cursor = ledger.open_cursor("sub-a").unwrap();
         cursor.mark_delete(mark_delete.clone()).unwrap();
     }
 
     let db = open_test_db(&db_path);
-    let mut ledger = RocksDBManagedLedger::open("ledger-a", db).unwrap();
+    let entry_log = open_test_entry_log(&db_path);
+    let mut ledger = RocksDBManagedLedger::open("ledger-a", db, entry_log).unwrap();
     let cursor = ledger.open_cursor("sub-a").unwrap();
 
     assert_eq!(cursor.state().mark_delete, Some(mark_delete));

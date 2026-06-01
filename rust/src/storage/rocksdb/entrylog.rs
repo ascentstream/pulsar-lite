@@ -24,11 +24,13 @@ pub(super) struct EntryIndex {
     pub partition: i32,
 }
 
+#[derive(Debug)]
 struct EntryLogState {
     active_file_id: u64,
     active_offset: u64,
 }
 
+#[derive(Debug)]
 pub(super) struct EntryLogStore {
     dir: PathBuf,
     log_size_limit: u64,

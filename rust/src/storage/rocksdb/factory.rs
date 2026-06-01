@@ -3,20 +3,21 @@ use anyhow::Result;
 use rocksdb::DB;
 use std::sync::Arc;
 
-use crate::storage::{ManagedLedgerConfig, ManagedLedgerFactory};
+use crate::storage::{rocksdb::entrylog::EntryLogStore, ManagedLedgerConfig, ManagedLedgerFactory};
 
 #[derive(Debug, Clone)]
 pub(super) struct RocksDBManagedLedgerFactory {
     db: Arc<DB>,
+    entry_log: Arc<EntryLogStore>,
 }
 
 impl RocksDBManagedLedgerFactory {
-    pub(super) fn new(db: Arc<DB>) -> Self {
-        Self { db }
+    pub(super) fn new(db: Arc<DB>, entry_log: Arc<EntryLogStore>) -> Self {
+        Self { db, entry_log }
     }
 
     pub(super) fn open_ledger(&self, name: &str) -> Result<RocksDBManagedLedger> {
-        RocksDBManagedLedger::open(name, Arc::clone(&self.db))
+        RocksDBManagedLedger::open(name, Arc::clone(&self.db), Arc::clone(&self.entry_log))
     }
 
     fn open_ledger_with_config(
@@ -24,7 +25,12 @@ impl RocksDBManagedLedgerFactory {
         name: &str,
         config: &ManagedLedgerConfig,
     ) -> Result<RocksDBManagedLedger> {
-        RocksDBManagedLedger::open_with_config(name, Arc::clone(&self.db), config)
+        RocksDBManagedLedger::open_with_config(
+            name,
+            Arc::clone(&self.db),
+            Arc::clone(&self.entry_log),
+            config,
+        )
     }
 }
 

@@ -8,15 +8,15 @@ use crate::storage::{ManagedCursor, ManagedCursorState, ManagedLedgerPosition};
 
 #[derive(Debug, Clone)]
 pub(super) struct RocksDBManagedCursor {
-    ledger_name: String,
+    managedledger_name: String,
     name: String,
     db: Arc<DB>,
     state: ManagedCursorState,
 }
 
 impl RocksDBManagedCursor {
-    pub(super) fn open(ledger_name: &str, name: &str, db: Arc<DB>) -> Result<Self> {
-        let key = keys::managed_cursor_key(ledger_name, name);
+    pub(super) fn open(managedledger_name: &str, name: &str, db: Arc<DB>) -> Result<Self> {
+        let key = keys::managed_cursor_key(managedledger_name, name);
         let state = db
             .get(key)?
             .map(|bytes| StoredManagedCursorState::decode(&bytes))
@@ -25,7 +25,7 @@ impl RocksDBManagedCursor {
             .unwrap_or_default();
 
         Ok(Self {
-            ledger_name: ledger_name.to_string(),
+            managedledger_name: managedledger_name.to_string(),
             name: name.to_string(),
             db,
             state,
@@ -33,7 +33,7 @@ impl RocksDBManagedCursor {
     }
 
     fn persist_state(&self) -> Result<()> {
-        let key = keys::managed_cursor_key(&self.ledger_name, &self.name);
+        let key = keys::managed_cursor_key(&self.managedledger_name, &self.name);
         let stored = StoredManagedCursorState::from(self.state.clone());
         self.db.put(key, stored.encode_to_vec())?;
         Ok(())

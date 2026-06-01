@@ -170,10 +170,10 @@ impl RocksDBManagedLedger {
                     && position.partition == message_id.partition
             })
             .and_then(|(_, index)| {
-                self.entry_log
-                    .read(index)
-                    .ok()
-                    .map(|entry| (message_id.clone(), entry.payload))
+                self.entry_log.read(index).ok().and_then(|entry| {
+                    (entry.partition == message_id.partition)
+                        .then_some((message_id.clone(), entry.payload))
+                })
             })
     }
 
@@ -181,10 +181,10 @@ impl RocksDBManagedLedger {
         self.entries
             .iter()
             .filter_map(|(position, index)| {
-                self.entry_log
-                    .read(index)
-                    .ok()
-                    .map(|entry| (MessageId::from(position), entry.payload))
+                self.entry_log.read(index).ok().and_then(|entry| {
+                    (entry.partition == position.partition)
+                        .then_some((MessageId::from(position), entry.payload))
+                })
             })
             .collect()
     }
@@ -209,6 +209,10 @@ impl ManagedLedger for RocksDBManagedLedger {
         self.entries
             .iter()
             .find(|(stored_position, _)| stored_position == position)
-            .and_then(|(_, index)| self.entry_log.read(index).ok().map(|entry| entry.payload))
+            .and_then(|(_, index)| {
+                self.entry_log.read(index).ok().and_then(|entry| {
+                    (entry.partition == position.partition).then_some(entry.payload)
+                })
+            })
     }
 }

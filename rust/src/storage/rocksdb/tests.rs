@@ -3,7 +3,7 @@ use super::entrylog::EntryLogStore;
 use super::factory::RocksDBManagedLedgerFactory;
 use super::keys;
 use super::ledger::RocksDBManagedLedger;
-use super::metadata::StoredManagedLedgerInfo;
+use super::metadata::{StoredEntryLocation, StoredManagedLedgerInfo};
 use super::storage::RocksDbManagedLedgerStorage;
 use crate::storage::{
     ManagedCursor, ManagedLedger, ManagedLedgerConfig, ManagedLedgerFactory, ManagedLedgerPosition,
@@ -301,6 +301,63 @@ fn managed_ledger_entry_recovers_after_reopen() {
         ledger.read_entry(&first_position).as_deref(),
         Some(b"first".as_slice())
     );
+}
+
+#[test]
+fn managed_ledger_entry_value_stores_location_not_payload() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("ledger-entry-location-value");
+    let db = open_test_db(&db_path);
+    let entry_log = open_test_entry_log(&db_path);
+    let payload = b"payload-in-entrylog";
+
+    let mut ledger = RocksDBManagedLedger::open("ledger-a", Arc::clone(&db), entry_log).unwrap();
+    let position = ledger.add_entry(payload).unwrap();
+
+    let raw_value = read_raw_value(
+        &db,
+        keys::managed_entry_key(position.ledger_id, position.entry_id),
+    );
+    let location: StoredEntryLocation = bincode::deserialize(&raw_value).unwrap();
+
+    assert_eq!(location.partition, -1);
+    assert_eq!(location.offset, 0);
+    assert_eq!(location.len, 40 + payload.len() as u64);
+    assert!(!raw_value
+        .windows(payload.len())
+        .any(|window| window == payload));
+}
+
+#[test]
+fn managed_ledger_returns_none_for_bad_entry_location() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("ledger-bad-entry-location");
+    let db = open_test_db(&db_path);
+    let entry_log = open_test_entry_log(&db_path);
+
+    let position = {
+        let mut ledger =
+            RocksDBManagedLedger::open("ledger-a", Arc::clone(&db), entry_log).unwrap();
+        ledger.add_entry(b"payload").unwrap()
+    };
+
+    let mut location: StoredEntryLocation = bincode::deserialize(&read_raw_value(
+        &db,
+        keys::managed_entry_key(position.ledger_id, position.entry_id),
+    ))
+    .unwrap();
+    location.checksum = location.checksum.wrapping_add(1);
+
+    db.put(
+        keys::managed_entry_key(position.ledger_id, position.entry_id),
+        bincode::serialize(&location).unwrap(),
+    )
+    .unwrap();
+
+    let entry_log = open_test_entry_log(&db_path);
+    let ledger = RocksDBManagedLedger::open("ledger-a", Arc::clone(&db), entry_log).unwrap();
+
+    assert_eq!(ledger.read_entry(&position), None);
 }
 
 #[test]

@@ -1,6 +1,7 @@
 use super::cursor::RocksDBManagedCursor;
+use super::entrylog::{EntryIndex, EntryLogStore};
 use super::keys;
-use super::metadata::{StoredEntry, StoredManagedLedgerInfo};
+use super::metadata::{StoredEntryLocation, StoredManagedLedgerInfo};
 use anyhow::Result;
 use rocksdb::{WriteBatch, DB};
 use std::sync::Arc;
@@ -14,18 +15,20 @@ pub(super) struct RocksDBManagedLedger {
     name: String,
     db: Arc<DB>,
     pub(super) info: StoredManagedLedgerInfo,
-    entries: Vec<(ManagedLedgerPosition, Vec<u8>)>,
+    entries: Vec<(ManagedLedgerPosition, EntryIndex)>,
     max_entries_per_ledger: u64,
+    entry_log: Arc<EntryLogStore>,
 }
 
 impl RocksDBManagedLedger {
-    pub(super) fn open(name: &str, db: Arc<DB>) -> Result<Self> {
-        Self::open_with_config(name, db, &ManagedLedgerConfig::default())
+    pub(super) fn open(name: &str, db: Arc<DB>, entry_log: Arc<EntryLogStore>) -> Result<Self> {
+        Self::open_with_config(name, db, entry_log, &ManagedLedgerConfig::default())
     }
 
     pub(super) fn open_with_config(
         name: &str,
         db: Arc<DB>,
+        entry_log: Arc<EntryLogStore>,
         config: &ManagedLedgerConfig,
     ) -> Result<Self> {
         let key = keys::managed_ledger_key(name);
@@ -53,6 +56,7 @@ impl RocksDBManagedLedger {
             name: name.to_string(),
             entries: Self::load_entries(&info, &db)?,
             db,
+            entry_log,
             info,
             max_entries_per_ledger,
         })
@@ -72,7 +76,7 @@ impl RocksDBManagedLedger {
     fn load_entries(
         info: &StoredManagedLedgerInfo,
         db: &DB,
-    ) -> Result<Vec<(ManagedLedgerPosition, Vec<u8>)>> {
+    ) -> Result<Vec<(ManagedLedgerPosition, EntryIndex)>> {
         let mut entries = Vec::new();
 
         for ledger in &info.ledgers {
@@ -86,16 +90,23 @@ impl RocksDBManagedLedger {
                 let Some(entry_id) = suffix.parse::<u64>().ok() else {
                     continue;
                 };
-                let stored_entry: StoredEntry = bincode::deserialize(&value)?;
+                let stored_entry_location: StoredEntryLocation = bincode::deserialize(&value)?;
+                let position = ManagedLedgerPosition {
+                    ledger_id: ledger.ledger_id,
+                    entry_id,
+                    partition: stored_entry_location.partition,
+                };
+                let entry_index = EntryIndex {
+                    ledger_id: ledger.ledger_id,
+                    entry_id,
+                    file_id: stored_entry_location.file_id,
+                    offset: stored_entry_location.offset,
+                    len: stored_entry_location.len,
+                    checksum: stored_entry_location.checksum,
+                    partition: stored_entry_location.partition,
+                };
 
-                entries.push((
-                    ManagedLedgerPosition {
-                        ledger_id: ledger.ledger_id,
-                        entry_id,
-                        partition: stored_entry.partition,
-                    },
-                    stored_entry.payload,
-                ));
+                entries.push((position, entry_index));
             }
         }
 
@@ -128,15 +139,15 @@ impl RocksDBManagedLedger {
             next_info.roll_over_current_ledger(next_ledger_id);
         }
 
-        let stored_entry = StoredEntry {
-            partition,
-            payload: payload.to_vec(),
-        };
+        let entry_index =
+            self.entry_log
+                .append(position.ledger_id, position.entry_id, partition, payload)?;
+        let stored_entry_location = StoredEntryLocation::from(entry_index.clone());
 
         let mut batch = WriteBatch::default();
         batch.put(
             keys::managed_entry_key(position.ledger_id, position.entry_id),
-            bincode::serialize(&stored_entry)?,
+            bincode::serialize(&stored_entry_location)?,
         );
         batch.put(
             keys::managed_ledger_key(&self.name),
@@ -145,7 +156,7 @@ impl RocksDBManagedLedger {
         self.db.write(batch)?;
 
         self.info = next_info;
-        self.entries.push((position.clone(), payload.to_vec()));
+        self.entries.push((position.clone(), entry_index));
 
         Ok(position)
     }
@@ -158,13 +169,23 @@ impl RocksDBManagedLedger {
                     && position.entry_id == message_id.entry
                     && position.partition == message_id.partition
             })
-            .map(|(_, payload)| (message_id.clone(), payload.clone()))
+            .and_then(|(_, index)| {
+                self.entry_log.read(index).ok().and_then(|entry| {
+                    (entry.partition == message_id.partition)
+                        .then_some((message_id.clone(), entry.payload))
+                })
+            })
     }
 
     pub(super) fn messages(&self) -> Vec<(MessageId, Vec<u8>)> {
         self.entries
             .iter()
-            .map(|(position, payload)| (MessageId::from(position), payload.clone()))
+            .filter_map(|(position, index)| {
+                self.entry_log.read(index).ok().and_then(|entry| {
+                    (entry.partition == position.partition)
+                        .then_some((MessageId::from(position), entry.payload))
+                })
+            })
             .collect()
     }
 }
@@ -184,10 +205,14 @@ impl ManagedLedger for RocksDBManagedLedger {
         RocksDBManagedCursor::open(&self.name, name, Arc::clone(&self.db))
     }
 
-    fn read_entry(&self, position: &ManagedLedgerPosition) -> Option<&[u8]> {
+    fn read_entry(&self, position: &ManagedLedgerPosition) -> Option<Vec<u8>> {
         self.entries
             .iter()
             .find(|(stored_position, _)| stored_position == position)
-            .map(|(_, payload)| payload.as_slice())
+            .and_then(|(_, index)| {
+                self.entry_log.read(index).ok().and_then(|entry| {
+                    (entry.partition == position.partition).then_some(entry.payload)
+                })
+            })
     }
 }

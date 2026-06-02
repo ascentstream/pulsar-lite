@@ -10,6 +10,8 @@ use prost::Message;
 use std::path::Path;
 use std::sync::{Arc, Arc as StdArc};
 use std::time::Instant;
+#[cfg(feature = "rocksdb-storage")]
+use tempfile::tempdir;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 fn create_test_storage() -> SharedStorage {
@@ -68,6 +70,30 @@ async fn test_topic_creation() {
     assert_eq!(topic.name, "test-topic");
     assert_eq!(topic.get_producer_count(), 0);
     assert_eq!(topic.get_subscription_count(), 0);
+}
+
+#[cfg(feature = "rocksdb-storage")]
+#[tokio::test]
+async fn persistent_topic_publish_recovers_from_rocksdb() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("broker-topic-storage.db");
+    let topic_name = "persistent://public/default/topic-publish-recovery";
+
+    let message_id = {
+        let storage = StdArc::new(Mutex::new(Storage::new(&db_path).unwrap()));
+        let mut topic = Topic::new(topic_name.to_string(), storage);
+        assert_eq!(topic.runtime_mode(), TopicRuntimeMode::Persistent);
+        topic
+            .publish_message(None, Bytes::from_static(b"payload"))
+            .await
+            .unwrap()
+    };
+
+    let storage = Storage::new(&db_path).unwrap();
+    let messages = storage.get_messages(topic_name);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].0, message_id);
+    assert_eq!(messages[0].1, b"payload".to_vec());
 }
 
 #[tokio::test]

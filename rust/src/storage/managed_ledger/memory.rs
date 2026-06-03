@@ -1,3 +1,8 @@
+use super::cursor_init::{CursorInitOptions, CursorOpenResult, InitialPosition};
+use super::cursor_read::{
+    cursor_subscription_key, first_unacked_from_messages, last_position_from_messages,
+    next_position_single_ledger, read_from_messages,
+};
 use super::{
     ack_shared, is_message_acknowledged, ManagedCursor, ManagedCursorState, ManagedLedger,
     ManagedLedgerConfig, ManagedLedgerFactory, ManagedLedgerPosition, ManagedLedgerStorage,
@@ -19,6 +24,54 @@ impl InMemoryManagedLedgerStorage {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn cursor_key(topic: &str, subscription: &str) -> String {
+        cursor_subscription_key(topic, subscription)
+    }
+
+    fn cursor_exists(&self, key: &str) -> bool {
+        self.cursors.contains_key(key) || self.subscription_cursors.contains_key(key)
+    }
+
+    fn messages(&self, topic: &str) -> Vec<(MessageId, Vec<u8>)> {
+        self.factory.messages(topic).cloned().unwrap_or_default()
+    }
+
+    fn is_acknowledged_inner(
+        &self,
+        topic: &str,
+        subscription: &str,
+        message_id: &MessageId,
+    ) -> bool {
+        let key = Self::cursor_key(topic, subscription);
+
+        if let Some(shared) = self.subscription_cursors.get(&key) {
+            return is_message_acknowledged(Some(shared), message_id.entry);
+        }
+
+        let mark_delete = self.cursors.get(&key).copied().unwrap_or(u64::MAX);
+        mark_delete != u64::MAX && message_id.entry <= mark_delete
+    }
+
+    fn ensure_exclusive_cursor(&mut self, key: &str) {
+        self.cursors.entry(key.to_string()).or_insert(u64::MAX);
+    }
+
+    fn apply_latest_exclusive(&mut self, key: &str, topic: &str) {
+        if let Some(last) = last_position_from_messages(&self.messages(topic)) {
+            self.cursors.insert(key.to_string(), last.entry_id);
+        } else {
+            self.ensure_exclusive_cursor(key);
+        }
+    }
+
+    fn apply_start_message_id_exclusive(&mut self, key: &str, start: &MessageId) {
+        if start.entry > 0 {
+            self.cursors.insert(key.to_string(), start.entry - 1);
+        } else {
+            self.ensure_exclusive_cursor(key);
+        }
+    }
 }
 
 impl ManagedLedgerStorage for InMemoryManagedLedgerStorage {
@@ -31,10 +84,80 @@ impl ManagedLedgerStorage for InMemoryManagedLedgerStorage {
         Ok(self.factory.append_entry(topic, partition, data))
     }
 
-    fn subscribe(&mut self, topic: &str, subscription: &str) -> Result<()> {
-        let key = format!("{}:{}", topic, subscription);
-        self.cursors.entry(key).or_insert(u64::MAX);
+    fn subscribe(&mut self, _topic: &str, _subscription: &str) -> Result<()> {
         Ok(())
+    }
+
+    fn initialize_or_open_cursor(
+        &mut self,
+        topic: &str,
+        subscription: &str,
+        options: CursorInitOptions,
+    ) -> Result<CursorOpenResult> {
+        let key = Self::cursor_key(topic, subscription);
+
+        if self.cursor_exists(&key) {
+            return Ok(CursorOpenResult {
+                created: false,
+                first_unacked: self.first_unacked_position(topic, subscription)?,
+            });
+        }
+
+        if let Some(start_id) = options.start_message_id.as_ref() {
+            self.apply_start_message_id_exclusive(&key, start_id);
+        } else if options.initial_position == InitialPosition::Latest {
+            self.apply_latest_exclusive(&key, topic);
+        } else {
+            self.ensure_exclusive_cursor(&key);
+        }
+
+        Ok(CursorOpenResult {
+            created: true,
+            first_unacked: self.first_unacked_position(topic, subscription)?,
+        })
+    }
+
+    fn first_unacked_position(
+        &self,
+        topic: &str,
+        subscription: &str,
+    ) -> Result<Option<ManagedLedgerPosition>> {
+        let messages = self.messages(topic);
+        Ok(first_unacked_from_messages(&messages, |id| {
+            self.is_acknowledged_inner(topic, subscription, id)
+        }))
+    }
+
+    fn read_from(
+        &self,
+        topic: &str,
+        from: &ManagedLedgerPosition,
+        limit: usize,
+    ) -> Result<Vec<(MessageId, Vec<u8>)>> {
+        let messages = self.messages(topic);
+        Ok(read_from_messages(&messages, from, limit))
+    }
+
+    fn get_last_position(&self, topic: &str) -> Result<Option<ManagedLedgerPosition>> {
+        Ok(last_position_from_messages(&self.messages(topic)))
+    }
+
+    fn get_next_position(
+        &self,
+        topic: &str,
+        current: &ManagedLedgerPosition,
+    ) -> Result<Option<ManagedLedgerPosition>> {
+        let _ = topic;
+        Ok(next_position_single_ledger(current))
+    }
+
+    fn is_acknowledged(
+        &self,
+        topic: &str,
+        subscription: &str,
+        message_id: &MessageId,
+    ) -> Result<bool> {
+        Ok(self.is_acknowledged_inner(topic, subscription, message_id))
     }
 
     fn get_next_unassigned_message(
@@ -305,5 +428,58 @@ mod tests {
         assert_eq!(found.0, msg1);
         assert_eq!(found.1, b"1".to_vec());
         assert_eq!(msg0.entry, 0);
+    }
+
+    #[test]
+    fn first_unacked_skips_individual_deleted_hole() {
+        let mut storage = InMemoryManagedLedgerStorage::new();
+        let topic = "persistent://public/default/hole";
+        let sub = "sub";
+
+        storage.create_topic(topic).unwrap();
+        storage
+            .initialize_or_open_cursor(
+                topic,
+                sub,
+                CursorInitOptions {
+                    initial_position: InitialPosition::Earliest,
+                    start_message_id: None,
+                },
+            )
+            .unwrap();
+
+        let msg0 = storage.append_message(topic, -1, b"0").unwrap();
+        storage.append_message(topic, -1, b"1").unwrap();
+        let msg2 = storage.append_message(topic, -1, b"2").unwrap();
+
+        storage.ack_message_shared(topic, sub, msg0).unwrap();
+        storage.ack_message_shared(topic, sub, msg2).unwrap();
+
+        let first = storage.first_unacked_position(topic, sub).unwrap().unwrap();
+        assert_eq!(first.entry_id, 1);
+    }
+
+    #[test]
+    fn latest_skips_existing_backlog_on_new_cursor() {
+        let mut storage = InMemoryManagedLedgerStorage::new();
+        let topic = "persistent://public/default/latest";
+        let sub = "sub";
+
+        storage.create_topic(topic).unwrap();
+        storage.append_message(topic, -1, b"old").unwrap();
+
+        let result = storage
+            .initialize_or_open_cursor(
+                topic,
+                sub,
+                CursorInitOptions {
+                    initial_position: InitialPosition::Latest,
+                    start_message_id: None,
+                },
+            )
+            .unwrap();
+
+        assert!(result.created);
+        assert!(result.first_unacked.is_none());
     }
 }

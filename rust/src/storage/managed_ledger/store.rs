@@ -1,4 +1,7 @@
-use super::{InMemoryManagedLedgerStorage, ManagedLedgerStorage, MessageId};
+use super::{
+    CursorInitOptions, CursorOpenResult, InMemoryManagedLedgerStorage, ManagedLedgerPosition,
+    ManagedLedgerStorage, MessageId,
+};
 #[cfg(feature = "rocksdb-storage")]
 use crate::storage::rocksdb::RocksDbManagedLedgerStorage;
 use anyhow::Result;
@@ -49,6 +52,77 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
             Self::Memory(inner) => inner.subscribe(topic, subscription),
             #[cfg(feature = "rocksdb-storage")]
             Self::RocksDb(inner) => inner.subscribe(topic, subscription),
+        }
+    }
+
+    fn initialize_or_open_cursor(
+        &mut self,
+        topic: &str,
+        subscription: &str,
+        options: CursorInitOptions,
+    ) -> Result<CursorOpenResult> {
+        match self {
+            Self::Memory(inner) => inner.initialize_or_open_cursor(topic, subscription, options),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(inner) => inner.initialize_or_open_cursor(topic, subscription, options),
+        }
+    }
+
+    fn first_unacked_position(
+        &self,
+        topic: &str,
+        subscription: &str,
+    ) -> Result<Option<ManagedLedgerPosition>> {
+        match self {
+            Self::Memory(inner) => inner.first_unacked_position(topic, subscription),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(inner) => inner.first_unacked_position(topic, subscription),
+        }
+    }
+
+    fn read_from(
+        &self,
+        topic: &str,
+        from: &ManagedLedgerPosition,
+        limit: usize,
+    ) -> Result<Vec<(MessageId, Vec<u8>)>> {
+        match self {
+            Self::Memory(inner) => inner.read_from(topic, from, limit),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(inner) => inner.read_from(topic, from, limit),
+        }
+    }
+
+    fn get_last_position(&self, topic: &str) -> Result<Option<ManagedLedgerPosition>> {
+        match self {
+            Self::Memory(inner) => inner.get_last_position(topic),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(inner) => inner.get_last_position(topic),
+        }
+    }
+
+    fn get_next_position(
+        &self,
+        topic: &str,
+        current: &ManagedLedgerPosition,
+    ) -> Result<Option<ManagedLedgerPosition>> {
+        match self {
+            Self::Memory(inner) => inner.get_next_position(topic, current),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(inner) => inner.get_next_position(topic, current),
+        }
+    }
+
+    fn is_acknowledged(
+        &self,
+        topic: &str,
+        subscription: &str,
+        message_id: &MessageId,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(inner) => inner.is_acknowledged(topic, subscription, message_id),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(inner) => inner.is_acknowledged(topic, subscription, message_id),
         }
     }
 

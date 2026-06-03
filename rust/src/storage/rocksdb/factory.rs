@@ -1,3 +1,4 @@
+use super::keys;
 use super::ledger::RocksDBManagedLedger;
 use anyhow::Result;
 use rocksdb::DB;
@@ -18,6 +19,13 @@ impl RocksDBManagedLedgerFactory {
 
     pub(super) fn open_ledger(&self, name: &str) -> Result<RocksDBManagedLedger> {
         RocksDBManagedLedger::open(name, Arc::clone(&self.db), Arc::clone(&self.entry_log))
+    }
+
+    pub(super) fn cursor_state_exists(&self, ledger_name: &str, cursor_name: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .get(keys::managed_cursor_key(ledger_name, cursor_name))?
+            .is_some())
     }
 
     fn open_ledger_with_config(

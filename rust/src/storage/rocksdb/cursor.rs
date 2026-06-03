@@ -32,7 +32,7 @@ impl RocksDBManagedCursor {
         })
     }
 
-    fn persist_state(&self) -> Result<()> {
+    pub(super) fn persist_state(&self) -> Result<()> {
         let key = keys::managed_cursor_key(&self.managedledger_name, &self.name);
         let stored = StoredManagedCursorState::from(self.state.clone());
         self.db.put(key, stored.encode_to_vec())?;
@@ -82,7 +82,7 @@ fn first_position(info: &StoredManagedLedgerInfo, partition: i32) -> Option<Mana
         })
 }
 
-fn next_position(
+pub(super) fn next_position(
     position: &ManagedLedgerPosition,
     info: &StoredManagedLedgerInfo,
 ) -> Option<ManagedLedgerPosition> {

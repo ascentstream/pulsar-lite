@@ -7,6 +7,8 @@
 
 mod config;
 mod cursor;
+mod cursor_init;
+mod cursor_read;
 mod factory;
 mod ledger;
 mod memory;
@@ -18,6 +20,7 @@ pub use config::ManagedLedgerConfig;
 pub use cursor::{
     ack_shared, is_message_acknowledged, ManagedCursor, ManagedCursorState, SubscriptionCursor,
 };
+pub use cursor_init::{CursorInitOptions, CursorOpenResult, InitialPosition};
 pub use factory::ManagedLedgerFactory;
 pub use ledger::ManagedLedger;
 pub use memory::{
@@ -27,3 +30,8 @@ pub use memory::{
 pub use storage::ManagedLedgerStorage;
 pub use store::ManagedLedgerStore;
 pub use types::{ManagedLedgerPosition, MessageId, NonPersistentEntry};
+
+#[cfg(feature = "rocksdb-storage")]
+pub(crate) use cursor_read::{
+    first_unacked_from_messages, last_position_from_messages, read_from_messages,
+};

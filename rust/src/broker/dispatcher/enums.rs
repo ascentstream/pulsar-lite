@@ -7,6 +7,7 @@ use super::traits::Dispatcher;
 use super::{ExclusiveDispatcher, FailoverDispatcher, SharedDispatcher};
 use crate::broker::service::topic::SubscriptionType;
 use crate::broker::service::{Consumer, SharedStorage};
+use crate::storage::ManagedLedgerPosition;
 use std::sync::Arc;
 
 /// Dispatcher enum - holds the concrete dispatcher implementation
@@ -60,6 +61,14 @@ impl DispatcherEnum {
             DispatcherEnum::Exclusive(d) => d.remove_consumer(consumer_id),
             DispatcherEnum::Shared(d) => d.remove_consumer(consumer_id),
             DispatcherEnum::Failover(d) => d.remove_consumer(consumer_id),
+        }
+    }
+
+    pub fn init_read_position(&self, pos: Option<ManagedLedgerPosition>) {
+        match self {
+            DispatcherEnum::Exclusive(d) => d.init_read_position(pos),
+            DispatcherEnum::Shared(d) => d.init_read_position(pos),
+            DispatcherEnum::Failover(d) => d.init_read_position(pos),
         }
     }
 

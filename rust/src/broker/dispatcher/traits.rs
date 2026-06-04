@@ -6,6 +6,7 @@
 
 use crate::broker::service::topic::SubscriptionType;
 use crate::broker::service::{Consumer, SharedStorage};
+use crate::storage::ManagedLedgerPosition;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -25,6 +26,9 @@ pub trait Dispatcher: Send + Sync {
 
     /// Remove a consumer from this dispatcher
     fn remove_consumer(&mut self, consumer_id: u64) -> Option<Arc<Consumer>>;
+
+    /// Initialize the persistent read position for this dispatcher.
+    fn init_read_position(&self, pos: Option<ManagedLedgerPosition>);
 
     // ==================== Flow Control ====================
 

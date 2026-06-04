@@ -5,11 +5,13 @@
  * Consistent with Apache Pulsar's PersistentDispatcherMultipleConsumers in Failover mode
  */
 
+use super::read_position::{commit_read_position, next_unacked_candidate};
 use crate::broker::dispatcher::Dispatcher;
 use crate::broker::service::topic::SubscriptionType;
 use crate::broker::service::{Consumer, SharedStorage};
+use crate::storage::ManagedLedgerPosition;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Consistent with Apache Pulsar: dispatcherMaxRoundRobinBatchSize = 20
 const DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE: u32 = 20;
@@ -21,6 +23,9 @@ pub struct FailoverDispatcher {
 
     /// Total available permits for primary consumer
     total_available_permits: AtomicU32,
+
+    /// Next managed-ledger position to read from.
+    read_position: RwLock<Option<ManagedLedgerPosition>>,
 }
 
 impl FailoverDispatcher {
@@ -29,6 +34,7 @@ impl FailoverDispatcher {
         Self {
             consumers: Vec::new(),
             total_available_permits: AtomicU32::new(0),
+            read_position: RwLock::new(None),
         }
     }
 }
@@ -70,6 +76,10 @@ impl Dispatcher for FailoverDispatcher {
         }
     }
 
+    fn init_read_position(&self, pos: Option<ManagedLedgerPosition>) {
+        *self.read_position.write().unwrap() = pos;
+    }
+
     fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {
         if let Some(_consumer) = self.consumers.iter().find(|c| c.consumer_id == consumer_id) {
             self.total_available_permits
@@ -106,22 +116,26 @@ impl Dispatcher for FailoverDispatcher {
                 }
                 self.total_available_permits.fetch_sub(1, Ordering::Relaxed);
 
-                let message_opt = {
-                    let mut guard = storage.lock().await;
-                    guard.get_next_unassigned_message(
-                        &topic,
-                        &subscription,
-                        primary_consumer.consumer_id,
-                    )?
-                };
+                let candidate = next_unacked_candidate(
+                    storage.clone(),
+                    &topic,
+                    &subscription,
+                    &self.read_position,
+                )
+                .await?;
 
-                if let Some((message_id, payload)) = message_opt {
+                if let Some(candidate) = candidate {
                     if primary_consumer
-                        .enqueue_message(message_id, Vec::new(), payload.clone())
+                        .enqueue_message(
+                            candidate.message_id,
+                            Vec::new(),
+                            candidate.payload.clone(),
+                        )
                         .await
                     {
+                        commit_read_position(&self.read_position, candidate.next_position);
                         primary_consumer
-                            .record_message_dispatched(payload.len())
+                            .record_message_dispatched(candidate.payload.len())
                             .await;
                         dispatched += 1;
                     } else {

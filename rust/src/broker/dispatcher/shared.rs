@@ -4,10 +4,11 @@
  * Consistent with Apache Pulsar's PersistentDispatcherMultipleConsumers
  */
 
+use super::read_position::{commit_read_position, next_unacked_candidate};
 use crate::broker::dispatcher::Dispatcher;
 use crate::broker::service::topic::SubscriptionType;
 use crate::broker::service::{Consumer, SharedStorage};
-use crate::storage::MessageId;
+use crate::storage::{ManagedLedgerPosition, MessageId};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -37,6 +38,9 @@ pub struct SharedDispatcher {
     // Pending messages to redeliver (ordered for debugging)
     // When a Consumer disconnects, its held messages are added to this queue
     messages_to_redeliver: Arc<RwLock<BTreeMap<MessageId, u32>>>,
+
+    /// Next managed-ledger position to read from for new dispatches.
+    read_position: RwLock<Option<ManagedLedgerPosition>>,
 }
 
 impl SharedDispatcher {
@@ -49,6 +53,7 @@ impl SharedDispatcher {
             total_available_permits: AtomicU32::new(0),
             dispatch_in_progress: AtomicBool::new(false),
             messages_to_redeliver: Arc::new(RwLock::new(BTreeMap::new())),
+            read_position: RwLock::new(None),
         }
     }
 
@@ -321,11 +326,12 @@ impl SharedDispatcher {
                 .get_next_dispatchable_message(storage.clone(), &topic, &subscription)
                 .await?;
 
-            if let Some((message_id, payload)) = message_opt {
+            if let Some((message_id, payload, next_position)) = message_opt {
                 if consumer
                     .send_message(message_id.clone(), Vec::new(), payload.clone(), 0)
                     .await
                 {
+                    commit_read_position(&self.read_position, next_position);
                     consumer.record_message_dispatched(payload.len()).await;
                     dispatched += 1;
 
@@ -336,6 +342,7 @@ impl SharedDispatcher {
                     );
                 } else {
                     self.add_to_redelivery_queue(vec![(message_id, 0)]);
+                    commit_read_position(&self.read_position, next_position);
                     consumer.add_permits(1).await;
                     self.total_available_permits.fetch_add(1, Ordering::Relaxed);
                 }
@@ -401,29 +408,29 @@ impl SharedDispatcher {
         storage: SharedStorage,
         topic: &str,
         subscription: &str,
-    ) -> Result<Option<(MessageId, Vec<u8>)>, Box<dyn std::error::Error + Send + Sync>> {
-        let messages = {
-            let guard = storage.lock().await;
-            guard.get_messages(topic)
-        };
-
-        for (message_id, payload) in messages {
-            let already_acked = {
-                let guard = storage.lock().await;
-                guard.is_acknowledged_shared(topic, subscription, &message_id)
+    ) -> Result<
+        Option<(MessageId, Vec<u8>, ManagedLedgerPosition)>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        loop {
+            let Some(candidate) =
+                next_unacked_candidate(storage.clone(), topic, subscription, &self.read_position)
+                    .await?
+            else {
+                return Ok(None);
             };
-            if already_acked {
+
+            if self.is_message_pending(&candidate.message_id).await {
+                commit_read_position(&self.read_position, candidate.next_position);
                 continue;
             }
 
-            if self.is_message_pending(&message_id).await {
-                continue;
-            }
-
-            return Ok(Some((message_id, payload)));
+            return Ok(Some((
+                candidate.message_id,
+                candidate.payload,
+                candidate.next_position,
+            )));
         }
-
-        Ok(None)
     }
 
     pub async fn remove_consumer_with_recovery(
@@ -493,6 +500,10 @@ impl Dispatcher for SharedDispatcher {
             self.remove_consumer_order(consumer_id);
         }
         consumer
+    }
+
+    fn init_read_position(&self, pos: Option<ManagedLedgerPosition>) {
+        *self.read_position.write().unwrap() = pos;
     }
 
     fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {

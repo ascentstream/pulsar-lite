@@ -7,7 +7,7 @@ use super::traits::Dispatcher;
 use super::{ExclusiveDispatcher, FailoverDispatcher, SharedDispatcher};
 use crate::broker::service::topic::SubscriptionType;
 use crate::broker::service::{Consumer, SharedStorage};
-use crate::storage::ManagedLedgerPosition;
+use crate::storage::{ManagedLedgerPosition, MessageId};
 use std::sync::Arc;
 
 /// Dispatcher enum - holds the concrete dispatcher implementation
@@ -123,6 +123,14 @@ impl DispatcherEnum {
             DispatcherEnum::Exclusive(d) => d.dispatch_messages(storage, topic, subscription).await,
             DispatcherEnum::Shared(d) => d.dispatch_messages(storage, topic, subscription).await,
             DispatcherEnum::Failover(d) => d.dispatch_messages(storage, topic, subscription).await,
+        }
+    }
+
+    /// Called after storage acknowledges a message
+    pub fn on_message_acknowledged(&mut self, message_id: &MessageId) {
+        match self {
+            DispatcherEnum::Shared(d) => d.on_message_acknowledged(message_id),
+            DispatcherEnum::Exclusive(_) | DispatcherEnum::Failover(_) => {}
         }
     }
 }

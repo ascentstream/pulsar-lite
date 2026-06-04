@@ -6,10 +6,10 @@
 use crate::broker::broker_service::{SharedBrokerService, TopicRef};
 use crate::broker::service::consumer::PendingMessage;
 use crate::broker::service::topic::{
-    KeySharedHashRange, KeySharedMode, KeySharedPolicy, SubscriptionType,
+    AckCommandType, KeySharedHashRange, KeySharedMode, KeySharedPolicy, SubscriptionType,
 };
 use crate::broker::service::ConnectionWriteState;
-use crate::broker::service::{Consumer, SharedStorage};
+use crate::broker::service::Consumer;
 use crate::protocol::codec::{proto::pulsar::BaseCommand, PulsarFrameCodec};
 use crate::protocol::ServerCommand;
 use crate::storage::{CursorInitOptions, InitialPosition, MessageId};
@@ -207,17 +207,11 @@ pub async fn handle_flow(
     Ok(())
 }
 
-/// Handle Ack command - Message acknowledgment (Apache Pulsar style)
-///
-/// For Shared subscription:
-/// 1. Validate that the message belongs to this consumer
-/// 2. Remove from pending_acks
-/// 3. Update storage cursor using ack_message_shared()
+/// Handle Ack command
 pub async fn handle_ack<T>(
     framed: &mut Framed<T, PulsarFrameCodec>,
     cmd: BaseCommand,
     consumers: &HashMap<u64, Arc<Consumer>>,
-    storage: SharedStorage,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -229,118 +223,52 @@ where
         ack_cmd.ack_type
     );
 
-    // Get consumer (Apache Pulsar style - directly from consumers map)
     let consumer = consumers
         .get(&ack_cmd.consumer_id)
         .ok_or_else(|| format!("Unknown consumer ID: {}", ack_cmd.consumer_id))?;
 
-    // Acknowledge message (Apache Pulsar style)
-    if let Some(message_id) = ack_cmd.message_id.first() {
-        // Pulsar protocol defaults non-partitioned message ids to partition = -1.
-        // Keep the protocol/broker boundary aligned so Shared ownership can be
-        // checked using the full MessageId instead of falling back to partial matching.
-        let protocol_msg_id = crate::storage::MessageId {
-            ledger: message_id.ledger_id,
-            entry: message_id.entry_id,
-            partition: message_id.partition.unwrap_or(-1),
-        };
+    let ack_type = AckCommandType::from_proto(ack_cmd.ack_type as i32);
+    let message_ids: Vec<MessageId> = ack_cmd
+        .message_id
+        .iter()
+        .map(|id| MessageId {
+            ledger: id.ledger_id,
+            entry: id.entry_id,
+            partition: id.partition.unwrap_or(-1),
+        })
+        .collect();
 
-        let subscription = consumer.get_subscription();
-        let (sub_type, is_non_persistent, subscription_consumers) = {
-            let sub_guard = subscription.read().await;
-            (
-                sub_guard.get_sub_type(),
-                sub_guard.is_non_persistent(),
-                sub_guard.get_consumers(),
-            )
-        };
+    if message_ids.is_empty() {
+        return Ok(());
+    }
 
-        if matches!(
-            sub_type,
-            SubscriptionType::Shared | SubscriptionType::KeyShared
-        ) {
-            let ack_owner = if consumer.has_pending_ack(&protocol_msg_id).await {
-                Some(consumer.clone())
-            } else {
-                let mut owner = None;
-                for candidate in subscription_consumers {
-                    if candidate.consumer_id != consumer.consumer_id
-                        && candidate.has_pending_ack(&protocol_msg_id).await
-                    {
-                        owner = Some(candidate);
-                        break;
-                    }
-                }
-                owner
-            };
+    consumer
+        .clone()
+        .message_acked(ack_type, message_ids.clone())
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-            if let Some(owner_consumer) = ack_owner {
-                let removed = owner_consumer.remove_pending_ack(&protocol_msg_id).await;
-
-                if removed {
-                    owner_consumer.record_message_acked().await;
-
-                    if !is_non_persistent {
-                        let mut guard = storage.lock().await;
-                        let topic_name = consumer.get_topic_name();
-                        let sub_name = consumer.get_subscription_name();
-                        guard.ack_message_shared(
-                            &topic_name,
-                            &sub_name,
-                            protocol_msg_id.clone(),
-                        )?;
-                    }
-                } else {
-                    log::warn!(
-                        "Consumer {} found owner {} for message {}:{}:{} but pending ack removal failed; ignoring ack",
-                        ack_cmd.consumer_id,
-                        owner_consumer.consumer_id,
-                        protocol_msg_id.ledger,
-                        protocol_msg_id.entry,
-                        protocol_msg_id.partition
-                    );
-                }
-            } else {
-                log::warn!(
-                    "Consumer {} attempted to ack message {}:{}:{} without ownership; ignoring ack",
-                    ack_cmd.consumer_id,
-                    protocol_msg_id.ledger,
-                    protocol_msg_id.entry,
-                    protocol_msg_id.partition
-                );
-            }
-        } else {
-            consumer.ack_message(protocol_msg_id.clone()).await;
-
-            if !is_non_persistent {
-                let mut guard = storage.lock().await;
-                let topic_name = consumer.get_topic_name();
-                let sub_name = consumer.get_subscription_name();
-                guard.ack_message(&topic_name, &sub_name, protocol_msg_id)?;
-            }
-        }
-
+    if let Some(first) = message_ids.first() {
         log::info!(
             "Message {}:{} acknowledged for consumer {}",
-            message_id.ledger_id,
-            message_id.entry_id,
+            first.ledger,
+            first.entry,
             ack_cmd.consumer_id
         );
+    }
 
-        // Only send AckResponse when Ack command includes request_id
-        if let Some(request_id) = ack_cmd.request_id {
-            let response = ServerCommand::AckResponse {
-                consumer_id: ack_cmd.consumer_id,
-                request_id,
-            };
+    if let Some(request_id) = ack_cmd.request_id {
+        let response = ServerCommand::AckResponse {
+            consumer_id: ack_cmd.consumer_id,
+            request_id,
+        };
 
-            framed.send(response).await?;
-            log::debug!(
-                "Sent AckResponse for consumer {} with request_id {}",
-                ack_cmd.consumer_id,
-                request_id
-            );
-        }
+        framed.send(response).await?;
+        log::debug!(
+            "Sent AckResponse for consumer {} with request_id {}",
+            ack_cmd.consumer_id,
+            request_id
+        );
     }
 
     Ok(())
@@ -410,6 +338,7 @@ mod tests {
     use super::*;
     use crate::broker::broker_service::{BrokerService, TopicRef};
     use crate::broker::service::topic::{KeySharedMode, TopicRuntimeMode};
+    use crate::broker::service::SharedStorage;
     use crate::protocol::codec::proto::pulsar::{
         base_command, CommandAck, CommandSubscribe, IntRange, KeySharedMeta, KeyValue,
         MessageIdData,
@@ -640,7 +569,6 @@ mod tests {
             &mut server_framed,
             build_ack_command(consumer.consumer_id, 0, 0, -1),
             &consumers,
-            storage.clone(),
         )
         .await
         .unwrap();
@@ -724,7 +652,6 @@ mod tests {
             &mut server_framed,
             build_ack_command(consumer.consumer_id, 0, 0, -1),
             &consumers,
-            storage.clone(),
         )
         .await
         .unwrap();

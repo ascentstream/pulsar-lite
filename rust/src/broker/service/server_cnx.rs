@@ -101,9 +101,6 @@ where
     /// Connection ID (unique identifier for this connection)
     connection_id: String,
 
-    /// Shared storage reference
-    storage: SharedStorage,
-
     /// Topic manager reference
     topic_manager: SharedBrokerService,
     /// Number of in-flight non-persistent publish tasks spawned from this connection.
@@ -151,7 +148,7 @@ where
     /// Create a new ServerCnx
     pub fn new(
         socket: T,
-        storage: SharedStorage,
+        _storage: SharedStorage,
         topic_manager: SharedBrokerService,
         connection_id: String,
         keep_alive_interval: Duration,
@@ -189,7 +186,6 @@ where
             message_tx,
             connection_write_state,
             connection_id,
-            storage,
             topic_manager,
             pending_send_requests: 0,
             max_concurrent_non_persistent,
@@ -681,7 +677,7 @@ where
     }
 
     async fn handle_ack(&mut self, cmd: BaseCommand) -> CnxResult<()> {
-        handler::handle_ack(&mut self.framed, cmd, &self.consumers, self.storage.clone())
+        handler::handle_ack(&mut self.framed, cmd, &self.consumers)
             .await
             .map_err(to_cnx_error)
     }

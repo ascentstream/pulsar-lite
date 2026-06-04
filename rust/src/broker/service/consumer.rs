@@ -9,14 +9,12 @@ use std::sync::{
     Arc,
 };
 
-use super::topic::SubscriptionType;
 use super::ConnectionWriteState;
 use super::{PendingAck, PendingAcksMap};
 use tokio::sync::{mpsc, RwLock};
 
 use super::topic::KeySharedPolicy;
-/// Forward declaration for Subscription type
-use super::topic::Subscription;
+use super::topic::{AckCommandType, Subscription, SubscriptionType};
 use crate::storage::MessageId;
 
 /// Consumer statistics
@@ -628,11 +626,7 @@ impl Consumer {
         // For now, the dispatcher will be called from the handler
     }
 
-    /// Acknowledge a message
-    ///
-    /// This method:
-    /// 1. Records the acknowledgment in stats
-    /// 2. (Future) Updates subscription cursor
+    /// Record consumer-level ack stats (Exclusive/Failover path).
     pub async fn ack_message(&self, message_id: crate::storage::MessageId) {
         log::debug!(
             "Consumer {} acking message {}:{}",
@@ -640,13 +634,105 @@ impl Consumer {
             message_id.ledger,
             message_id.entry
         );
-
-        // Record in stats
         self.record_message_acked().await;
+    }
 
-        // TODO: Update subscription cursor (Apache Pulsar style)
-        // In Pulsar, this would call subscription.acknowledgeMessage()
-        // For now, the actual ack is handled in the handler through storage
+    /// Handle `CommandAck` at the consumer layer
+    ///
+    /// - Shared/KeyShared: resolve pending owner, update stats, then cursor ack on subscription.
+    /// - Exclusive/Failover: stats here; cursor ack on subscription for persistent topics.
+    pub async fn message_acked(
+        self: Arc<Self>,
+        ack_type: AckCommandType,
+        message_ids: Vec<MessageId>,
+    ) -> Result<(), String> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+
+        let (sub_type, is_persistent) = {
+            let sub = self.subscription.read().await;
+            (sub.get_sub_type(), sub.is_persistent())
+        };
+
+        match sub_type {
+            SubscriptionType::Shared | SubscriptionType::KeyShared => {
+                if ack_type == AckCommandType::Cumulative {
+                    log::warn!(
+                        "Consumer {} sent cumulative ack on Shared subscription; ignoring",
+                        self.consumer_id
+                    );
+                    return Ok(());
+                }
+
+                let mut acked_for_storage = Vec::with_capacity(message_ids.len());
+                for message_id in &message_ids {
+                    let Some(owner) = self.resolve_ack_owner(message_id).await else {
+                        log::warn!(
+                            "Consumer {} attempted to ack message {}:{} without ownership; ignoring",
+                            self.consumer_id,
+                            message_id.ledger,
+                            message_id.entry
+                        );
+                        continue;
+                    };
+
+                    if !owner.remove_pending_ack(message_id).await {
+                        log::warn!(
+                            "Consumer {} found owner {} for message {}:{} but pending ack removal failed; ignoring",
+                            self.consumer_id,
+                            owner.consumer_id,
+                            message_id.ledger,
+                            message_id.entry
+                        );
+                        continue;
+                    }
+
+                    owner.record_message_acked().await;
+                    acked_for_storage.push(message_id.clone());
+                }
+
+                if is_persistent && !acked_for_storage.is_empty() {
+                    self.subscription
+                        .write()
+                        .await
+                        .acknowledge_message(&acked_for_storage, ack_type)
+                        .await?;
+                }
+            }
+            SubscriptionType::Exclusive | SubscriptionType::Failover => {
+                for message_id in &message_ids {
+                    self.ack_message(message_id.clone()).await;
+                }
+
+                if is_persistent {
+                    self.subscription
+                        .write()
+                        .await
+                        .acknowledge_message(&message_ids, ack_type)
+                        .await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn resolve_ack_owner(self: &Arc<Self>, message_id: &MessageId) -> Option<Arc<Consumer>> {
+        if self.has_pending_ack(message_id).await {
+            return Some(Arc::clone(self));
+        }
+
+        let sub = self.subscription.read().await;
+        for candidate in sub.get_consumers() {
+            if candidate.consumer_id != self.consumer_id
+                && candidate.has_pending_ack(message_id).await
+            {
+                return Some(candidate);
+            }
+        }
+
+        None
     }
 }
 

@@ -482,4 +482,30 @@ mod tests {
         assert!(result.created);
         assert!(result.first_unacked.is_none());
     }
+
+    #[test]
+    fn start_message_id_positions_new_cursor_at_requested_message() {
+        let mut storage = InMemoryManagedLedgerStorage::new();
+        let topic = "persistent://public/default/start-message-id";
+        let sub = "sub";
+
+        storage.create_topic(topic).unwrap();
+        storage.append_message(topic, -1, b"before").unwrap();
+        let start = storage.append_message(topic, -1, b"start").unwrap();
+        storage.append_message(topic, -1, b"after").unwrap();
+
+        let result = storage
+            .initialize_or_open_cursor(
+                topic,
+                sub,
+                CursorInitOptions {
+                    initial_position: InitialPosition::Latest,
+                    start_message_id: Some(start.clone()),
+                },
+            )
+            .unwrap();
+
+        assert!(result.created);
+        assert_eq!(result.first_unacked.unwrap().entry_id, start.entry);
+    }
 }

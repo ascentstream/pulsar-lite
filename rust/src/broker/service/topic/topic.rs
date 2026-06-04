@@ -8,7 +8,7 @@ use super::{
 };
 
 use crate::broker::service::{Consumer, Producer, SharedStorage};
-use crate::storage::{MessageId, NonPersistentEntry, Storage};
+use crate::storage::{CursorInitOptions, MessageId, NonPersistentEntry, Storage};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::fmt;
@@ -359,6 +359,7 @@ impl Topic {
             sub_type,
             HashMap::new(),
             None,
+            CursorInitOptions::default(),
         )
         .await
     }
@@ -369,16 +370,32 @@ impl Topic {
         sub_type: SubscriptionType,
         properties: HashMap<String, String>,
         key_shared_policy: Option<KeySharedPolicy>,
+        cursor_options: CursorInitOptions,
     ) -> Result<SharedSubscription, String> {
         if !self.subscriptions.contains_key(subscription_name) {
-            if self.runtime_mode == TopicRuntimeMode::Persistent {
-                {
-                    let mut guard = self.storage.lock().await;
-                    if let Err(e) = guard.subscribe(&self.name, subscription_name) {
-                        return Err(format!("Failed to create subscription in storage: {}", e));
-                    }
+            let cursor_result = if self.runtime_mode == TopicRuntimeMode::Persistent {
+                let mut guard = self.storage.lock().await;
+                if let Err(e) = guard.resources_mut().ensure_subscription(
+                    &self.name,
+                    subscription_name,
+                    Storage::METADATA_VERSION,
+                ) {
+                    log::warn!(
+                        "Skipping metadata persistence for subscription '{}' on topic '{}': {}",
+                        subscription_name,
+                        self.name,
+                        e
+                    );
                 }
-            }
+
+                Some(
+                    guard
+                        .initialize_or_open_cursor(&self.name, subscription_name, cursor_options)
+                        .map_err(|e| format!("Failed to initialize cursor in storage: {}", e))?,
+                )
+            } else {
+                None
+            };
 
             // Create Subscription object wrapped in Arc<RwLock>
             let subscription = Arc::new(RwLock::new(Subscription::new_with_options(
@@ -393,6 +410,12 @@ impl Topic {
                 key_shared_policy,
                 self.storage.clone(),
             )));
+            if let Some(cursor_result) = cursor_result {
+                subscription
+                    .write()
+                    .await
+                    .set_pending_first_unacked(cursor_result.first_unacked);
+            }
             self.subscriptions
                 .insert(subscription_name.to_string(), subscription.clone());
 

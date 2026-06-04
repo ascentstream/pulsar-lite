@@ -18,3 +18,6 @@ pub use topic::{
     SharedSubscription, Topic, TopicPublishRate, TopicPublishRateExceeded, TopicRuntimeMode,
     TopicStats,
 };
+
+#[cfg(test)]
+mod tests;

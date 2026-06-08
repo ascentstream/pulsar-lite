@@ -11,6 +11,7 @@ use crate::storage::{
 };
 use prost::Message;
 use rocksdb::{Options, DB};
+use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -61,6 +62,12 @@ fn entrylog_appends_and_reads_entry_payload() {
     assert_eq!(index.partition, 2);
     assert_eq!(entry.partition, 2);
     assert_eq!(entry.payload, b"payload");
+    assert!(dir.path().join("entrylog").join("0.log").exists());
+    assert!(!dir
+        .path()
+        .join("entrylog")
+        .join("entrylog-00000000000000000000.log")
+        .exists());
 }
 
 #[test]
@@ -124,6 +131,68 @@ fn entrylog_reopen_allocates_next_file_id() {
 }
 
 #[test]
+fn entrylog_reopen_uses_decimal_log_file_ids() {
+    let dir = tempdir().unwrap();
+    let entrylog_dir = dir.path().join("entrylog");
+    fs::create_dir_all(&entrylog_dir).unwrap();
+    fs::write(entrylog_dir.join("9.log"), b"").unwrap();
+    fs::write(entrylog_dir.join("10.log"), b"").unwrap();
+
+    let store = EntryLogStore::open(dir.path()).unwrap();
+    let index = store.append(7, 0, -1, b"payload").unwrap();
+
+    assert_eq!(index.file_id, 11);
+    assert!(entrylog_dir.join("11.log").exists());
+}
+
+#[test]
+fn entrylog_reads_legacy_zero_padded_log_file_names() {
+    let dir = tempdir().unwrap();
+    let store = EntryLogStore::open(dir.path()).unwrap();
+    let index = store.append(7, 0, -1, b"legacy").unwrap();
+    let entrylog_dir = dir.path().join("entrylog");
+
+    fs::rename(
+        entrylog_dir.join("0.log"),
+        entrylog_dir.join("entrylog-00000000000000000000.log"),
+    )
+    .unwrap();
+
+    assert_eq!(store.read(&index).unwrap().payload, b"legacy");
+}
+
+#[test]
+fn entrylog_rolls_over_when_configured_limit_is_exceeded() {
+    let dir = tempdir().unwrap();
+    let store = EntryLogStore::open_with_log_size_limit(dir.path(), 88).unwrap();
+
+    let first = store.append(7, 0, -1, &[1; 40]).unwrap();
+    let second = store.append(7, 1, -1, &[2; 40]).unwrap();
+
+    assert_eq!(first.file_id, 0);
+    assert_eq!(second.file_id, 1);
+    assert!(dir.path().join("entrylog").join("0.log").exists());
+    assert!(dir.path().join("entrylog").join("1.log").exists());
+}
+
+#[test]
+fn entrylog_allows_single_entry_larger_than_configured_limit() {
+    let dir = tempdir().unwrap();
+    let store = EntryLogStore::open_with_log_size_limit(dir.path(), 16).unwrap();
+
+    let first = store.append(7, 0, -1, &[1; 40]).unwrap();
+    let second = store.append(7, 1, -1, b"next").unwrap();
+
+    assert_eq!(first.file_id, 0);
+    assert_eq!(second.file_id, 1);
+}
+
+#[test]
+fn entrylog_default_size_limit_matches_bookkeeper_like_threshold() {
+    assert_eq!(EntryLogStore::default_log_size_limit(), 1536 * 1024 * 1024);
+}
+
+#[test]
 fn managed_metadata_keys_follow_pulsar_path_shape() {
     assert_eq!(
         keys::managed_ledger_key("tenant/namespace/persistent/topic"),
@@ -137,14 +206,7 @@ fn managed_metadata_keys_follow_pulsar_path_shape() {
 
 #[test]
 fn entry_keys_follow_bookkeeper_style_ledger_entry_lookup() {
-    assert_eq!(
-        keys::managed_entry_key(42, 7),
-        b"entry|00000000000000000042|00000000000000000007".to_vec()
-    );
-    assert_eq!(
-        keys::managed_entry_prefix(42),
-        b"entry|00000000000000000042|".to_vec()
-    );
+    assert_eq!(keys::managed_entry_key(42, 7), b"entry|42|7".to_vec());
 }
 
 #[test]
@@ -299,6 +361,33 @@ fn managed_ledger_entry_recovers_after_reopen() {
     assert_eq!(first_position.entry_id, 0);
     assert_eq!(
         ledger.read_entry(&first_position).as_deref(),
+        Some(b"first".as_slice())
+    );
+}
+
+#[test]
+fn managed_ledger_reload_uses_metadata_entry_count_with_plain_entry_keys() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("ledger-entry-recovery-plain-key");
+    let db = open_test_db(&db_path);
+    let entry_log = open_test_entry_log(&db_path);
+    let index = entry_log.append(0, 0, -1, b"first").unwrap();
+    let mut info = StoredManagedLedgerInfo::new(0);
+    info.ledgers[0].entries = 1;
+    info.ledgers[0].size = b"first".len() as u64;
+
+    db.put(keys::managed_ledger_key("ledger-a"), info.encode_to_vec())
+        .unwrap();
+    db.put(
+        b"entry|0|0",
+        bincode::serialize(&StoredEntryLocation::from(index)).unwrap(),
+    )
+    .unwrap();
+
+    let ledger = RocksDBManagedLedger::open("ledger-a", Arc::clone(&db), entry_log).unwrap();
+
+    assert_eq!(
+        ledger.read_entry(&position(0, 0)).as_deref(),
         Some(b"first".as_slice())
     );
 }

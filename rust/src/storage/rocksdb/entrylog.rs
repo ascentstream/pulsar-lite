@@ -10,7 +10,7 @@ use std::sync::Mutex;
 const ENTRY_MAGIC: u32 = 0x504C4547; // "PLEG"
 const ENTRY_VERSION: u16 = 1;
 const ENTRY_HEADER_LEN: u16 = 40;
-const DEFAULT_LOG_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
+const DEFAULT_LOG_SIZE_LIMIT: u64 = 1536 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub(super) struct EntryIndex {
@@ -44,18 +44,32 @@ pub(super) struct EntryLogStore {
 
 impl EntryLogStore {
     pub(super) fn open(root: &Path) -> Result<Self> {
+        Self::open_with_limit(root, DEFAULT_LOG_SIZE_LIMIT)
+    }
+
+    #[cfg(test)]
+    pub(super) fn open_with_log_size_limit(root: &Path, log_size_limit: u64) -> Result<Self> {
+        Self::open_with_limit(root, log_size_limit)
+    }
+
+    fn open_with_limit(root: &Path, log_size_limit: u64) -> Result<Self> {
         let dir = root.join("entrylog");
         fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create entrylog dir {}", dir.display()))?;
         let active_file_id = Self::next_entry_log_file_id(&dir)?;
         Ok(Self {
             dir,
-            log_size_limit: DEFAULT_LOG_SIZE_LIMIT,
+            log_size_limit,
             state: Mutex::new(EntryLogState {
                 active_file_id,
                 active_offset: 0,
             }),
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn default_log_size_limit() -> u64 {
+        DEFAULT_LOG_SIZE_LIMIT
     }
 
     fn next_entry_log_file_id(dir: &Path) -> Result<u64> {
@@ -68,11 +82,7 @@ impl EntryLogStore {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            let Some(file_id) = name
-                .strip_prefix("entrylog-")
-                .and_then(|name| name.strip_suffix(".log"))
-                .and_then(|name| name.parse::<u64>().ok())
-            else {
+            let Some(file_id) = Self::parse_log_file_id(&name) else {
                 continue;
             };
 
@@ -86,8 +96,32 @@ impl EntryLogStore {
         })
     }
 
+    fn parse_log_file_id(name: &str) -> Option<u64> {
+        if let Some(decimal_id) = name.strip_suffix(".log") {
+            if let Ok(file_id) = decimal_id.parse::<u64>() {
+                return Some(file_id);
+            }
+        }
+
+        name.strip_prefix("entrylog-")
+            .and_then(|name| name.strip_suffix(".log"))
+            .and_then(|name| name.parse::<u64>().ok())
+    }
+
     fn entry_log_path(&self, file_id: u64) -> PathBuf {
+        self.dir.join(format!("{file_id}.log"))
+    }
+
+    fn legacy_entry_log_path(&self, file_id: u64) -> PathBuf {
         self.dir.join(format!("entrylog-{file_id:020}.log"))
+    }
+
+    fn readable_entry_log_path(&self, file_id: u64) -> PathBuf {
+        let path = self.entry_log_path(file_id);
+        if path.exists() {
+            return path;
+        }
+        self.legacy_entry_log_path(file_id)
     }
 
     fn checksum(payload: &[u8]) -> u64 {
@@ -144,7 +178,7 @@ impl EntryLogStore {
     }
 
     pub(super) fn read(&self, index: &EntryIndex) -> Result<EntryRecord> {
-        let path = self.entry_log_path(index.file_id);
+        let path = self.readable_entry_log_path(index.file_id);
         let mut file = OpenOptions::new().read(true).open(&path)?;
 
         file.seek(SeekFrom::Start(index.offset))?;

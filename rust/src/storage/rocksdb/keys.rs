@@ -11,11 +11,7 @@ pub(super) fn ledger_id_allocator_key() -> Vec<u8> {
 }
 
 pub(super) fn managed_entry_key(ledger_id: u64, entry_id: u64) -> Vec<u8> {
-    format!("entry|{ledger_id:020}|{entry_id:020}").into_bytes()
-}
-
-pub(super) fn managed_entry_prefix(ledger_id: u64) -> Vec<u8> {
-    format!("entry|{ledger_id:020}|").into_bytes()
+    format!("entry|{ledger_id}|{entry_id}").into_bytes()
 }
 
 pub(super) fn managed_ledger_name(topic: &str) -> String {

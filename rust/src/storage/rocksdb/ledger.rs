@@ -2,7 +2,7 @@ use super::cursor::RocksDBManagedCursor;
 use super::entrylog::{EntryIndex, EntryLogStore};
 use super::keys;
 use super::metadata::{StoredEntryLocation, StoredManagedLedgerInfo};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use rocksdb::{WriteBatch, DB};
 use std::sync::Arc;
 
@@ -80,16 +80,16 @@ impl RocksDBManagedLedger {
         let mut entries = Vec::new();
 
         for ledger in &info.ledgers {
-            let prefix = keys::managed_entry_prefix(ledger.ledger_id);
-            for item in db.prefix_iterator(&prefix) {
-                let (key, value) = item?;
-                let Some(suffix) = key.strip_prefix(prefix.as_slice()) else {
-                    break;
-                };
-                let suffix = std::str::from_utf8(suffix)?;
-                let Some(entry_id) = suffix.parse::<u64>().ok() else {
-                    continue;
-                };
+            for entry_id in 0..ledger.entries {
+                let value = db
+                    .get(keys::managed_entry_key(ledger.ledger_id, entry_id))?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "missing entry location for ledger {} entry {}",
+                            ledger.ledger_id,
+                            entry_id
+                        )
+                    })?;
                 let stored_entry_location: StoredEntryLocation = bincode::deserialize(&value)?;
                 let position = ManagedLedgerPosition {
                     ledger_id: ledger.ledger_id,

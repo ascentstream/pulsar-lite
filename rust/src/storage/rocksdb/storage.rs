@@ -1,4 +1,4 @@
-use super::cursor::{ack_managed_cursor_shared, is_managed_position_acknowledged};
+use super::cursor::{ack_managed_cursor_shared, is_managed_position_acknowledged, next_position};
 use super::entrylog::EntryLogStore;
 use super::factory::RocksDBManagedLedgerFactory;
 use super::keys;
@@ -8,7 +8,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::storage::{
-    ManagedCursor, ManagedLedger, ManagedLedgerPosition, ManagedLedgerStorage, MessageId,
+    first_unacked_from_messages, last_position_from_messages, read_from_messages,
+    CursorInitOptions, CursorOpenResult, InitialPosition, ManagedCursor, ManagedLedger,
+    ManagedLedgerPosition, ManagedLedgerStorage, MessageId,
 };
 
 /// RocksDB-backed managed-ledger store for persistent topics.
@@ -28,6 +30,71 @@ impl RocksDbManagedLedgerStorage {
             factory: RocksDBManagedLedgerFactory::new(db, entry_log),
         })
     }
+
+    fn cursor_exists(&self, topic: &str, subscription: &str) -> Result<bool> {
+        let ledger_name = keys::managed_ledger_name(topic);
+        let cursor_name = keys::encode_cursor_name(subscription);
+        self.factory.cursor_state_exists(&ledger_name, &cursor_name)
+    }
+
+    fn persist_empty_cursor(&self, topic: &str, subscription: &str) -> Result<()> {
+        let ledger_name = keys::managed_ledger_name(topic);
+        let cursor_name = keys::encode_cursor_name(subscription);
+        let mut ledger = self.factory.open_ledger(&ledger_name)?;
+        let cursor = ledger.open_cursor(&cursor_name)?;
+        cursor.persist_state()
+    }
+
+    fn position_before_start_message_id(
+        &self,
+        topic: &str,
+        start: &MessageId,
+    ) -> Option<ManagedLedgerPosition> {
+        let target = ManagedLedgerPosition::from(start);
+        let mut previous = None;
+
+        for (message_id, _) in self.get_messages(topic) {
+            let position = ManagedLedgerPosition::from(&message_id);
+            if position >= target {
+                return previous;
+            }
+            previous = Some(position);
+        }
+
+        previous
+    }
+
+    fn apply_latest_cursor(&self, topic: &str, subscription: &str) -> Result<()> {
+        let last = last_position_from_messages(&self.get_messages(topic));
+        let ledger_name = keys::managed_ledger_name(topic);
+        let cursor_name = keys::encode_cursor_name(subscription);
+        let mut ledger = self.factory.open_ledger(&ledger_name)?;
+        let mut cursor = ledger.open_cursor(&cursor_name)?;
+
+        if let Some(last) = last {
+            cursor.mark_delete(last)
+        } else {
+            cursor.persist_state()
+        }
+    }
+
+    fn apply_start_message_id_cursor(
+        &self,
+        topic: &str,
+        subscription: &str,
+        start: &MessageId,
+    ) -> Result<()> {
+        let ledger_name = keys::managed_ledger_name(topic);
+        let cursor_name = keys::encode_cursor_name(subscription);
+        let mut ledger = self.factory.open_ledger(&ledger_name)?;
+        let mut cursor = ledger.open_cursor(&cursor_name)?;
+
+        if let Some(previous) = self.position_before_start_message_id(topic, start) {
+            cursor.mark_delete(previous)
+        } else {
+            cursor.persist_state()
+        }
+    }
 }
 
 impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
@@ -44,12 +111,84 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         Ok(MessageId::from(position))
     }
 
-    fn subscribe(&mut self, topic: &str, subscription: &str) -> Result<()> {
+    fn subscribe(&mut self, _topic: &str, _subscription: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn initialize_or_open_cursor(
+        &mut self,
+        topic: &str,
+        subscription: &str,
+        options: CursorInitOptions,
+    ) -> Result<CursorOpenResult> {
+        if self.cursor_exists(topic, subscription)? {
+            return Ok(CursorOpenResult {
+                created: false,
+                first_unacked: self.first_unacked_position(topic, subscription)?,
+            });
+        }
+
+        if let Some(start_id) = options.start_message_id.as_ref() {
+            self.apply_start_message_id_cursor(topic, subscription, start_id)?;
+        } else if options.initial_position == InitialPosition::Latest {
+            self.apply_latest_cursor(topic, subscription)?;
+        } else {
+            self.persist_empty_cursor(topic, subscription)?;
+        }
+
+        Ok(CursorOpenResult {
+            created: true,
+            first_unacked: self.first_unacked_position(topic, subscription)?,
+        })
+    }
+
+    fn first_unacked_position(
+        &self,
+        topic: &str,
+        subscription: &str,
+    ) -> Result<Option<ManagedLedgerPosition>> {
+        let messages = self.get_messages(topic);
         let ledger_name = keys::managed_ledger_name(topic);
         let cursor_name = keys::encode_cursor_name(subscription);
         let mut ledger = self.factory.open_ledger(&ledger_name)?;
-        ledger.open_cursor(&cursor_name)?;
-        Ok(())
+        let cursor = ledger.open_cursor(&cursor_name)?;
+
+        Ok(first_unacked_from_messages(&messages, |id| {
+            is_managed_position_acknowledged(cursor.state(), &ManagedLedgerPosition::from(id))
+        }))
+    }
+
+    fn read_from(
+        &self,
+        topic: &str,
+        from: &ManagedLedgerPosition,
+        limit: usize,
+    ) -> Result<Vec<(MessageId, Vec<u8>)>> {
+        let messages = self.get_messages(topic);
+        Ok(read_from_messages(&messages, from, limit))
+    }
+
+    fn get_last_position(&self, topic: &str) -> Result<Option<ManagedLedgerPosition>> {
+        Ok(last_position_from_messages(&self.get_messages(topic)))
+    }
+
+    fn get_next_position(
+        &self,
+        topic: &str,
+        current: &ManagedLedgerPosition,
+    ) -> Result<Option<ManagedLedgerPosition>> {
+        let ledger_name = keys::managed_ledger_name(topic);
+        let ledger = self.factory.open_ledger(&ledger_name)?;
+        Ok(next_position(current, &ledger.info))
+    }
+
+    fn is_acknowledged(
+        &self,
+        topic: &str,
+        subscription: &str,
+        message_id: &MessageId,
+    ) -> Result<bool> {
+        Ok(self.is_acknowledged_shared(topic, subscription, message_id))
     }
 
     fn get_next_unassigned_message(

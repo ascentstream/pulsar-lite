@@ -6,6 +6,7 @@
 mod enums;
 mod exclusive;
 mod failover;
+mod read_position;
 mod shared;
 mod traits;
 

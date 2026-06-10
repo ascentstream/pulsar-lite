@@ -12,6 +12,7 @@ use crate::broker::service::ConnectionWriteState;
 use crate::broker::service::{Consumer, SharedStorage};
 use crate::protocol::codec::{proto::pulsar::BaseCommand, PulsarFrameCodec};
 use crate::protocol::ServerCommand;
+use crate::storage::{CursorInitOptions, InitialPosition, MessageId};
 use futures::SinkExt;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -80,6 +81,19 @@ where
                 .collect(),
             allow_out_of_order_delivery: meta.allow_out_of_order_delivery.unwrap_or(false),
         });
+    let initial_position = match subscribe_cmd.initial_position.unwrap_or(0) {
+        1 => InitialPosition::Earliest,
+        _ => InitialPosition::Latest,
+    };
+    let start_message_id = subscribe_cmd.start_message_id.as_ref().map(|id| MessageId {
+        ledger: id.ledger_id,
+        entry: id.entry_id,
+        partition: id.partition.unwrap_or(-1),
+    });
+    let cursor_options = CursorInitOptions {
+        initial_position,
+        start_message_id,
+    };
 
     // Get or create subscription, then create Consumer (Apache Pulsar style)
     let consumer = {
@@ -103,6 +117,7 @@ where
                 sub_type,
                 subscription_properties.clone(),
                 key_shared_policy.clone(),
+                cursor_options,
             )
             .await?;
 

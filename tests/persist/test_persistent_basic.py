@@ -86,6 +86,27 @@ def test_persistent_latest_late_subscriber_skips_existing_backlog(tmp_path, uniq
             client.close()
 
 
+def test_persistent_unacked_message_does_not_repeat_on_additional_flow(tmp_path, unique_name):
+    db_path = tmp_path / "persistent.db"
+    topic = persistent_topic(unique_name, "persist-no-repeat-flow")
+    subscription = unique_name("persist-sub")
+
+    with _broker(tmp_path, db_path) as broker:
+        client = pulsar.Client(broker.broker_url)
+        try:
+            producer = client.create_producer(topic, batching_enabled=False)
+            consumer = _subscribe_exclusive(client, topic, subscription)
+
+            producer.send(b"in-flight")
+            message = consumer.receive(timeout_millis=5000)
+            assert message.data() == b"in-flight"
+
+            assert_no_message(consumer, timeout_millis=1000)
+            consumer.acknowledge(message)
+        finally:
+            client.close()
+
+
 def test_persistent_existing_subscription_reuses_saved_cursor(tmp_path, unique_name):
     db_path = tmp_path / "persistent.db"
     topic = persistent_topic(unique_name, "persist-saved-cursor")

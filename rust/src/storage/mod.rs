@@ -8,11 +8,16 @@ use anyhow::Result;
 use log::{debug, info, warn};
 use std::path::Path;
 
+#[cfg(feature = "rocksdb-storage")]
+pub(crate) use managed_ledger::{
+    first_unacked_from_messages, last_position_from_messages, read_from_messages,
+};
 pub use managed_ledger::{
-    InMemoryManagedCursor, InMemoryManagedLedger, InMemoryManagedLedgerFactory,
-    InMemoryManagedLedgerStorage, ManagedCursor, ManagedCursorState, ManagedLedger,
-    ManagedLedgerConfig, ManagedLedgerFactory, ManagedLedgerPosition, ManagedLedgerStorage,
-    ManagedLedgerStore, MessageId, NonPersistentEntry, SubscriptionCursor,
+    CursorInitOptions, CursorOpenResult, InMemoryManagedCursor, InMemoryManagedLedger,
+    InMemoryManagedLedgerFactory, InMemoryManagedLedgerStorage, InitialPosition, ManagedCursor,
+    ManagedCursorState, ManagedLedger, ManagedLedgerConfig, ManagedLedgerFactory,
+    ManagedLedgerPosition, ManagedLedgerStorage, ManagedLedgerStore, MessageId, NonPersistentEntry,
+    SubscriptionCursor,
 };
 pub use metadata::{
     DomainNode, JsonFileMetadataStore, MetadataBackend, MetadataDocument, MetadataFileNode,
@@ -132,6 +137,56 @@ impl Storage {
         }
 
         Ok(())
+    }
+
+    pub fn initialize_or_open_cursor(
+        &mut self,
+        topic: &str,
+        subscription: &str,
+        options: CursorInitOptions,
+    ) -> Result<CursorOpenResult> {
+        self.managed_ledger
+            .initialize_or_open_cursor(topic, subscription, options)
+    }
+
+    pub fn first_unacked_position(
+        &self,
+        topic: &str,
+        subscription: &str,
+    ) -> Result<Option<ManagedLedgerPosition>> {
+        self.managed_ledger
+            .first_unacked_position(topic, subscription)
+    }
+
+    pub fn read_from(
+        &self,
+        topic: &str,
+        from: &ManagedLedgerPosition,
+        limit: usize,
+    ) -> Result<Vec<(MessageId, Vec<u8>)>> {
+        self.managed_ledger.read_from(topic, from, limit)
+    }
+
+    pub fn get_last_position(&self, topic: &str) -> Result<Option<ManagedLedgerPosition>> {
+        self.managed_ledger.get_last_position(topic)
+    }
+
+    pub fn get_next_position(
+        &self,
+        topic: &str,
+        current: &ManagedLedgerPosition,
+    ) -> Result<Option<ManagedLedgerPosition>> {
+        self.managed_ledger.get_next_position(topic, current)
+    }
+
+    pub fn is_acknowledged(
+        &self,
+        topic: &str,
+        subscription: &str,
+        message_id: &MessageId,
+    ) -> Result<bool> {
+        self.managed_ledger
+            .is_acknowledged(topic, subscription, message_id)
     }
 
     /// Return the next deliverable message for the current in-memory flow.

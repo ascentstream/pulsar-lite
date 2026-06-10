@@ -11,7 +11,7 @@ use std::sync::Arc;
 use super::super::{Consumer, SharedStorage};
 use crate::broker::dispatcher::DispatcherEnum;
 use crate::broker::non_persistent::NonPersistentSubscriptionRuntime;
-use crate::storage::NonPersistentEntry;
+use crate::storage::{ManagedLedgerPosition, NonPersistentEntry};
 
 /// Subscription type (matches Pulsar protocol)
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -77,6 +77,8 @@ pub struct Subscription {
     /// Dispatcher for this subscription (created on first consumer)
     /// Apache Pulsar style - subscription holds dispatcher, not consumers directly
     dispatcher: Option<DispatcherEnum>,
+    /// Initial persistent read position captured when the storage cursor opens.
+    pending_first_unacked: Option<Option<ManagedLedgerPosition>>,
     /// Storage backend for reading messages
     storage: SharedStorage,
 }
@@ -94,6 +96,7 @@ impl std::fmt::Debug for Subscription {
                 "dispatcher",
                 &self.dispatcher.as_ref().map(|d| d.get_type()),
             )
+            .field("pending_first_unacked", &self.pending_first_unacked)
             .field(
                 "non_persistent_runtime",
                 &self.non_persistent_runtime.as_ref().map(|_| "initialized"),
@@ -158,6 +161,7 @@ impl Subscription {
             key_shared_policy,
             non_persistent_runtime: None,
             dispatcher: None,
+            pending_first_unacked: None,
             storage,
         }
     }
@@ -194,6 +198,10 @@ impl Subscription {
 
     pub fn key_shared_policy(&self) -> Option<&KeySharedPolicy> {
         self.key_shared_policy.as_ref()
+    }
+
+    pub fn set_pending_first_unacked(&mut self, pos: Option<ManagedLedgerPosition>) {
+        self.pending_first_unacked = Some(pos);
     }
 
     pub fn is_fenced(&self) -> bool {
@@ -276,6 +284,11 @@ impl Subscription {
         match self.runtime_mode {
             SubscriptionRuntimeMode::Persistent => {
                 self.reuse_or_create_dispatcher();
+                if let Some(pos) = self.pending_first_unacked.take() {
+                    if let Some(dispatcher) = self.dispatcher.as_ref() {
+                        dispatcher.init_read_position(pos);
+                    }
+                }
                 self.dispatcher
                     .as_mut()
                     .ok_or_else(|| "Failed to create dispatcher".to_string())?

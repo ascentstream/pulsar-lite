@@ -524,9 +524,9 @@ impl Subscription {
         match self.runtime_mode {
             SubscriptionRuntimeMode::Persistent => match self.sub_type {
                 SubscriptionType::Failover => self
-                    .get_consumers()
-                    .into_iter()
-                    .next()
+                    .dispatcher
+                    .as_ref()
+                    .and_then(|dispatcher| dispatcher.get_active_consumer())
                     .into_iter()
                     .collect(),
                 _ => self.get_consumers(),

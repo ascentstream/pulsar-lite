@@ -84,8 +84,14 @@ impl DispatcherEnum {
                 d.remove_consumer_with_recovery(consumer_id, storage, topic, subscription)
                     .await
             }
-            DispatcherEnum::Exclusive(d) => d.remove_consumer(consumer_id),
-            DispatcherEnum::Failover(d) => d.remove_consumer(consumer_id),
+            DispatcherEnum::Exclusive(d) => {
+                d.remove_consumer_with_recovery(consumer_id, storage, topic, subscription)
+                    .await
+            }
+            DispatcherEnum::Failover(d) => {
+                d.remove_consumer_with_recovery(consumer_id, storage, topic, subscription)
+                    .await
+            }
         }
     }
 
@@ -101,6 +107,14 @@ impl DispatcherEnum {
         self.get_consumers()
             .into_iter()
             .find(|c| c.consumer_id == consumer_id)
+    }
+
+    pub fn get_active_consumer(&self) -> Option<Arc<Consumer>> {
+        match self {
+            DispatcherEnum::Failover(d) => d.get_active_consumer(),
+            DispatcherEnum::Exclusive(d) => d.get_consumers().into_iter().next(),
+            DispatcherEnum::Shared(_) => None,
+        }
     }
 
     /// Handle consumer flow command - update permits

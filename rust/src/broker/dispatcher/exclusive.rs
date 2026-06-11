@@ -38,6 +38,16 @@ impl ExclusiveDispatcher {
             read_position: RwLock::new(None),
         }
     }
+
+    pub async fn remove_consumer_with_recovery(
+        &mut self,
+        consumer_id: u64,
+        _storage: SharedStorage,
+        _topic: &str,
+        _subscription: &str,
+    ) -> Option<Arc<Consumer>> {
+        self.remove_consumer(consumer_id)
+    }
 }
 
 impl Dispatcher for ExclusiveDispatcher {

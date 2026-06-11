@@ -11,7 +11,7 @@ use std::sync::Arc;
 use super::super::{Consumer, SharedStorage};
 use crate::broker::dispatcher::DispatcherEnum;
 use crate::broker::non_persistent::NonPersistentSubscriptionRuntime;
-use crate::storage::{ManagedLedgerPosition, NonPersistentEntry};
+use crate::storage::{ManagedLedgerPosition, MessageId, NonPersistentEntry};
 
 /// Subscription type (matches Pulsar protocol)
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -25,6 +25,23 @@ pub enum SubscriptionType {
 impl Default for SubscriptionType {
     fn default() -> Self {
         SubscriptionType::Exclusive
+    }
+}
+
+/// Mirrors `CommandAck.AckType` in PulsarApi.proto (Individual = 0, Cumulative = 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckCommandType {
+    Individual,
+    Cumulative,
+}
+
+impl AckCommandType {
+    pub fn from_proto(value: i32) -> Self {
+        if value == 1 {
+            Self::Cumulative
+        } else {
+            Self::Individual
+        }
     }
 }
 
@@ -385,6 +402,91 @@ impl Subscription {
                 consumer
             }
             SubscriptionRuntimeMode::NonPersistent => self.remove_consumer(consumer_id),
+        }
+    }
+
+    /// Persist cursor updates and notify the dispatcher after a message was acked.
+    ///
+    /// The caller (`Consumer::message_acked`) must handle Shared ownership resolution
+    /// and clear `pending_acks` before invoking this method.
+    pub async fn acknowledge_message(
+        &mut self,
+        message_ids: &[MessageId],
+        ack_type: AckCommandType,
+    ) -> Result<(), String> {
+        if !self.is_persistent() || message_ids.is_empty() {
+            return Ok(());
+        }
+
+        match (self.sub_type, ack_type) {
+            (
+                SubscriptionType::Shared | SubscriptionType::KeyShared,
+                AckCommandType::Cumulative,
+            ) => {
+                log::warn!(
+                    "Ignoring cumulative ack on Shared subscription '{}' for topic '{}'",
+                    self.name,
+                    self.topic
+                );
+                Ok(())
+            }
+            (
+                SubscriptionType::Shared | SubscriptionType::KeyShared,
+                AckCommandType::Individual,
+            ) => {
+                {
+                    let mut guard = self.storage.lock().await;
+                    for message_id in message_ids {
+                        guard
+                            .ack_message_shared(&self.topic, &self.name, message_id.clone())
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                for message_id in message_ids {
+                    self.notify_dispatcher_message_acked(message_id);
+                }
+                Ok(())
+            }
+            (
+                SubscriptionType::Exclusive | SubscriptionType::Failover,
+                AckCommandType::Individual,
+            ) => {
+                {
+                    let mut guard = self.storage.lock().await;
+                    for message_id in message_ids {
+                        guard
+                            .ack_message_shared(&self.topic, &self.name, message_id.clone())
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                for message_id in message_ids {
+                    self.notify_dispatcher_message_acked(message_id);
+                }
+                Ok(())
+            }
+            (
+                SubscriptionType::Exclusive | SubscriptionType::Failover,
+                AckCommandType::Cumulative,
+            ) => {
+                let message_id = message_ids
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| "cumulative ack requires a message id".to_string())?;
+                {
+                    let mut guard = self.storage.lock().await;
+                    guard
+                        .ack_message(&self.topic, &self.name, message_id.clone())
+                        .map_err(|e| e.to_string())?;
+                }
+                self.notify_dispatcher_message_acked(&message_id);
+                Ok(())
+            }
+        }
+    }
+
+    fn notify_dispatcher_message_acked(&mut self, message_id: &MessageId) {
+        if let Some(dispatcher) = self.dispatcher.as_mut() {
+            dispatcher.on_message_acknowledged(message_id);
         }
     }
 

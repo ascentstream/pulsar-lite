@@ -11,8 +11,8 @@ pub use partitioned_topic::{
     PartitionStats, PartitionedTopic, PartitionedTopicStats, SharedPartitionedTopic,
 };
 pub use subscription::{
-    KeySharedHashRange, KeySharedMode, KeySharedPolicy, Subscription, SubscriptionRuntimeMode,
-    SubscriptionStats, SubscriptionType,
+    AckCommandType, KeySharedHashRange, KeySharedMode, KeySharedPolicy, Subscription,
+    SubscriptionRuntimeMode, SubscriptionStats, SubscriptionType,
 };
 pub use topic::{
     SharedSubscription, Topic, TopicPublishRate, TopicPublishRateExceeded, TopicRuntimeMode,

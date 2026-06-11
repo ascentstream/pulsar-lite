@@ -466,6 +466,18 @@ impl SharedDispatcher {
     pub fn get_redelivery_queue_size(&self) -> usize {
         self.messages_to_redeliver.read().unwrap().len()
     }
+
+    /// Remove a message from the redelivery queue after it has been acked.
+    pub fn on_message_acknowledged(&self, message_id: &MessageId) {
+        let mut redeliver = self.messages_to_redeliver.write().unwrap();
+        if redeliver.remove(message_id).is_some() {
+            log::debug!(
+                "Removed acked message {}:{} from redelivery queue",
+                message_id.ledger,
+                message_id.entry
+            );
+        }
+    }
 }
 
 impl Dispatcher for SharedDispatcher {

@@ -71,6 +71,7 @@ pub fn estimate_message_parts_size(
     partition: i32,
     metadata: &Bytes,
     payload: &Bytes,
+    redelivery_count: u32,
 ) -> usize {
     use proto::pulsar::*;
 
@@ -84,6 +85,7 @@ pub fn estimate_message_parts_size(
                 partition: Some(partition),
                 ..Default::default()
             },
+            redelivery_count: Some(redelivery_count),
             ..Default::default()
         }),
         ..Default::default()
@@ -112,6 +114,7 @@ pub fn encode_message_parts(
     partition: i32,
     metadata: &Bytes,
     payload: &Bytes,
+    redelivery_count: u32,
 ) -> Result<EncodedMessageParts, io::Error> {
     use proto::pulsar::*;
 
@@ -125,6 +128,7 @@ pub fn encode_message_parts(
                 partition: Some(partition),
                 ..Default::default()
             },
+            redelivery_count: Some(redelivery_count),
             ..Default::default()
         }),
         ..Default::default()
@@ -275,6 +279,7 @@ impl Encoder<ServerCommand> for PulsarFrameCodec {
                 *partition,
                 metadata,
                 payload,
+                0,
                 dst,
             );
         }
@@ -316,6 +321,7 @@ impl Encoder<(u64, PendingMessage)> for PulsarFrameCodec {
             msg.message_id.partition,
             &msg.metadata,
             &msg.payload,
+            msg.redelivery_count,
             dst,
         )
     }
@@ -331,6 +337,7 @@ impl PulsarFrameCodec {
         partition: i32,
         metadata: &Bytes,
         payload: &Bytes,
+        redelivery_count: u32,
         dst: &mut BytesMut,
     ) -> Result<(), io::Error> {
         let parts = encode_message_parts(
@@ -340,6 +347,7 @@ impl PulsarFrameCodec {
             partition,
             metadata,
             payload,
+            redelivery_count,
         )?;
         dst.reserve(parts.header.len() + parts.metadata.len() + parts.payload.len());
         dst.extend_from_slice(parts.header.as_ref());
@@ -461,6 +469,7 @@ mod tests {
             -1,
             &Bytes::new(),
             &Bytes::from_static(b"payload"),
+            0,
         )
         .unwrap();
         let mut rebuilt = BytesMut::new();

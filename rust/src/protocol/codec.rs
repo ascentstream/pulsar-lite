@@ -360,7 +360,7 @@ impl PulsarFrameCodec {
 
 #[cfg(test)]
 mod tests {
-    use super::proto::pulsar::{CompressionType, KeyValue, MessageMetadata};
+    use super::proto::pulsar::{BaseCommand, CompressionType, KeyValue, MessageMetadata};
     use super::*;
     use crate::protocol::command::ServerCommand;
     use bytes::Bytes;
@@ -478,5 +478,25 @@ mod tests {
         rebuilt.extend_from_slice(parts.payload.as_ref());
 
         assert_eq!(encoded.freeze(), rebuilt.freeze());
+    }
+
+    #[test]
+    fn message_command_encodes_redelivery_count() {
+        let parts = encode_message_parts(
+            7,
+            11,
+            22,
+            -1,
+            &Bytes::new(),
+            &Bytes::from_static(b"payload"),
+            3,
+        )
+        .unwrap();
+
+        let header = parts.header.as_ref();
+        let command_size = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
+        let command = BaseCommand::decode(&header[8..8 + command_size]).unwrap();
+
+        assert_eq!(command.message.unwrap().redelivery_count, Some(3));
     }
 }

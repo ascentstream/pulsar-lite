@@ -741,4 +741,33 @@ mod tests {
         assert!(matches!(first_remaining, 2 | 3));
         assert!(matches!(second_remaining, 2 | 3));
     }
+
+    #[tokio::test]
+    async fn ack_state_update_prunes_acked_redelivery_entries() {
+        let storage = create_test_storage();
+        let topic = "persistent://public/default/test-topic";
+        let subscription_name = "test-sub";
+        let (acked, pending) = {
+            let mut guard = storage.lock().await;
+            guard.create_topic(topic).unwrap();
+            guard.subscribe(topic, subscription_name).unwrap();
+            let acked = guard.append_message(topic, -1, b"acked").unwrap();
+            let pending = guard.append_message(topic, -1, b"pending").unwrap();
+            guard
+                .ack_message_shared(topic, subscription_name, acked.clone())
+                .unwrap();
+            (acked, pending)
+        };
+
+        let dispatcher = SharedDispatcher::new();
+        dispatcher.add_to_redelivery_queue(vec![(acked, 0), (pending.clone(), 0)]);
+
+        dispatcher
+            .on_ack_state_updated(storage, topic, subscription_name)
+            .await
+            .unwrap();
+
+        assert_eq!(dispatcher.get_redelivery_queue_size(), 1);
+        assert_eq!(dispatcher.pop_redelivery_message().unwrap().0, pending);
+    }
 }

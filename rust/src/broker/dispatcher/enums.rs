@@ -161,6 +161,18 @@ impl DispatcherEnum {
             DispatcherEnum::Exclusive(_) | DispatcherEnum::Failover(_) => {}
         }
     }
+
+    pub async fn on_ack_state_updated(
+        &mut self,
+        storage: SharedStorage,
+        topic: &str,
+        subscription: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            DispatcherEnum::Shared(d) => d.on_ack_state_updated(storage, topic, subscription).await,
+            DispatcherEnum::Exclusive(_) | DispatcherEnum::Failover(_) => Ok(()),
+        }
+    }
 }
 
 impl std::fmt::Debug for DispatcherEnum {

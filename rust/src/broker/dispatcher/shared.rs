@@ -263,7 +263,7 @@ impl SharedDispatcher {
             if let Some((msg_id, redelivery_count)) = self.pop_redelivery_message() {
                 let already_acked = {
                     let guard = storage.lock().await;
-                    guard.is_acknowledged_shared(&topic, &subscription, &msg_id)
+                    guard.is_acknowledged(&topic, &subscription, &msg_id)?
                 };
                 if already_acked {
                     consumer.add_permits(1).await;
@@ -390,6 +390,50 @@ impl SharedDispatcher {
     pub fn pop_redelivery_message(&self) -> Option<(MessageId, u32)> {
         let mut redeliver = self.messages_to_redeliver.write().unwrap();
         redeliver.pop_first()
+    }
+
+    pub async fn on_ack_state_updated(
+        &self,
+        storage: SharedStorage,
+        topic: &str,
+        subscription: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let queued_message_ids = {
+            let redeliver = self.messages_to_redeliver.read().unwrap();
+            redeliver.keys().cloned().collect::<Vec<_>>()
+        };
+
+        let (acked_redeliveries, first_unacked) = {
+            let guard = storage.lock().await;
+            let mut acked_redeliveries = Vec::new();
+            for message_id in queued_message_ids {
+                if guard.is_acknowledged(topic, subscription, &message_id)? {
+                    acked_redeliveries.push(message_id);
+                }
+            }
+            let first_unacked = guard.first_unacked_position(topic, subscription)?;
+            (acked_redeliveries, first_unacked)
+        };
+
+        if !acked_redeliveries.is_empty() {
+            let mut redeliver = self.messages_to_redeliver.write().unwrap();
+            for message_id in acked_redeliveries {
+                redeliver.remove(&message_id);
+            }
+        }
+
+        let mut read_position = self.read_position.write().unwrap();
+        match (&*read_position, first_unacked) {
+            (Some(current), Some(first_unacked)) if current < &first_unacked => {
+                *read_position = Some(first_unacked);
+            }
+            (Some(_), None) => {
+                *read_position = None;
+            }
+            _ => {}
+        }
+
+        Ok(())
     }
 
     /// Check if message is pending ack by any consumer

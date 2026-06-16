@@ -445,6 +445,7 @@ impl Subscription {
                 for message_id in message_ids {
                     self.notify_dispatcher_message_acked(message_id);
                 }
+                self.notify_dispatcher_ack_state_updated().await?;
                 Ok(())
             }
             (
@@ -488,6 +489,16 @@ impl Subscription {
         if let Some(dispatcher) = self.dispatcher.as_mut() {
             dispatcher.on_message_acknowledged(message_id);
         }
+    }
+
+    async fn notify_dispatcher_ack_state_updated(&mut self) -> Result<(), String> {
+        if let Some(dispatcher) = self.dispatcher.as_mut() {
+            dispatcher
+                .on_ack_state_updated(self.storage.clone(), &self.topic, &self.name)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     pub async fn redeliver_unacknowledged_messages(

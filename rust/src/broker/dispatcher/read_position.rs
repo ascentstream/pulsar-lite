@@ -6,6 +6,7 @@ pub type DispatchError = Box<dyn std::error::Error + Send + Sync>;
 
 pub struct ReadCandidate {
     pub message_id: MessageId,
+    pub metadata: Vec<u8>,
     pub payload: Vec<u8>,
     pub next_position: ManagedLedgerPosition,
 }
@@ -46,17 +47,18 @@ pub async fn next_unacked_candidate(
             }
         };
 
-        let Some((message_id, payload, next_position, already_acked)) = ({
+        let Some((entry, next_position, already_acked)) = ({
             let guard = storage.lock().await;
-            let batch = guard.read_from(topic, &pos, 1)?;
+            let batch = guard.read_entries_from(topic, &pos, 1)?;
 
-            if let Some((message_id, payload)) = batch.into_iter().next() {
-                let current_position = ManagedLedgerPosition::from(&message_id);
+            if let Some(entry) = batch.into_iter().next() {
+                let current_position = ManagedLedgerPosition::from(&entry.message_id);
                 let next_position = guard
                     .get_next_position(topic, &current_position)?
-                    .unwrap_or_else(|| logical_next(&message_id));
-                let already_acked = guard.is_acknowledged(topic, subscription, &message_id)?;
-                Some((message_id, payload, next_position, already_acked))
+                    .unwrap_or_else(|| logical_next(&entry.message_id));
+                let already_acked =
+                    guard.is_acknowledged(topic, subscription, &entry.message_id)?;
+                Some((entry, next_position, already_acked))
             } else {
                 None
             }
@@ -70,8 +72,9 @@ pub async fn next_unacked_candidate(
         }
 
         return Ok(Some(ReadCandidate {
-            message_id,
-            payload,
+            message_id: entry.message_id,
+            metadata: entry.metadata,
+            payload: entry.payload,
             next_position,
         }));
     }

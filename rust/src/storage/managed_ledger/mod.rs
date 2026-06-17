@@ -29,7 +29,7 @@ pub use memory::{
 };
 pub use storage::ManagedLedgerStorage;
 pub use store::ManagedLedgerStore;
-pub use types::{ManagedLedgerPosition, MessageId, NonPersistentEntry};
+pub use types::{ManagedLedgerPosition, MessageId, NonPersistentEntry, StoredMessage};
 
 #[cfg(feature = "rocksdb-storage")]
 pub(crate) use cursor_read::{

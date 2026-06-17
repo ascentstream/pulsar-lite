@@ -8,9 +8,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const ENTRY_MAGIC: u32 = 0x504C4547; // "PLEG"
-const ENTRY_VERSION: u16 = 1;
-const ENTRY_HEADER_LEN: u16 = 40;
-const DEFAULT_LOG_SIZE_LIMIT: u64 = 1536 * 1024 * 1024;
+const ENTRY_VERSION_LEGACY: u16 = 1;
+const ENTRY_VERSION: u16 = 2;
+const ENTRY_HEADER_LEN_LEGACY: u16 = 40;
+const ENTRY_HEADER_LEN: u16 = 44;
+const DEFAULT_LOG_SIZE_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub(super) struct EntryIndex {
@@ -26,6 +28,7 @@ pub(super) struct EntryIndex {
 #[derive(Debug, Clone)]
 pub(super) struct EntryRecord {
     pub(super) partition: i32,
+    pub(super) metadata: Vec<u8>,
     pub(super) payload: Vec<u8>,
 }
 
@@ -97,39 +100,21 @@ impl EntryLogStore {
     }
 
     fn parse_log_file_id(name: &str) -> Option<u64> {
-        if let Some(decimal_id) = name.strip_suffix(".log") {
-            if let Ok(file_id) = decimal_id.parse::<u64>() {
-                return Some(file_id);
-            }
-        }
-
-        name.strip_prefix("entrylog-")
-            .and_then(|name| name.strip_suffix(".log"))
-            .and_then(|name| name.parse::<u64>().ok())
+        name.strip_suffix(".log")?.parse::<u64>().ok()
     }
 
     fn entry_log_path(&self, file_id: u64) -> PathBuf {
         self.dir.join(format!("{file_id}.log"))
     }
 
-    fn legacy_entry_log_path(&self, file_id: u64) -> PathBuf {
-        self.dir.join(format!("entrylog-{file_id:020}.log"))
-    }
-
-    fn readable_entry_log_path(&self, file_id: u64) -> PathBuf {
-        let path = self.entry_log_path(file_id);
-        if path.exists() {
-            return path;
-        }
-        self.legacy_entry_log_path(file_id)
-    }
-
-    fn checksum(payload: &[u8]) -> u64 {
-        payload
+    fn checksum(parts: &[&[u8]]) -> u64 {
+        parts
             .iter()
+            .flat_map(|part| part.iter())
             .fold(0u64, |acc, byte| acc.wrapping_add(*byte as u64))
     }
 
+    #[cfg(test)]
     pub(super) fn append(
         &self,
         ledger_id: u64,
@@ -137,10 +122,22 @@ impl EntryLogStore {
         partition: i32,
         payload: &[u8],
     ) -> Result<EntryIndex> {
+        self.append_with_metadata(ledger_id, entry_id, partition, &[], payload)
+    }
+
+    pub(super) fn append_with_metadata(
+        &self,
+        ledger_id: u64,
+        entry_id: u64,
+        partition: i32,
+        metadata: &[u8],
+        payload: &[u8],
+    ) -> Result<EntryIndex> {
         let mut state = self.state.lock().unwrap();
-        let checksum = EntryLogStore::checksum(payload);
+        let checksum = EntryLogStore::checksum(&[metadata, payload]);
+        let metadata_len = metadata.len() as u32;
         let payload_len = payload.len() as u32;
-        let len = ENTRY_HEADER_LEN as u64 + payload.len() as u64;
+        let len = ENTRY_HEADER_LEN as u64 + metadata.len() as u64 + payload.len() as u64;
         if state.active_offset > 0 && state.active_offset + len > self.log_size_limit {
             state.active_file_id += 1;
             state.active_offset = 0;
@@ -160,8 +157,10 @@ impl EntryLogStore {
         file.write_all(&ledger_id.to_le_bytes())?;
         file.write_all(&entry_id.to_le_bytes())?;
         file.write_all(&partition.to_le_bytes())?;
+        file.write_all(&metadata_len.to_le_bytes())?;
         file.write_all(&payload_len.to_le_bytes())?;
         file.write_all(&checksum.to_le_bytes())?;
+        file.write_all(metadata)?;
         file.write_all(payload)?;
         file.flush()?;
         state.active_offset += len;
@@ -178,48 +177,72 @@ impl EntryLogStore {
     }
 
     pub(super) fn read(&self, index: &EntryIndex) -> Result<EntryRecord> {
-        let path = self.readable_entry_log_path(index.file_id);
+        let path = self.entry_log_path(index.file_id);
         let mut file = OpenOptions::new().read(true).open(&path)?;
 
         file.seek(SeekFrom::Start(index.offset))?;
 
-        let mut header = vec![0u8; ENTRY_HEADER_LEN as usize];
-        file.read_exact(&mut header)?;
+        let mut header_prefix = [0u8; 8];
+        file.read_exact(&mut header_prefix)?;
 
-        let magic = u32::from_le_bytes(header[0..4].try_into()?);
-        let version = u16::from_le_bytes(header[4..6].try_into()?);
-        let header_len = u16::from_le_bytes(header[6..8].try_into()?);
+        let magic = u32::from_le_bytes(header_prefix[0..4].try_into()?);
+        let version = u16::from_le_bytes(header_prefix[4..6].try_into()?);
+        let header_len = u16::from_le_bytes(header_prefix[6..8].try_into()?);
+        let mut header = header_prefix.to_vec();
+        header.resize(header_len as usize, 0);
+        file.read_exact(&mut header[8..])?;
+
         let ledger_id = u64::from_le_bytes(header[8..16].try_into()?);
         let entry_id = u64::from_le_bytes(header[16..24].try_into()?);
         let partition = i32::from_le_bytes(header[24..28].try_into()?);
-        let payload_len = u32::from_le_bytes(header[28..32].try_into()?);
-        let expected_checksum = u64::from_le_bytes(header[32..40].try_into()?);
 
         if magic != ENTRY_MAGIC {
             bail!("invalid entrylog magic");
         }
-        if version != ENTRY_VERSION {
+        if version != ENTRY_VERSION && version != ENTRY_VERSION_LEGACY {
             bail!("unsupported entrylog version {}", version);
         }
-        if header_len != ENTRY_HEADER_LEN {
+        if version == ENTRY_VERSION_LEGACY && header_len != ENTRY_HEADER_LEN_LEGACY {
+            bail!("invalid entrylog header length {}", header_len);
+        }
+        if version == ENTRY_VERSION && header_len != ENTRY_HEADER_LEN {
             bail!("invalid entrylog header length {}", header_len);
         }
         if ledger_id != index.ledger_id || entry_id != index.entry_id {
             bail!("entrylog position does not match index");
         }
 
-        let actual_len = ENTRY_HEADER_LEN as u64 + payload_len as u64;
+        let (metadata_len, payload_len, expected_checksum) = if version == ENTRY_VERSION_LEGACY {
+            let payload_len = u32::from_le_bytes(header[28..32].try_into()?);
+            let expected_checksum = u64::from_le_bytes(header[32..40].try_into()?);
+            (0u32, payload_len, expected_checksum)
+        } else {
+            let metadata_len = u32::from_le_bytes(header[28..32].try_into()?);
+            let payload_len = u32::from_le_bytes(header[32..36].try_into()?);
+            let expected_checksum = u64::from_le_bytes(header[36..44].try_into()?);
+            (metadata_len, payload_len, expected_checksum)
+        };
+
+        let actual_len = header_len as u64 + metadata_len as u64 + payload_len as u64;
         if actual_len != index.len {
             bail!("entrylog length does not match index");
         }
 
+        let mut metadata = vec![0u8; metadata_len as usize];
+        file.read_exact(&mut metadata)?;
         let mut payload = vec![0u8; payload_len as usize];
         file.read_exact(&mut payload)?;
 
-        if Self::checksum(&payload) != expected_checksum || expected_checksum != index.checksum {
+        if Self::checksum(&[&metadata, &payload]) != expected_checksum
+            || expected_checksum != index.checksum
+        {
             bail!("entrylog checksum mismatch");
         }
 
-        Ok(EntryRecord { partition, payload })
+        Ok(EntryRecord {
+            partition,
+            metadata,
+            payload,
+        })
     }
 }

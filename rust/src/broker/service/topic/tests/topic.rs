@@ -4,7 +4,7 @@ use crate::broker::service::topic::{
 };
 use crate::broker::service::{Consumer, Producer, SharedStorage};
 use crate::protocol::codec::proto::pulsar::MessageMetadata;
-use crate::storage::Storage;
+use crate::storage::{CursorInitOptions, InitialPosition, Storage};
 use bytes::Bytes;
 use prost::Message;
 use std::path::Path;
@@ -13,6 +13,7 @@ use std::time::Instant;
 #[cfg(feature = "rocksdb-storage")]
 use tempfile::tempdir;
 use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::time::{timeout, Duration};
 
 fn create_test_storage() -> SharedStorage {
     StdArc::new(Mutex::new(
@@ -94,6 +95,76 @@ async fn persistent_topic_publish_recovers_from_rocksdb() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].0, message_id);
     assert_eq!(messages[0].1, b"payload".to_vec());
+}
+
+#[cfg(feature = "rocksdb-storage")]
+#[tokio::test]
+async fn persistent_topic_dispatch_recovers_message_metadata_from_rocksdb() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("broker-topic-metadata.db");
+    let topic_name = "persistent://public/default/topic-metadata-recovery";
+    let subscription_name = "sub";
+    let metadata = MessageMetadata {
+        producer_name: "producer-1".to_string(),
+        sequence_id: 17,
+        partition_key: Some("partition-key".to_string()),
+        ordering_key: Some(b"ordering-key".to_vec()),
+        ..Default::default()
+    }
+    .encode_to_vec();
+
+    {
+        let storage = StdArc::new(Mutex::new(Storage::new(&db_path).unwrap()));
+        {
+            let mut guard = storage.lock().await;
+            guard.subscribe(topic_name, subscription_name).unwrap();
+            guard
+                .initialize_or_open_cursor(
+                    topic_name,
+                    subscription_name,
+                    CursorInitOptions {
+                        initial_position: InitialPosition::Earliest,
+                        start_message_id: None,
+                    },
+                )
+                .unwrap();
+        }
+        let mut topic = Topic::new(topic_name.to_string(), storage);
+        topic
+            .publish_message(
+                Some(Bytes::from(metadata.clone())),
+                Bytes::from_static(b"payload"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let storage = StdArc::new(Mutex::new(Storage::new(&db_path).unwrap()));
+    let mut topic = Topic::new(topic_name.to_string(), storage);
+    let subscription = topic
+        .get_or_create_subscription(subscription_name, SubscriptionType::Exclusive)
+        .await
+        .unwrap();
+    let (consumer, mut rx) = create_test_consumer_with_rx(1, subscription.clone());
+    consumer.add_permits(1).await;
+    {
+        let mut sub_guard = subscription.write().await;
+        sub_guard.add_consumer(consumer).unwrap();
+    }
+    {
+        let sub_guard = subscription.read().await;
+        sub_guard.consumer_flow(1, 1).await;
+    }
+
+    topic.dispatch_to_subscriptions().await;
+
+    let (consumer_id, pending) = timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("message should dispatch")
+        .expect("message dispatched");
+    assert_eq!(consumer_id, 1);
+    assert_eq!(pending.metadata, metadata);
+    assert_eq!(pending.payload, b"payload".to_vec());
 }
 
 #[tokio::test]

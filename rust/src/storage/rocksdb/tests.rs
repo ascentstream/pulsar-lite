@@ -1,5 +1,5 @@
 use super::cursor::{ack_managed_cursor_shared, RocksDBManagedCursor};
-use super::entrylog::EntryLogStore;
+use super::entrylog::{EntryIndex, EntryLogStore};
 use super::factory::RocksDBManagedLedgerFactory;
 use super::keys;
 use super::ledger::RocksDBManagedLedger;
@@ -11,7 +11,8 @@ use crate::storage::{
 };
 use prost::Message;
 use rocksdb::{Options, DB};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -58,9 +59,10 @@ fn entrylog_appends_and_reads_entry_payload() {
     assert_eq!(index.entry_id, 3);
     assert_eq!(index.file_id, 0);
     assert_eq!(index.offset, 0);
-    assert_eq!(index.len, 40 + b"payload".len() as u64);
+    assert_eq!(index.len, 44 + b"payload".len() as u64);
     assert_eq!(index.partition, 2);
     assert_eq!(entry.partition, 2);
+    assert_eq!(entry.metadata, b"");
     assert_eq!(entry.payload, b"payload");
     assert!(dir.path().join("entrylog").join("0.log").exists());
     assert!(!dir
@@ -68,6 +70,25 @@ fn entrylog_appends_and_reads_entry_payload() {
         .join("entrylog")
         .join("entrylog-00000000000000000000.log")
         .exists());
+}
+
+#[test]
+fn entrylog_appends_and_reads_entry_metadata() {
+    let dir = tempdir().unwrap();
+    let store = EntryLogStore::open(dir.path()).unwrap();
+
+    let index = store
+        .append_with_metadata(7, 3, 2, b"metadata", b"payload")
+        .unwrap();
+    let entry = store.read(&index).unwrap();
+
+    assert_eq!(
+        index.len,
+        44 + b"metadata".len() as u64 + b"payload".len() as u64
+    );
+    assert_eq!(entry.partition, 2);
+    assert_eq!(entry.metadata, b"metadata");
+    assert_eq!(entry.payload, b"payload");
 }
 
 #[test]
@@ -146,22 +167,6 @@ fn entrylog_reopen_uses_decimal_log_file_ids() {
 }
 
 #[test]
-fn entrylog_reads_legacy_zero_padded_log_file_names() {
-    let dir = tempdir().unwrap();
-    let store = EntryLogStore::open(dir.path()).unwrap();
-    let index = store.append(7, 0, -1, b"legacy").unwrap();
-    let entrylog_dir = dir.path().join("entrylog");
-
-    fs::rename(
-        entrylog_dir.join("0.log"),
-        entrylog_dir.join("entrylog-00000000000000000000.log"),
-    )
-    .unwrap();
-
-    assert_eq!(store.read(&index).unwrap().payload, b"legacy");
-}
-
-#[test]
 fn entrylog_rolls_over_when_configured_limit_is_exceeded() {
     let dir = tempdir().unwrap();
     let store = EntryLogStore::open_with_log_size_limit(dir.path(), 88).unwrap();
@@ -189,7 +194,7 @@ fn entrylog_allows_single_entry_larger_than_configured_limit() {
 
 #[test]
 fn entrylog_default_size_limit_matches_bookkeeper_like_threshold() {
-    assert_eq!(EntryLogStore::default_log_size_limit(), 1536 * 1024 * 1024);
+    assert_eq!(EntryLogStore::default_log_size_limit(), 2 * 1024 * 1024 * 1024);
 }
 
 #[test]
@@ -411,7 +416,7 @@ fn managed_ledger_entry_value_stores_location_not_payload() {
 
     assert_eq!(location.partition, -1);
     assert_eq!(location.offset, 0);
-    assert_eq!(location.len, 40 + payload.len() as u64);
+    assert_eq!(location.len, 44 + payload.len() as u64);
     assert!(!raw_value
         .windows(payload.len())
         .any(|window| window == payload));

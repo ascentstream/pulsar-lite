@@ -506,7 +506,13 @@ impl Topic {
         let message_id = match self.runtime_mode {
             TopicRuntimeMode::Persistent => {
                 let mut guard = self.storage.lock().await;
-                guard.append_message(&self.name, self.partition, &payload)?
+                let metadata = metadata.unwrap_or_default();
+                guard.append_message_with_metadata(
+                    &self.name,
+                    self.partition,
+                    metadata.as_ref(),
+                    payload.as_ref(),
+                )?
             }
             TopicRuntimeMode::NonPersistent => {
                 let publish = self.build_non_persistent_publish(metadata, payload);

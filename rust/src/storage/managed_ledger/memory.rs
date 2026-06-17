@@ -6,7 +6,7 @@ use super::cursor_read::{
 use super::{
     ack_shared, is_message_acknowledged, ManagedCursor, ManagedCursorState, ManagedLedger,
     ManagedLedgerConfig, ManagedLedgerFactory, ManagedLedgerPosition, ManagedLedgerStorage,
-    MessageId, SubscriptionCursor,
+    MessageId, StoredMessage, SubscriptionCursor,
 };
 use anyhow::Result;
 use log::debug;
@@ -18,6 +18,7 @@ pub struct InMemoryManagedLedgerStorage {
     factory: InMemoryManagedLedgerFactory,
     cursors: HashMap<String, u64>,
     subscription_cursors: HashMap<String, SubscriptionCursor>,
+    entry_metadata: HashMap<MessageId, Vec<u8>>,
 }
 
 impl InMemoryManagedLedgerStorage {
@@ -35,6 +36,15 @@ impl InMemoryManagedLedgerStorage {
 
     fn messages(&self, topic: &str) -> Vec<(MessageId, Vec<u8>)> {
         self.factory.messages(topic).cloned().unwrap_or_default()
+    }
+
+    fn stored_message(&self, message_id: MessageId, payload: Vec<u8>) -> StoredMessage {
+        let metadata = self
+            .entry_metadata
+            .get(&message_id)
+            .cloned()
+            .unwrap_or_default();
+        StoredMessage::new(message_id, metadata, payload)
     }
 
     fn is_acknowledged_inner(
@@ -82,6 +92,21 @@ impl ManagedLedgerStorage for InMemoryManagedLedgerStorage {
 
     fn append_message(&mut self, topic: &str, partition: i32, data: &[u8]) -> Result<MessageId> {
         Ok(self.factory.append_entry(topic, partition, data))
+    }
+
+    fn append_message_with_metadata(
+        &mut self,
+        topic: &str,
+        partition: i32,
+        metadata: &[u8],
+        payload: &[u8],
+    ) -> Result<MessageId> {
+        let message_id = self.factory.append_entry(topic, partition, payload);
+        if !metadata.is_empty() {
+            self.entry_metadata
+                .insert(message_id.clone(), metadata.to_vec());
+        }
+        Ok(message_id)
     }
 
     fn subscribe(&mut self, _topic: &str, _subscription: &str) -> Result<()> {
@@ -136,6 +161,19 @@ impl ManagedLedgerStorage for InMemoryManagedLedgerStorage {
     ) -> Result<Vec<(MessageId, Vec<u8>)>> {
         let messages = self.messages(topic);
         Ok(read_from_messages(&messages, from, limit))
+    }
+
+    fn read_entries_from(
+        &self,
+        topic: &str,
+        from: &ManagedLedgerPosition,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        Ok(self
+            .read_from(topic, from, limit)?
+            .into_iter()
+            .map(|(message_id, payload)| self.stored_message(message_id, payload))
+            .collect())
     }
 
     fn get_last_position(&self, topic: &str) -> Result<Option<ManagedLedgerPosition>> {
@@ -241,8 +279,24 @@ impl ManagedLedgerStorage for InMemoryManagedLedgerStorage {
         self.factory.get_message_by_id(topic, message_id)
     }
 
+    fn get_message_entry_by_id(
+        &self,
+        topic: &str,
+        message_id: &MessageId,
+    ) -> Option<StoredMessage> {
+        self.get_message_by_id(topic, message_id)
+            .map(|(message_id, payload)| self.stored_message(message_id, payload))
+    }
+
     fn get_messages(&self, topic: &str) -> Vec<(MessageId, Vec<u8>)> {
         self.factory.messages(topic).cloned().unwrap_or_default()
+    }
+
+    fn get_message_entries(&self, topic: &str) -> Vec<StoredMessage> {
+        self.get_messages(topic)
+            .into_iter()
+            .map(|(message_id, payload)| self.stored_message(message_id, payload))
+            .collect()
     }
 
     fn is_acknowledged_shared(

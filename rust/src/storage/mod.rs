@@ -17,7 +17,7 @@ pub use managed_ledger::{
     InMemoryManagedLedgerFactory, InMemoryManagedLedgerStorage, InitialPosition, ManagedCursor,
     ManagedCursorState, ManagedLedger, ManagedLedgerConfig, ManagedLedgerFactory,
     ManagedLedgerPosition, ManagedLedgerStorage, ManagedLedgerStore, MessageId, NonPersistentEntry,
-    SubscriptionCursor,
+    StoredMessage, SubscriptionCursor,
 };
 pub use metadata::{
     DomainNode, JsonFileMetadataStore, MetadataBackend, MetadataDocument, MetadataFileNode,
@@ -114,6 +114,28 @@ impl Storage {
         Ok(message_id)
     }
 
+    /// Append a message with its serialized Pulsar `MessageMetadata`.
+    pub fn append_message_with_metadata(
+        &mut self,
+        topic: &str,
+        partition: i32,
+        metadata: &[u8],
+        payload: &[u8],
+    ) -> Result<MessageId> {
+        let message_id = self
+            .managed_ledger
+            .append_message_with_metadata(topic, partition, metadata, payload)?;
+        debug!(
+            "Message appended to {}: ledger={}, entry={}, partition={}, metadata={} bytes",
+            topic,
+            message_id.ledger,
+            message_id.entry,
+            message_id.partition,
+            metadata.len()
+        );
+        Ok(message_id)
+    }
+
     /// Create or reuse a subscription for a topic.
     pub fn subscribe(&mut self, topic: &str, subscription: &str) -> Result<()> {
         if let Err(error) =
@@ -165,6 +187,15 @@ impl Storage {
         limit: usize,
     ) -> Result<Vec<(MessageId, Vec<u8>)>> {
         self.managed_ledger.read_from(topic, from, limit)
+    }
+
+    pub fn read_entries_from(
+        &self,
+        topic: &str,
+        from: &ManagedLedgerPosition,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        self.managed_ledger.read_entries_from(topic, from, limit)
     }
 
     pub fn get_last_position(&self, topic: &str) -> Result<Option<ManagedLedgerPosition>> {
@@ -246,9 +277,22 @@ impl Storage {
         self.managed_ledger.get_message_by_id(topic, message_id)
     }
 
+    pub fn get_message_entry_by_id(
+        &self,
+        topic: &str,
+        message_id: &MessageId,
+    ) -> Option<StoredMessage> {
+        self.managed_ledger
+            .get_message_entry_by_id(topic, message_id)
+    }
+
     /// Return the current in-memory message list for a topic.
     pub fn get_messages(&self, topic: &str) -> Vec<(MessageId, Vec<u8>)> {
         self.managed_ledger.get_messages(topic)
+    }
+
+    pub fn get_message_entries(&self, topic: &str) -> Vec<StoredMessage> {
+        self.managed_ledger.get_message_entries(topic)
     }
 
     /// Check whether a message is already covered by the Shared ack frontier.
@@ -302,6 +346,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn memory_store_reads_message_metadata_with_payload() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("storage.db");
+        let mut storage = Storage::new_memory(&db_path).unwrap();
+
+        let topic = "persistent://public/default/memory-metadata-store-test";
+        storage.create_topic(topic).unwrap();
+        let message_id = storage
+            .append_message_with_metadata(topic, -1, b"metadata", b"payload")
+            .unwrap();
+
+        let stored = storage
+            .get_message_entry_by_id(topic, &message_id)
+            .expect("message should be readable");
+        assert_eq!(stored.message_id, message_id);
+        assert_eq!(stored.metadata, b"metadata".to_vec());
+        assert_eq!(stored.payload, b"payload".to_vec());
+    }
+
     #[cfg(feature = "rocksdb-storage")]
     #[test]
     fn new_uses_rocksdb_managed_ledger_store_when_feature_enabled() {
@@ -342,6 +406,30 @@ mod tests {
             storage.get_message_by_id(topic, &message_id).unwrap().1,
             b"durable".to_vec()
         );
+    }
+
+    #[cfg(feature = "rocksdb-storage")]
+    #[test]
+    fn rocksdb_persists_message_metadata_across_reopen() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("storage.db");
+        let topic = "persistent://public/default/rocksdb-metadata-store-test";
+
+        let message_id = {
+            let mut storage = Storage::new_rocksdb(&db_path).unwrap();
+            storage.create_topic(topic).unwrap();
+            storage
+                .append_message_with_metadata(topic, -1, b"metadata", b"payload")
+                .unwrap()
+        };
+
+        let storage = Storage::new_rocksdb(&db_path).unwrap();
+        let stored = storage
+            .get_message_entry_by_id(topic, &message_id)
+            .expect("message should be readable after reopen");
+        assert_eq!(stored.message_id, message_id);
+        assert_eq!(stored.metadata, b"metadata".to_vec());
+        assert_eq!(stored.payload, b"payload".to_vec());
     }
 
     #[cfg(feature = "rocksdb-storage")]

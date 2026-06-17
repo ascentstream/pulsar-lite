@@ -6,7 +6,9 @@ use anyhow::{anyhow, Result};
 use rocksdb::{WriteBatch, DB};
 use std::sync::Arc;
 
-use crate::storage::{ManagedLedger, ManagedLedgerConfig, ManagedLedgerPosition, MessageId};
+use crate::storage::{
+    ManagedLedger, ManagedLedgerConfig, ManagedLedgerPosition, MessageId, StoredMessage,
+};
 
 const DEFAULT_MAX_ENTRIES_PER_LEDGER: u64 = 50_000;
 
@@ -121,6 +123,15 @@ impl RocksDBManagedLedger {
         partition: i32,
         payload: &[u8],
     ) -> Result<ManagedLedgerPosition> {
+        self.add_entry_with_partition_and_metadata(partition, &[], payload)
+    }
+
+    pub(super) fn add_entry_with_partition_and_metadata(
+        &mut self,
+        partition: i32,
+        metadata: &[u8],
+        payload: &[u8],
+    ) -> Result<ManagedLedgerPosition> {
         let mut next_info = self.info.clone();
         if next_info.current_ledger_is_full(self.max_entries_per_ledger) {
             let next_ledger_id = Self::allocate_ledger_id(&self.db)?;
@@ -133,15 +144,19 @@ impl RocksDBManagedLedger {
             partition,
         };
         current_ledger.entries += 1;
-        current_ledger.size += payload.len() as u64;
+        current_ledger.size += metadata.len() as u64 + payload.len() as u64;
         if next_info.current_ledger_is_full(self.max_entries_per_ledger) {
             let next_ledger_id = Self::allocate_ledger_id(&self.db)?;
             next_info.roll_over_current_ledger(next_ledger_id);
         }
 
-        let entry_index =
-            self.entry_log
-                .append(position.ledger_id, position.entry_id, partition, payload)?;
+        let entry_index = self.entry_log.append_with_metadata(
+            position.ledger_id,
+            position.entry_id,
+            partition,
+            metadata,
+            payload,
+        )?;
         let stored_entry_location = StoredEntryLocation::from(entry_index.clone());
 
         let mut batch = WriteBatch::default();
@@ -162,6 +177,11 @@ impl RocksDBManagedLedger {
     }
 
     pub(super) fn get_message_by_id(&self, message_id: &MessageId) -> Option<(MessageId, Vec<u8>)> {
+        self.get_message_entry_by_id(message_id)
+            .map(|entry| (entry.message_id, entry.payload))
+    }
+
+    pub(super) fn get_message_entry_by_id(&self, message_id: &MessageId) -> Option<StoredMessage> {
         self.entries
             .iter()
             .find(|(position, _)| {
@@ -171,19 +191,32 @@ impl RocksDBManagedLedger {
             })
             .and_then(|(_, index)| {
                 self.entry_log.read(index).ok().and_then(|entry| {
-                    (entry.partition == message_id.partition)
-                        .then_some((message_id.clone(), entry.payload))
+                    (entry.partition == message_id.partition).then_some(StoredMessage::new(
+                        message_id.clone(),
+                        entry.metadata,
+                        entry.payload,
+                    ))
                 })
             })
     }
 
     pub(super) fn messages(&self) -> Vec<(MessageId, Vec<u8>)> {
+        self.message_entries()
+            .into_iter()
+            .map(|entry| (entry.message_id, entry.payload))
+            .collect()
+    }
+
+    pub(super) fn message_entries(&self) -> Vec<StoredMessage> {
         self.entries
             .iter()
             .filter_map(|(position, index)| {
                 self.entry_log.read(index).ok().and_then(|entry| {
-                    (entry.partition == position.partition)
-                        .then_some((MessageId::from(position), entry.payload))
+                    (entry.partition == position.partition).then_some(StoredMessage::new(
+                        MessageId::from(position),
+                        entry.metadata,
+                        entry.payload,
+                    ))
                 })
             })
             .collect()

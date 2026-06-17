@@ -27,6 +27,28 @@ pub struct MessageId {
     pub partition: i32,
 }
 
+/// Persisted message entry returned by managed-ledger reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredMessage {
+    pub message_id: MessageId,
+    pub metadata: Vec<u8>,
+    pub payload: Vec<u8>,
+}
+
+impl StoredMessage {
+    pub fn new(message_id: MessageId, metadata: Vec<u8>, payload: Vec<u8>) -> Self {
+        Self {
+            message_id,
+            metadata,
+            payload,
+        }
+    }
+
+    pub fn from_payload(message_id: MessageId, payload: Vec<u8>) -> Self {
+        Self::new(message_id, Vec::new(), payload)
+    }
+}
+
 impl From<&MessageId> for ManagedLedgerPosition {
     fn from(value: &MessageId) -> Self {
         Self {

@@ -1,4 +1,4 @@
-use super::{CursorInitOptions, CursorOpenResult, ManagedLedgerPosition, MessageId};
+use super::{CursorInitOptions, CursorOpenResult, ManagedLedgerPosition, MessageId, StoredMessage};
 use anyhow::Result;
 
 /// Storage-level abstraction mirroring the role of Pulsar's managed-ledger
@@ -7,6 +7,17 @@ pub trait ManagedLedgerStorage: Send + Sync {
     fn create_topic(&mut self, name: &str) -> Result<()>;
 
     fn append_message(&mut self, topic: &str, partition: i32, data: &[u8]) -> Result<MessageId>;
+
+    fn append_message_with_metadata(
+        &mut self,
+        topic: &str,
+        partition: i32,
+        metadata: &[u8],
+        payload: &[u8],
+    ) -> Result<MessageId> {
+        let _ = metadata;
+        self.append_message(topic, partition, payload)
+    }
 
     fn subscribe(&mut self, topic: &str, subscription: &str) -> Result<()>;
 
@@ -37,6 +48,19 @@ pub trait ManagedLedgerStorage: Send + Sync {
     ) -> Result<Vec<(MessageId, Vec<u8>)>> {
         let _ = (topic, from, limit);
         anyhow::bail!("read_from is not implemented for this managed-ledger store")
+    }
+
+    fn read_entries_from(
+        &self,
+        topic: &str,
+        from: &ManagedLedgerPosition,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        Ok(self
+            .read_from(topic, from, limit)?
+            .into_iter()
+            .map(|(message_id, payload)| StoredMessage::from_payload(message_id, payload))
+            .collect())
     }
 
     fn get_last_position(&self, topic: &str) -> Result<Option<ManagedLedgerPosition>> {
@@ -86,7 +110,23 @@ pub trait ManagedLedgerStorage: Send + Sync {
         message_id: &MessageId,
     ) -> Option<(MessageId, Vec<u8>)>;
 
+    fn get_message_entry_by_id(
+        &self,
+        topic: &str,
+        message_id: &MessageId,
+    ) -> Option<StoredMessage> {
+        self.get_message_by_id(topic, message_id)
+            .map(|(message_id, payload)| StoredMessage::from_payload(message_id, payload))
+    }
+
     fn get_messages(&self, topic: &str) -> Vec<(MessageId, Vec<u8>)>;
+
+    fn get_message_entries(&self, topic: &str) -> Vec<StoredMessage> {
+        self.get_messages(topic)
+            .into_iter()
+            .map(|(message_id, payload)| StoredMessage::from_payload(message_id, payload))
+            .collect()
+    }
 
     fn is_acknowledged_shared(
         &self,

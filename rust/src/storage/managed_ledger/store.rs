@@ -1,6 +1,6 @@
 use super::{
     CursorInitOptions, CursorOpenResult, InMemoryManagedLedgerStorage, ManagedLedgerPosition,
-    ManagedLedgerStorage, MessageId,
+    ManagedLedgerStorage, MessageId, StoredMessage,
 };
 #[cfg(feature = "rocksdb-storage")]
 use crate::storage::rocksdb::RocksDbManagedLedgerStorage;
@@ -47,6 +47,24 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         }
     }
 
+    fn append_message_with_metadata(
+        &mut self,
+        topic: &str,
+        partition: i32,
+        metadata: &[u8],
+        payload: &[u8],
+    ) -> Result<MessageId> {
+        match self {
+            Self::Memory(inner) => {
+                inner.append_message_with_metadata(topic, partition, metadata, payload)
+            }
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(inner) => {
+                inner.append_message_with_metadata(topic, partition, metadata, payload)
+            }
+        }
+    }
+
     fn subscribe(&mut self, topic: &str, subscription: &str) -> Result<()> {
         match self {
             Self::Memory(inner) => inner.subscribe(topic, subscription),
@@ -90,6 +108,19 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
             Self::Memory(inner) => inner.read_from(topic, from, limit),
             #[cfg(feature = "rocksdb-storage")]
             Self::RocksDb(inner) => inner.read_from(topic, from, limit),
+        }
+    }
+
+    fn read_entries_from(
+        &self,
+        topic: &str,
+        from: &ManagedLedgerPosition,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        match self {
+            Self::Memory(inner) => inner.read_entries_from(topic, from, limit),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(inner) => inner.read_entries_from(topic, from, limit),
         }
     }
 
@@ -181,11 +212,31 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         }
     }
 
+    fn get_message_entry_by_id(
+        &self,
+        topic: &str,
+        message_id: &MessageId,
+    ) -> Option<StoredMessage> {
+        match self {
+            Self::Memory(inner) => inner.get_message_entry_by_id(topic, message_id),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(inner) => inner.get_message_entry_by_id(topic, message_id),
+        }
+    }
+
     fn get_messages(&self, topic: &str) -> Vec<(MessageId, Vec<u8>)> {
         match self {
             Self::Memory(inner) => inner.get_messages(topic),
             #[cfg(feature = "rocksdb-storage")]
             Self::RocksDb(inner) => inner.get_messages(topic),
+        }
+    }
+
+    fn get_message_entries(&self, topic: &str) -> Vec<StoredMessage> {
+        match self {
+            Self::Memory(inner) => inner.get_message_entries(topic),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(inner) => inner.get_message_entries(topic),
         }
     }
 

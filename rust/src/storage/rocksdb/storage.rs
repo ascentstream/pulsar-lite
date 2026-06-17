@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::storage::{
     first_unacked_from_messages, last_position_from_messages, read_from_messages,
     CursorInitOptions, CursorOpenResult, InitialPosition, ManagedCursor, ManagedLedger,
-    ManagedLedgerPosition, ManagedLedgerStorage, MessageId,
+    ManagedLedgerPosition, ManagedLedgerStorage, MessageId, StoredMessage,
 };
 
 /// RocksDB-backed managed-ledger store for persistent topics.
@@ -111,6 +111,20 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         Ok(MessageId::from(position))
     }
 
+    fn append_message_with_metadata(
+        &mut self,
+        topic: &str,
+        partition: i32,
+        metadata: &[u8],
+        payload: &[u8],
+    ) -> Result<MessageId> {
+        let ledger_name = keys::managed_ledger_name(topic);
+        let mut ledger = self.factory.open_ledger(&ledger_name)?;
+        let position =
+            ledger.add_entry_with_partition_and_metadata(partition, metadata, payload)?;
+        Ok(MessageId::from(position))
+    }
+
     fn subscribe(&mut self, _topic: &str, _subscription: &str) -> Result<()> {
         Ok(())
     }
@@ -166,6 +180,27 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
     ) -> Result<Vec<(MessageId, Vec<u8>)>> {
         let messages = self.get_messages(topic);
         Ok(read_from_messages(&messages, from, limit))
+    }
+
+    fn read_entries_from(
+        &self,
+        topic: &str,
+        from: &ManagedLedgerPosition,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        let messages = self.get_message_entries(topic);
+        let mut out = Vec::new();
+        for entry in messages {
+            let position = ManagedLedgerPosition::from(&entry.message_id);
+            if (position.ledger_id, position.entry_id) < (from.ledger_id, from.entry_id) {
+                continue;
+            }
+            out.push(entry);
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     fn get_last_position(&self, topic: &str) -> Result<Option<ManagedLedgerPosition>> {
@@ -253,11 +288,31 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
             .get_message_by_id(message_id)
     }
 
+    fn get_message_entry_by_id(
+        &self,
+        topic: &str,
+        message_id: &MessageId,
+    ) -> Option<StoredMessage> {
+        let ledger_name = keys::managed_ledger_name(topic);
+        self.factory
+            .open_ledger(&ledger_name)
+            .ok()?
+            .get_message_entry_by_id(message_id)
+    }
+
     fn get_messages(&self, topic: &str) -> Vec<(MessageId, Vec<u8>)> {
         let ledger_name = keys::managed_ledger_name(topic);
         self.factory
             .open_ledger(&ledger_name)
             .map(|ledger| ledger.messages())
+            .unwrap_or_default()
+    }
+
+    fn get_message_entries(&self, topic: &str) -> Vec<StoredMessage> {
+        let ledger_name = keys::managed_ledger_name(topic);
+        self.factory
+            .open_ledger(&ledger_name)
+            .map(|ledger| ledger.message_entries())
             .unwrap_or_default()
     }
 

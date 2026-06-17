@@ -115,7 +115,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ConnectionLimiter::new(config.max_connections, config.max_connections_per_ip);
 
     loop {
-        let (socket, peer_addr) = listener.accept().await?;
+        let ret = listener.accept().await;
+        let (socket, peer_addr) = match ret {
+            Ok((s, p)) => (s, p),
+            Err(e) => {
+                log::warn!("Error accepting connection: {}", e);
+                continue
+            }
+        };
+
         log::info!("New connection from {}", peer_addr);
 
         let permit = match connection_limiter.try_acquire(peer_addr.ip()) {

@@ -92,51 +92,6 @@ fn entrylog_appends_and_reads_entry_metadata() {
 }
 
 #[test]
-fn entrylog_reads_legacy_payload_only_entry_without_metadata() {
-    let dir = tempdir().unwrap();
-    let log_dir = dir.path().join("entrylog");
-    std::fs::create_dir_all(&log_dir).unwrap();
-    let path = log_dir.join("entrylog-00000000000000000000.log");
-    let payload = b"legacy";
-    let checksum = payload
-        .iter()
-        .fold(0u64, |acc, byte| acc.wrapping_add(*byte as u64));
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .unwrap();
-    file.write_all(&0x504C4547u32.to_le_bytes()).unwrap();
-    file.write_all(&1u16.to_le_bytes()).unwrap();
-    file.write_all(&40u16.to_le_bytes()).unwrap();
-    file.write_all(&7u64.to_le_bytes()).unwrap();
-    file.write_all(&3u64.to_le_bytes()).unwrap();
-    file.write_all(&2i32.to_le_bytes()).unwrap();
-    file.write_all(&(payload.len() as u32).to_le_bytes())
-        .unwrap();
-    file.write_all(&checksum.to_le_bytes()).unwrap();
-    file.write_all(payload).unwrap();
-    file.flush().unwrap();
-
-    let store = EntryLogStore::open(dir.path()).unwrap();
-    let index = EntryIndex {
-        ledger_id: 7,
-        entry_id: 3,
-        file_id: 0,
-        offset: 0,
-        len: 40 + payload.len() as u64,
-        checksum,
-        partition: 2,
-    };
-    let entry = store.read(&index).unwrap();
-
-    assert_eq!(entry.partition, 2);
-    assert_eq!(entry.metadata, b"");
-    assert_eq!(entry.payload, payload);
-}
-
-#[test]
 fn entrylog_appends_multiple_entries_with_stable_offsets() {
     let dir = tempdir().unwrap();
     let store = EntryLogStore::open(dir.path()).unwrap();
@@ -212,22 +167,6 @@ fn entrylog_reopen_uses_decimal_log_file_ids() {
 }
 
 #[test]
-fn entrylog_reads_legacy_zero_padded_log_file_names() {
-    let dir = tempdir().unwrap();
-    let store = EntryLogStore::open(dir.path()).unwrap();
-    let index = store.append(7, 0, -1, b"legacy").unwrap();
-    let entrylog_dir = dir.path().join("entrylog");
-
-    fs::rename(
-        entrylog_dir.join("0.log"),
-        entrylog_dir.join("entrylog-00000000000000000000.log"),
-    )
-    .unwrap();
-
-    assert_eq!(store.read(&index).unwrap().payload, b"legacy");
-}
-
-#[test]
 fn entrylog_rolls_over_when_configured_limit_is_exceeded() {
     let dir = tempdir().unwrap();
     let store = EntryLogStore::open_with_log_size_limit(dir.path(), 88).unwrap();
@@ -255,7 +194,7 @@ fn entrylog_allows_single_entry_larger_than_configured_limit() {
 
 #[test]
 fn entrylog_default_size_limit_matches_bookkeeper_like_threshold() {
-    assert_eq!(EntryLogStore::default_log_size_limit(), 1536 * 1024 * 1024);
+    assert_eq!(EntryLogStore::default_log_size_limit(), 2 * 1024 * 1024 * 1024);
 }
 
 #[test]

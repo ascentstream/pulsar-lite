@@ -4,7 +4,7 @@
  * Consistent with Apache Pulsar's PersistentDispatcherMultipleConsumers
  */
 
-use super::read_position::{commit_read_position, next_unacked_candidate};
+use super::read_position::{commit_read_position, next_unacked_candidate, ReadCandidate};
 use crate::broker::dispatcher::Dispatcher;
 use crate::broker::service::topic::SubscriptionType;
 use crate::broker::service::{Consumer, SharedStorage};
@@ -279,32 +279,37 @@ impl SharedDispatcher {
                 // Get message content from storage
                 let message_opt = {
                     let guard = storage.lock().await;
-                    guard.get_message_by_id(&topic, &msg_id)
+                    guard.get_message_entry_by_id(&topic, &msg_id)
                 };
 
-                if let Some((message_id, payload)) = message_opt {
+                if let Some(entry) = message_opt {
                     if consumer
                         .send_message(
-                            message_id.clone(),
-                            Vec::new(),
-                            payload.clone(),
+                            entry.message_id.clone(),
+                            entry.metadata.clone(),
+                            entry.payload.clone(),
                             redelivery_count + 1,
                         )
                         .await
                     {
-                        consumer.record_message_dispatched(payload.len()).await;
+                        consumer
+                            .record_message_dispatched(entry.payload.len())
+                            .await;
                         dispatched += 1;
                         redelivered += 1;
 
                         log::debug!(
                             "Redelivered message {}:{} to consumer {}, remaining permits={}",
-                            message_id.ledger,
-                            message_id.entry,
+                            entry.message_id.ledger,
+                            entry.message_id.entry,
                             consumer_id,
                             self.total_available_permits.load(Ordering::Relaxed)
                         );
                     } else {
-                        self.add_to_redelivery_queue(vec![(message_id, redelivery_count + 1)]);
+                        self.add_to_redelivery_queue(vec![(
+                            entry.message_id,
+                            redelivery_count + 1,
+                        )]);
                         consumer.add_permits(1).await;
                         self.total_available_permits.fetch_add(1, Ordering::Relaxed);
                     }
@@ -326,23 +331,30 @@ impl SharedDispatcher {
                 .get_next_dispatchable_message(storage.clone(), &topic, &subscription)
                 .await?;
 
-            if let Some((message_id, payload, next_position)) = message_opt {
+            if let Some(candidate) = message_opt {
                 if consumer
-                    .send_message(message_id.clone(), Vec::new(), payload.clone(), 0)
+                    .send_message(
+                        candidate.message_id.clone(),
+                        candidate.metadata.clone(),
+                        candidate.payload.clone(),
+                        0,
+                    )
                     .await
                 {
-                    commit_read_position(&self.read_position, next_position);
-                    consumer.record_message_dispatched(payload.len()).await;
+                    commit_read_position(&self.read_position, candidate.next_position);
+                    consumer
+                        .record_message_dispatched(candidate.payload.len())
+                        .await;
                     dispatched += 1;
 
                     log::debug!(
                         "Dispatched new message {}:{} to consumer {} via Round-Robin, remaining permits={}",
-                        message_id.ledger, message_id.entry, consumer_id,
+                        candidate.message_id.ledger, candidate.message_id.entry, consumer_id,
                         self.total_available_permits.load(Ordering::Relaxed)
                     );
                 } else {
-                    self.add_to_redelivery_queue(vec![(message_id, 0)]);
-                    commit_read_position(&self.read_position, next_position);
+                    self.add_to_redelivery_queue(vec![(candidate.message_id, 0)]);
+                    commit_read_position(&self.read_position, candidate.next_position);
                     consumer.add_permits(1).await;
                     self.total_available_permits.fetch_add(1, Ordering::Relaxed);
                 }
@@ -452,10 +464,7 @@ impl SharedDispatcher {
         storage: SharedStorage,
         topic: &str,
         subscription: &str,
-    ) -> Result<
-        Option<(MessageId, Vec<u8>, ManagedLedgerPosition)>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> Result<Option<ReadCandidate>, Box<dyn std::error::Error + Send + Sync>> {
         loop {
             let Some(candidate) =
                 next_unacked_candidate(storage.clone(), topic, subscription, &self.read_position)
@@ -469,11 +478,7 @@ impl SharedDispatcher {
                 continue;
             }
 
-            return Ok(Some((
-                candidate.message_id,
-                candidate.payload,
-                candidate.next_position,
-            )));
+            return Ok(Some(candidate));
         }
     }
 

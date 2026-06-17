@@ -267,7 +267,7 @@ impl Dispatcher for FailoverDispatcher {
                     if primary_consumer
                         .enqueue_message(
                             candidate.message_id,
-                            Vec::new(),
+                            candidate.metadata,
                             candidate.payload.clone(),
                         )
                         .await

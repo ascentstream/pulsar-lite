@@ -274,6 +274,46 @@ where
     Ok(())
 }
 
+pub async fn handle_redeliver_unacknowledged_messages(
+    cmd: BaseCommand,
+    consumers: &HashMap<u64, Arc<Consumer>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let redeliver_cmd = cmd
+        .redeliver_unacknowledged_messages
+        .as_ref()
+        .ok_or("Missing redeliver unacknowledged messages command")?;
+
+    let consumer = consumers
+        .get(&redeliver_cmd.consumer_id)
+        .ok_or_else(|| format!("Unknown consumer ID: {}", redeliver_cmd.consumer_id))?;
+
+    let message_ids = redeliver_cmd
+        .message_ids
+        .iter()
+        .map(|id| MessageId {
+            ledger: id.ledger_id,
+            entry: id.entry_id,
+            partition: id.partition.unwrap_or(-1),
+        })
+        .collect::<Vec<_>>();
+
+    log::info!(
+        "Handling RedeliverUnacknowledgedMessages command: consumer_id={}, message_ids={}",
+        redeliver_cmd.consumer_id,
+        message_ids.len()
+    );
+
+    consumer
+        .get_subscription()
+        .write()
+        .await
+        .redeliver_unacknowledged_messages(redeliver_cmd.consumer_id, message_ids)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    Ok(())
+}
+
 /// Handle CloseConsumer command (Apache Pulsar style)
 pub async fn handle_close_consumer<T>(
     framed: &mut Framed<T, PulsarFrameCodec>,

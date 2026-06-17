@@ -433,6 +433,10 @@ where
             }
             x if x == base_command::Type::Flow as i32 => self.handle_flow(base_command).await?,
             x if x == base_command::Type::Ack as i32 => self.handle_ack(base_command).await?,
+            x if x == base_command::Type::RedeliverUnacknowledgedMessages as i32 => {
+                self.handle_redeliver_unacknowledged_messages(base_command)
+                    .await?
+            }
             x if x == base_command::Type::Ping as i32 => self.handle_ping().await?,
             x if x == base_command::Type::Pong as i32 => self.handle_pong(base_command).await?,
             x if x == base_command::Type::CloseProducer as i32 => {
@@ -678,6 +682,15 @@ where
 
     async fn handle_ack(&mut self, cmd: BaseCommand) -> CnxResult<()> {
         handler::handle_ack(&mut self.framed, cmd, &self.consumers)
+            .await
+            .map_err(to_cnx_error)
+    }
+
+    async fn handle_redeliver_unacknowledged_messages(
+        &mut self,
+        cmd: BaseCommand,
+    ) -> CnxResult<()> {
+        handler::handle_redeliver_unacknowledged_messages(cmd, &self.consumers)
             .await
             .map_err(to_cnx_error)
     }

@@ -445,6 +445,7 @@ impl Subscription {
                 for message_id in message_ids {
                     self.notify_dispatcher_message_acked(message_id);
                 }
+                self.notify_dispatcher_ack_state_updated().await?;
                 Ok(())
             }
             (
@@ -488,6 +489,117 @@ impl Subscription {
         if let Some(dispatcher) = self.dispatcher.as_mut() {
             dispatcher.on_message_acknowledged(message_id);
         }
+    }
+
+    async fn notify_dispatcher_ack_state_updated(&mut self) -> Result<(), String> {
+        if let Some(dispatcher) = self.dispatcher.as_mut() {
+            dispatcher
+                .on_ack_state_updated(self.storage.clone(), &self.topic, &self.name)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub async fn redeliver_unacknowledged_messages(
+        &mut self,
+        consumer_id: u64,
+        message_ids: Vec<MessageId>,
+    ) -> Result<(), String> {
+        if !self.is_persistent() {
+            log::warn!(
+                "Ignoring redelivery command for non-persistent subscription '{}'",
+                self.name
+            );
+            return Ok(());
+        }
+
+        if !matches!(
+            self.sub_type,
+            SubscriptionType::Shared | SubscriptionType::KeyShared
+        ) {
+            log::warn!(
+                "Ignoring redelivery command for non-shared subscription '{}'",
+                self.name
+            );
+            return Ok(());
+        }
+
+        let Some(consumer) = self.get_consumer(consumer_id) else {
+            return Err(format!("Unknown consumer ID: {}", consumer_id));
+        };
+
+        let mut redeliver = Vec::new();
+        if message_ids.is_empty() {
+            redeliver.extend(
+                consumer
+                    .drain_pending_acks()
+                    .await
+                    .into_iter()
+                    .map(|(message_id, pending_ack)| {
+                        (message_id, pending_ack.redelivery_count + 1)
+                    }),
+            );
+        } else {
+            for message_id in message_ids {
+                if let Some(pending_ack) =
+                    consumer.take_pending_ack_for_redelivery(&message_id).await
+                {
+                    redeliver.push((message_id, pending_ack.redelivery_count + 1));
+                } else {
+                    log::debug!(
+                        "Consumer {} requested redelivery for non-pending message {}:{}",
+                        consumer_id,
+                        message_id.ledger,
+                        message_id.entry
+                    );
+                }
+            }
+        }
+
+        if redeliver.is_empty() {
+            return Ok(());
+        }
+
+        let mut dispatchable = Vec::with_capacity(redeliver.len());
+        {
+            let guard = self.storage.lock().await;
+            for (message_id, redelivery_count) in redeliver {
+                let acknowledged = guard
+                    .is_acknowledged(&self.topic, &self.name, &message_id)
+                    .map_err(|e| e.to_string())?;
+                if !acknowledged {
+                    dispatchable.push((message_id, redelivery_count));
+                }
+            }
+        }
+
+        if dispatchable.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(dispatcher) = self.dispatcher.as_mut() {
+            let queued = dispatchable.len();
+            dispatcher.redeliver_messages(dispatchable);
+            log::info!(
+                "Queued {} messages for redelivery on subscription '{}'",
+                queued,
+                self.name
+            );
+
+            if let Err(e) = dispatcher
+                .dispatch_messages(self.storage.clone(), self.topic.clone(), self.name.clone())
+                .await
+            {
+                log::error!(
+                    "Failed to dispatch redelivered messages for subscription '{}': {}",
+                    self.name,
+                    e
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Get a consumer by ID

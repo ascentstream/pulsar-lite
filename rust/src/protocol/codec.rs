@@ -71,6 +71,7 @@ pub fn estimate_message_parts_size(
     partition: i32,
     metadata: &Bytes,
     payload: &Bytes,
+    redelivery_count: u32,
 ) -> usize {
     use proto::pulsar::*;
 
@@ -84,6 +85,7 @@ pub fn estimate_message_parts_size(
                 partition: Some(partition),
                 ..Default::default()
             },
+            redelivery_count: Some(redelivery_count),
             ..Default::default()
         }),
         ..Default::default()
@@ -112,6 +114,7 @@ pub fn encode_message_parts(
     partition: i32,
     metadata: &Bytes,
     payload: &Bytes,
+    redelivery_count: u32,
 ) -> Result<EncodedMessageParts, io::Error> {
     use proto::pulsar::*;
 
@@ -125,6 +128,7 @@ pub fn encode_message_parts(
                 partition: Some(partition),
                 ..Default::default()
             },
+            redelivery_count: Some(redelivery_count),
             ..Default::default()
         }),
         ..Default::default()
@@ -275,6 +279,7 @@ impl Encoder<ServerCommand> for PulsarFrameCodec {
                 *partition,
                 metadata,
                 payload,
+                0,
                 dst,
             );
         }
@@ -316,6 +321,7 @@ impl Encoder<(u64, PendingMessage)> for PulsarFrameCodec {
             msg.message_id.partition,
             &msg.metadata,
             &msg.payload,
+            msg.redelivery_count,
             dst,
         )
     }
@@ -331,6 +337,7 @@ impl PulsarFrameCodec {
         partition: i32,
         metadata: &Bytes,
         payload: &Bytes,
+        redelivery_count: u32,
         dst: &mut BytesMut,
     ) -> Result<(), io::Error> {
         let parts = encode_message_parts(
@@ -340,6 +347,7 @@ impl PulsarFrameCodec {
             partition,
             metadata,
             payload,
+            redelivery_count,
         )?;
         dst.reserve(parts.header.len() + parts.metadata.len() + parts.payload.len());
         dst.extend_from_slice(parts.header.as_ref());
@@ -352,7 +360,7 @@ impl PulsarFrameCodec {
 
 #[cfg(test)]
 mod tests {
-    use super::proto::pulsar::{CompressionType, KeyValue, MessageMetadata};
+    use super::proto::pulsar::{BaseCommand, CompressionType, KeyValue, MessageMetadata};
     use super::*;
     use crate::protocol::command::ServerCommand;
     use bytes::Bytes;
@@ -461,6 +469,7 @@ mod tests {
             -1,
             &Bytes::new(),
             &Bytes::from_static(b"payload"),
+            0,
         )
         .unwrap();
         let mut rebuilt = BytesMut::new();
@@ -469,5 +478,25 @@ mod tests {
         rebuilt.extend_from_slice(parts.payload.as_ref());
 
         assert_eq!(encoded.freeze(), rebuilt.freeze());
+    }
+
+    #[test]
+    fn message_command_encodes_redelivery_count() {
+        let parts = encode_message_parts(
+            7,
+            11,
+            22,
+            -1,
+            &Bytes::new(),
+            &Bytes::from_static(b"payload"),
+            3,
+        )
+        .unwrap();
+
+        let header = parts.header.as_ref();
+        let command_size = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
+        let command = BaseCommand::decode(&header[8..8 + command_size]).unwrap();
+
+        assert_eq!(command.message.unwrap().redelivery_count, Some(3));
     }
 }

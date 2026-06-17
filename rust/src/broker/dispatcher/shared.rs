@@ -263,7 +263,7 @@ impl SharedDispatcher {
             if let Some((msg_id, redelivery_count)) = self.pop_redelivery_message() {
                 let already_acked = {
                     let guard = storage.lock().await;
-                    guard.is_acknowledged_shared(&topic, &subscription, &msg_id)
+                    guard.is_acknowledged(&topic, &subscription, &msg_id)?
                 };
                 if already_acked {
                     consumer.add_permits(1).await;
@@ -390,6 +390,50 @@ impl SharedDispatcher {
     pub fn pop_redelivery_message(&self) -> Option<(MessageId, u32)> {
         let mut redeliver = self.messages_to_redeliver.write().unwrap();
         redeliver.pop_first()
+    }
+
+    pub async fn on_ack_state_updated(
+        &self,
+        storage: SharedStorage,
+        topic: &str,
+        subscription: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let queued_message_ids = {
+            let redeliver = self.messages_to_redeliver.read().unwrap();
+            redeliver.keys().cloned().collect::<Vec<_>>()
+        };
+
+        let (acked_redeliveries, first_unacked) = {
+            let guard = storage.lock().await;
+            let mut acked_redeliveries = Vec::new();
+            for message_id in queued_message_ids {
+                if guard.is_acknowledged(topic, subscription, &message_id)? {
+                    acked_redeliveries.push(message_id);
+                }
+            }
+            let first_unacked = guard.first_unacked_position(topic, subscription)?;
+            (acked_redeliveries, first_unacked)
+        };
+
+        if !acked_redeliveries.is_empty() {
+            let mut redeliver = self.messages_to_redeliver.write().unwrap();
+            for message_id in acked_redeliveries {
+                redeliver.remove(&message_id);
+            }
+        }
+
+        let mut read_position = self.read_position.write().unwrap();
+        match (&*read_position, first_unacked) {
+            (Some(current), Some(first_unacked)) if current < &first_unacked => {
+                *read_position = Some(first_unacked);
+            }
+            (Some(_), None) => {
+                *read_position = None;
+            }
+            _ => {}
+        }
+
+        Ok(())
     }
 
     /// Check if message is pending ack by any consumer
@@ -696,5 +740,34 @@ mod tests {
         assert_ne!(first_remaining, second_remaining);
         assert!(matches!(first_remaining, 2 | 3));
         assert!(matches!(second_remaining, 2 | 3));
+    }
+
+    #[tokio::test]
+    async fn ack_state_update_prunes_acked_redelivery_entries() {
+        let storage = create_test_storage();
+        let topic = "persistent://public/default/test-topic";
+        let subscription_name = "test-sub";
+        let (acked, pending) = {
+            let mut guard = storage.lock().await;
+            guard.create_topic(topic).unwrap();
+            guard.subscribe(topic, subscription_name).unwrap();
+            let acked = guard.append_message(topic, -1, b"acked").unwrap();
+            let pending = guard.append_message(topic, -1, b"pending").unwrap();
+            guard
+                .ack_message_shared(topic, subscription_name, acked.clone())
+                .unwrap();
+            (acked, pending)
+        };
+
+        let dispatcher = SharedDispatcher::new();
+        dispatcher.add_to_redelivery_queue(vec![(acked, 0), (pending.clone(), 0)]);
+
+        dispatcher
+            .on_ack_state_updated(storage, topic, subscription_name)
+            .await
+            .unwrap();
+
+        assert_eq!(dispatcher.get_redelivery_queue_size(), 1);
+        assert_eq!(dispatcher.pop_redelivery_message().unwrap().0, pending);
     }
 }

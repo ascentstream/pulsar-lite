@@ -434,6 +434,7 @@ mod tests {
                 },
                 metadata: Bytes::new(),
                 payload: Bytes::from_static(b"occupied"),
+                redelivery_count: 0,
                 wire_size: 8,
             },
         ));

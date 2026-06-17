@@ -43,6 +43,8 @@ pub struct PendingMessage {
     pub metadata: Bytes,
     /// Message payload
     pub payload: Bytes,
+    /// Broker-side redelivery count encoded in CommandMessage.
+    pub redelivery_count: u32,
     /// Estimated encoded bytes currently pending on the connection.
     pub wire_size: usize,
 }
@@ -343,11 +345,13 @@ impl Consumer {
             message_id.partition,
             &metadata,
             &payload,
+            redelivery_count,
         );
         let msg = PendingMessage {
             message_id: message_id.clone(),
             metadata,
             payload,
+            redelivery_count,
             wire_size,
         };
 
@@ -422,6 +426,7 @@ impl Consumer {
             message_id.partition,
             &metadata,
             &payload,
+            redelivery_count,
         );
 
         // Step 3: Connection must currently be writable.
@@ -461,6 +466,7 @@ impl Consumer {
             message_id: message_id.clone(),
             metadata,
             payload,
+            redelivery_count,
             wire_size,
         };
 
@@ -558,6 +564,15 @@ impl Consumer {
             );
             false
         }
+    }
+
+    /// Remove a pending ack for broker-initiated redelivery and return its
+    /// previous delivery metadata.
+    pub async fn take_pending_ack_for_redelivery(
+        &self,
+        message_id: &MessageId,
+    ) -> Option<crate::broker::service::PendingAck> {
+        self.pending_acks.remove(message_id).await
     }
 
     pub async fn has_pending_ack(&self, message_id: &MessageId) -> bool {
@@ -970,6 +985,7 @@ mod tests {
             -1,
             &Bytes::new(),
             &Bytes::from(vec![7u8; 80]),
+            0,
         );
         write_state.observe_buffered_bytes(expected_wire_size);
         assert!(

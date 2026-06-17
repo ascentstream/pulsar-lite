@@ -117,6 +117,20 @@ impl DispatcherEnum {
         }
     }
 
+    pub fn redeliver_messages(&mut self, entries: Vec<(MessageId, u32)>) {
+        match self {
+            DispatcherEnum::Shared(d) => d.add_to_redelivery_queue(entries),
+            DispatcherEnum::Exclusive(_) | DispatcherEnum::Failover(_) => {
+                if !entries.is_empty() {
+                    log::warn!(
+                        "Ignoring redelivery request for non-shared dispatcher, entries={}",
+                        entries.len()
+                    );
+                }
+            }
+        }
+    }
+
     /// Handle consumer flow command - update permits
     pub fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {
         match self {
@@ -145,6 +159,18 @@ impl DispatcherEnum {
         match self {
             DispatcherEnum::Shared(d) => d.on_message_acknowledged(message_id),
             DispatcherEnum::Exclusive(_) | DispatcherEnum::Failover(_) => {}
+        }
+    }
+
+    pub async fn on_ack_state_updated(
+        &mut self,
+        storage: SharedStorage,
+        topic: &str,
+        subscription: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            DispatcherEnum::Shared(d) => d.on_ack_state_updated(storage, topic, subscription).await,
+            DispatcherEnum::Exclusive(_) | DispatcherEnum::Failover(_) => Ok(()),
         }
     }
 }

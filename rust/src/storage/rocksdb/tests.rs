@@ -1,5 +1,5 @@
 use super::cursor::{ack_managed_cursor_shared, RocksDBManagedCursor};
-use super::entrylog::EntryLogStore;
+use super::entrylog::{EntryIndex, EntryLogStore};
 use super::factory::RocksDBManagedLedgerFactory;
 use super::keys;
 use super::ledger::RocksDBManagedLedger;
@@ -11,7 +11,8 @@ use crate::storage::{
 };
 use prost::Message;
 use rocksdb::{Options, DB};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -58,9 +59,10 @@ fn entrylog_appends_and_reads_entry_payload() {
     assert_eq!(index.entry_id, 3);
     assert_eq!(index.file_id, 0);
     assert_eq!(index.offset, 0);
-    assert_eq!(index.len, 40 + b"payload".len() as u64);
+    assert_eq!(index.len, 44 + b"payload".len() as u64);
     assert_eq!(index.partition, 2);
     assert_eq!(entry.partition, 2);
+    assert_eq!(entry.metadata, b"");
     assert_eq!(entry.payload, b"payload");
     assert!(dir.path().join("entrylog").join("0.log").exists());
     assert!(!dir
@@ -68,6 +70,70 @@ fn entrylog_appends_and_reads_entry_payload() {
         .join("entrylog")
         .join("entrylog-00000000000000000000.log")
         .exists());
+}
+
+#[test]
+fn entrylog_appends_and_reads_entry_metadata() {
+    let dir = tempdir().unwrap();
+    let store = EntryLogStore::open(dir.path()).unwrap();
+
+    let index = store
+        .append_with_metadata(7, 3, 2, b"metadata", b"payload")
+        .unwrap();
+    let entry = store.read(&index).unwrap();
+
+    assert_eq!(
+        index.len,
+        44 + b"metadata".len() as u64 + b"payload".len() as u64
+    );
+    assert_eq!(entry.partition, 2);
+    assert_eq!(entry.metadata, b"metadata");
+    assert_eq!(entry.payload, b"payload");
+}
+
+#[test]
+fn entrylog_reads_legacy_payload_only_entry_without_metadata() {
+    let dir = tempdir().unwrap();
+    let log_dir = dir.path().join("entrylog");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let path = log_dir.join("entrylog-00000000000000000000.log");
+    let payload = b"legacy";
+    let checksum = payload
+        .iter()
+        .fold(0u64, |acc, byte| acc.wrapping_add(*byte as u64));
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .unwrap();
+    file.write_all(&0x504C4547u32.to_le_bytes()).unwrap();
+    file.write_all(&1u16.to_le_bytes()).unwrap();
+    file.write_all(&40u16.to_le_bytes()).unwrap();
+    file.write_all(&7u64.to_le_bytes()).unwrap();
+    file.write_all(&3u64.to_le_bytes()).unwrap();
+    file.write_all(&2i32.to_le_bytes()).unwrap();
+    file.write_all(&(payload.len() as u32).to_le_bytes())
+        .unwrap();
+    file.write_all(&checksum.to_le_bytes()).unwrap();
+    file.write_all(payload).unwrap();
+    file.flush().unwrap();
+
+    let store = EntryLogStore::open(dir.path()).unwrap();
+    let index = EntryIndex {
+        ledger_id: 7,
+        entry_id: 3,
+        file_id: 0,
+        offset: 0,
+        len: 40 + payload.len() as u64,
+        checksum,
+        partition: 2,
+    };
+    let entry = store.read(&index).unwrap();
+
+    assert_eq!(entry.partition, 2);
+    assert_eq!(entry.metadata, b"");
+    assert_eq!(entry.payload, payload);
 }
 
 #[test]
@@ -411,7 +477,7 @@ fn managed_ledger_entry_value_stores_location_not_payload() {
 
     assert_eq!(location.partition, -1);
     assert_eq!(location.offset, 0);
-    assert_eq!(location.len, 40 + payload.len() as u64);
+    assert_eq!(location.len, 44 + payload.len() as u64);
     assert!(!raw_value
         .windows(payload.len())
         .any(|window| window == payload));

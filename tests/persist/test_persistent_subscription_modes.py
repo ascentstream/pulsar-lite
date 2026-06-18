@@ -220,8 +220,8 @@ def test_persistent_key_shared_routes_same_key_to_same_consumer(tmp_path, unique
             owner_1, first = receive_from_any([consumer_1, consumer_2], timeout_secs=10)
             owner_2, second = receive_from_any([consumer_1, consumer_2], timeout_secs=10)
 
-            assert {first.data(), second.data()} == {b"same-key-0", b"same-key-1"}
-            assert owner_1.consumer_name() == owner_2.consumer_name()
+            assert [first.data(), second.data()] == [b"same-key-0", b"same-key-1"]
+            assert owner_1 is owner_2
             owner_1.acknowledge(first)
             owner_2.acknowledge(second)
         finally:
@@ -260,12 +260,11 @@ def test_persistent_key_shared_unacked_redelivery_preserves_key_owner(
             owner, first = receive_from_any([consumer_1, consumer_2], timeout_secs=10)
             assert first.data() == b"key-redelivery"
             survivor = consumer_2 if owner is consumer_1 else consumer_1
-            owner_name = owner.consumer_name()
             owner.close()
 
             redelivered = survivor.receive(timeout_millis=5000)
             assert redelivered.data() == b"key-redelivery"
-            assert survivor.consumer_name() == owner_name
+            assert redelivered.redelivery_count() >= 1
             survivor.acknowledge(redelivered)
         finally:
             client.close()

@@ -4,8 +4,8 @@
  */
 
 use super::traits::Dispatcher;
-use super::{ExclusiveDispatcher, FailoverDispatcher, SharedDispatcher};
-use crate::broker::service::topic::SubscriptionType;
+use super::{ExclusiveDispatcher, FailoverDispatcher, KeySharedDispatcher, SharedDispatcher};
+use crate::broker::service::topic::{KeySharedPolicy, SubscriptionType};
 use crate::broker::service::{Consumer, SharedStorage};
 use crate::storage::{ManagedLedgerPosition, MessageId};
 use std::sync::Arc;
@@ -16,18 +16,25 @@ pub enum DispatcherEnum {
     Exclusive(ExclusiveDispatcher),
     Shared(SharedDispatcher),
     Failover(FailoverDispatcher),
+    KeyShared(KeySharedDispatcher),
 }
 
 impl DispatcherEnum {
     /// Create a new DispatcherEnum based on subscription type
     pub fn new(sub_type: SubscriptionType) -> Self {
+        Self::new_with_key_shared_policy(sub_type, None)
+    }
+
+    pub fn new_with_key_shared_policy(
+        sub_type: SubscriptionType,
+        key_shared_policy: Option<KeySharedPolicy>,
+    ) -> Self {
         match sub_type {
             SubscriptionType::Exclusive => DispatcherEnum::Exclusive(ExclusiveDispatcher::new()),
             SubscriptionType::Shared => DispatcherEnum::Shared(SharedDispatcher::new()),
             SubscriptionType::Failover => DispatcherEnum::Failover(FailoverDispatcher::new()),
             SubscriptionType::KeyShared => {
-                log::warn!("KeyShared not yet implemented, falling back to Shared");
-                DispatcherEnum::Shared(SharedDispatcher::new())
+                DispatcherEnum::KeyShared(KeySharedDispatcher::new(key_shared_policy))
             }
         }
     }
@@ -37,6 +44,7 @@ impl DispatcherEnum {
             DispatcherEnum::Exclusive(_) => SubscriptionType::Exclusive,
             DispatcherEnum::Shared(_) => SubscriptionType::Shared,
             DispatcherEnum::Failover(_) => SubscriptionType::Failover,
+            DispatcherEnum::KeyShared(_) => SubscriptionType::KeyShared,
         }
     }
 
@@ -45,6 +53,7 @@ impl DispatcherEnum {
             DispatcherEnum::Exclusive(d) => d.is_consumer_connected(),
             DispatcherEnum::Shared(d) => d.is_consumer_connected(),
             DispatcherEnum::Failover(d) => d.is_consumer_connected(),
+            DispatcherEnum::KeyShared(d) => d.is_consumer_connected(),
         }
     }
 
@@ -53,6 +62,7 @@ impl DispatcherEnum {
             DispatcherEnum::Exclusive(d) => d.add_consumer(consumer),
             DispatcherEnum::Shared(d) => d.add_consumer(consumer),
             DispatcherEnum::Failover(d) => d.add_consumer(consumer),
+            DispatcherEnum::KeyShared(d) => d.add_consumer(consumer),
         }
     }
 
@@ -61,6 +71,7 @@ impl DispatcherEnum {
             DispatcherEnum::Exclusive(d) => d.remove_consumer(consumer_id),
             DispatcherEnum::Shared(d) => d.remove_consumer(consumer_id),
             DispatcherEnum::Failover(d) => d.remove_consumer(consumer_id),
+            DispatcherEnum::KeyShared(d) => d.remove_consumer(consumer_id),
         }
     }
 
@@ -69,6 +80,7 @@ impl DispatcherEnum {
             DispatcherEnum::Exclusive(d) => d.init_read_position(pos),
             DispatcherEnum::Shared(d) => d.init_read_position(pos),
             DispatcherEnum::Failover(d) => d.init_read_position(pos),
+            DispatcherEnum::KeyShared(d) => d.init_read_position(pos),
         }
     }
 
@@ -92,6 +104,10 @@ impl DispatcherEnum {
                 d.remove_consumer_with_recovery(consumer_id, storage, topic, subscription)
                     .await
             }
+            DispatcherEnum::KeyShared(d) => {
+                d.remove_consumer_with_recovery(consumer_id, storage, topic, subscription)
+                    .await
+            }
         }
     }
 
@@ -100,6 +116,7 @@ impl DispatcherEnum {
             DispatcherEnum::Exclusive(d) => d.get_consumers(),
             DispatcherEnum::Shared(d) => d.get_consumers(),
             DispatcherEnum::Failover(d) => d.get_consumers(),
+            DispatcherEnum::KeyShared(d) => d.get_consumers(),
         }
     }
 
@@ -113,13 +130,14 @@ impl DispatcherEnum {
         match self {
             DispatcherEnum::Failover(d) => d.get_active_consumer(),
             DispatcherEnum::Exclusive(d) => d.get_consumers().into_iter().next(),
-            DispatcherEnum::Shared(_) => None,
+            DispatcherEnum::Shared(_) | DispatcherEnum::KeyShared(_) => None,
         }
     }
 
     pub fn redeliver_messages(&mut self, entries: Vec<(MessageId, u32)>) {
         match self {
             DispatcherEnum::Shared(d) => d.add_to_redelivery_queue(entries),
+            DispatcherEnum::KeyShared(d) => d.add_to_redelivery_queue(entries),
             DispatcherEnum::Exclusive(_) | DispatcherEnum::Failover(_) => {
                 if !entries.is_empty() {
                     log::warn!(
@@ -137,6 +155,7 @@ impl DispatcherEnum {
             DispatcherEnum::Exclusive(d) => d.consumer_flow(consumer_id, additional_permits),
             DispatcherEnum::Shared(d) => d.consumer_flow(consumer_id, additional_permits),
             DispatcherEnum::Failover(d) => d.consumer_flow(consumer_id, additional_permits),
+            DispatcherEnum::KeyShared(d) => d.consumer_flow(consumer_id, additional_permits),
         }
     }
 
@@ -151,6 +170,7 @@ impl DispatcherEnum {
             DispatcherEnum::Exclusive(d) => d.dispatch_messages(storage, topic, subscription).await,
             DispatcherEnum::Shared(d) => d.dispatch_messages(storage, topic, subscription).await,
             DispatcherEnum::Failover(d) => d.dispatch_messages(storage, topic, subscription).await,
+            DispatcherEnum::KeyShared(d) => d.dispatch_messages(storage, topic, subscription).await,
         }
     }
 
@@ -158,6 +178,7 @@ impl DispatcherEnum {
     pub fn on_message_acknowledged(&mut self, message_id: &MessageId) {
         match self {
             DispatcherEnum::Shared(d) => d.on_message_acknowledged(message_id),
+            DispatcherEnum::KeyShared(d) => d.on_message_acknowledged(message_id),
             DispatcherEnum::Exclusive(_) | DispatcherEnum::Failover(_) => {}
         }
     }
@@ -170,6 +191,9 @@ impl DispatcherEnum {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match self {
             DispatcherEnum::Shared(d) => d.on_ack_state_updated(storage, topic, subscription).await,
+            DispatcherEnum::KeyShared(d) => {
+                d.on_ack_state_updated(storage, topic, subscription).await
+            }
             DispatcherEnum::Exclusive(_) | DispatcherEnum::Failover(_) => Ok(()),
         }
     }
@@ -181,6 +205,7 @@ impl std::fmt::Debug for DispatcherEnum {
             DispatcherEnum::Exclusive(_) => write!(f, "Exclusive"),
             DispatcherEnum::Shared(_) => write!(f, "Shared"),
             DispatcherEnum::Failover(_) => write!(f, "Failover"),
+            DispatcherEnum::KeyShared(_) => write!(f, "KeyShared"),
         }
     }
 }

@@ -72,15 +72,18 @@ enum DecodeState {
 | **Ack** | 24 | C→S | 确认消息 | ✅ |
 | **AckResponse** | 25 | S→C | 确认响应（可选） | ✅ |
 | **CloseConsumer** | 19 | C→S | 关闭消费者 | ✅ |
+| **RedeliverUnacknowledgedMessages** | 26 | C→S | 重新投递未确认消息（Shared/KeyShared persistent） | ✅ |
 
-### 待实现的命令
+### 订阅模式（通过 Subscribe 命令选择）
 
-| 命令 | 类型值 | 方向 | 说明 | 状态 |
-|------|--------|------|------|------|
-| RedeliverUnacknowledgedMessages | 26 | C→S | 重新投递未确认消息 | ⏳ |
-| Exclusive 订阅 | - | - | 独占订阅模式 | ⏳ |
-| Failover 订阅 | - | - | 故障转移订阅模式 | ⏳ |
-| Key_Shared 订阅 | - | - | 按键共享订阅模式 | ⏳ |
+| 模式 | 说明 | Persistent | Non-Persistent |
+|------|------|------------|----------------|
+| Shared | 多消费者 round-robin | ✅ | ✅ |
+| Exclusive | 单消费者独占 | ✅ | ✅ |
+| Failover | 主备切换（priority + rewind） | ✅ | ✅ |
+| Key_Shared | 按 ordering_key sticky 路由 | ✅ | ✅ |
+
+> Persistent 订阅使用 `initialize_or_open_cursor` + dispatcher `read_position` + hole-aware `read_from`；negative ack / ack timeout 由官方客户端发送 `RedeliverUnacknowledgedMessages` 触发，broker 不实现独立 ack-timeout 定时器。
 
 ## 交互流程
 
@@ -122,12 +125,12 @@ Client                              Server
   |                                     |
 ```
 
-### 3. 消费者流程（Shared 模式）
+### 3. 消费者流程
 
 ```
 Client                              Server
   |                                     |
-  |-- Subscribe (topic, sub) --------> |  # 订阅 Topic（Shared 模式）
+  |-- Subscribe (topic, sub, type) --> |  # Shared / Exclusive / Failover / KeyShared
   |                                     |
   |   <-- Success -------------------  |  # consumer_id
   |                                     |
@@ -141,18 +144,19 @@ Client                              Server
   |                                     |
   |   <-- AckResponse (optional) ----  |  # 仅当 request_id 存在时响应
   |                                     |
+  |-- Redeliver (consumer_id) -------> |  # 可选：nack / ack_timeout / 显式 redeliver
+  |                                     |
   |-- CloseConsumer (consumer_id) ---> |  # 关闭消费者
   |                                     |
   |   <-- Success -------------------  |  # 关闭成功
   |                                     |
 ```
 
-**Shared 模式特性**:
-- 多个消费者共享同一订阅
-- 消息通过 round-robin 分配给不同消费者
-- 每个消息只被一个消费者处理
-- 使用 `dispatcherMaxRoundRobinBatchSize = 20` (与 Apache Pulsar 一致)
-- 消息分配追踪避免重复消费
+**订阅模式特性**:
+- **Shared / KeyShared**: 多消费者；KeyShared 按 `ordering_key` sticky 路由
+- **Exclusive / Failover**: SingleActive；Failover 按 priority + name 选 active，active 关闭时 rewind
+- Persistent 读路径：`redelivery-first` → `read_from(read_position)` → pending/ack 过滤
+- 使用 `dispatcherMaxRoundRobinBatchSize = 20`（与 Apache Pulsar 一致）
 
 ## 实现细节
 
@@ -174,6 +178,7 @@ broker/
     ├── handle_subscribe()
     ├── handle_flow()
     ├── handle_ack()
+    ├── handle_redeliver_unacknowledged_messages()
     └── handle_close_consumer()
 ```
 

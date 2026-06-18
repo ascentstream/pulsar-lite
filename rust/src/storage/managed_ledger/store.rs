@@ -65,14 +65,6 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         }
     }
 
-    fn subscribe(&mut self, topic: &str, subscription: &str) -> Result<()> {
-        match self {
-            Self::Memory(inner) => inner.subscribe(topic, subscription),
-            #[cfg(feature = "rocksdb-storage")]
-            Self::RocksDb(inner) => inner.subscribe(topic, subscription),
-        }
-    }
-
     fn initialize_or_open_cursor(
         &mut self,
         topic: &str,
@@ -154,23 +146,6 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
             Self::Memory(inner) => inner.is_acknowledged(topic, subscription, message_id),
             #[cfg(feature = "rocksdb-storage")]
             Self::RocksDb(inner) => inner.is_acknowledged(topic, subscription, message_id),
-        }
-    }
-
-    fn get_next_unassigned_message(
-        &mut self,
-        topic: &str,
-        subscription: &str,
-        consumer_id: u64,
-    ) -> Result<Option<(MessageId, Vec<u8>)>> {
-        match self {
-            Self::Memory(inner) => {
-                inner.get_next_unassigned_message(topic, subscription, consumer_id)
-            }
-            #[cfg(feature = "rocksdb-storage")]
-            Self::RocksDb(inner) => {
-                inner.get_next_unassigned_message(topic, subscription, consumer_id)
-            }
         }
     }
 

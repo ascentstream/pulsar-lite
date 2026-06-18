@@ -4,7 +4,9 @@ use crate::broker::service::topic::{
 };
 use crate::broker::service::{Consumer, Producer, SharedStorage};
 use crate::protocol::codec::proto::pulsar::MessageMetadata;
-use crate::storage::{CursorInitOptions, InitialPosition, Storage};
+use crate::storage::Storage;
+#[cfg(feature = "rocksdb-storage")]
+use crate::storage::{CursorInitOptions, InitialPosition};
 use bytes::Bytes;
 use prost::Message;
 use std::path::Path;
@@ -13,6 +15,7 @@ use std::time::Instant;
 #[cfg(feature = "rocksdb-storage")]
 use tempfile::tempdir;
 use tokio::sync::{mpsc, Mutex, RwLock};
+#[cfg(feature = "rocksdb-storage")]
 use tokio::time::{timeout, Duration};
 
 fn create_test_storage() -> SharedStorage {
@@ -117,7 +120,6 @@ async fn persistent_topic_dispatch_recovers_message_metadata_from_rocksdb() {
         let storage = StdArc::new(Mutex::new(Storage::new(&db_path).unwrap()));
         {
             let mut guard = storage.lock().await;
-            guard.subscribe(topic_name, subscription_name).unwrap();
             guard
                 .initialize_or_open_cursor(
                     topic_name,

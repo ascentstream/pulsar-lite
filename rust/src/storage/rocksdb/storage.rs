@@ -125,10 +125,6 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         Ok(MessageId::from(position))
     }
 
-    fn subscribe(&mut self, _topic: &str, _subscription: &str) -> Result<()> {
-        Ok(())
-    }
-
     fn initialize_or_open_cursor(
         &mut self,
         topic: &str,
@@ -224,26 +220,6 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         message_id: &MessageId,
     ) -> Result<bool> {
         Ok(self.is_acknowledged_shared(topic, subscription, message_id))
-    }
-
-    fn get_next_unassigned_message(
-        &mut self,
-        topic: &str,
-        subscription: &str,
-        _consumer_id: u64,
-    ) -> Result<Option<(MessageId, Vec<u8>)>> {
-        let ledger_name = keys::managed_ledger_name(topic);
-        let cursor_name = keys::encode_cursor_name(subscription);
-        let mut ledger = self.factory.open_ledger(&ledger_name)?;
-        let cursor = ledger.open_cursor(&cursor_name)?;
-        for (message_id, payload) in self.get_messages(topic) {
-            let position = ManagedLedgerPosition::from(&message_id);
-            if is_managed_position_acknowledged(cursor.state(), &position) {
-                continue;
-            }
-            return Ok(Some((message_id, payload)));
-        }
-        Ok(None)
     }
 
     fn ack_message(

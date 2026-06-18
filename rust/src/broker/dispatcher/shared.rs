@@ -608,7 +608,7 @@ impl Dispatcher for SharedDispatcher {
 mod tests {
     use super::*;
     use crate::broker::service::topic::Subscription;
-    use crate::storage::Storage;
+    use crate::storage::{CursorInitOptions, InitialPosition, Storage};
     use std::path::Path;
     use tokio::sync::{mpsc, Mutex, RwLock};
 
@@ -755,7 +755,16 @@ mod tests {
         let (acked, pending) = {
             let mut guard = storage.lock().await;
             guard.create_topic(topic).unwrap();
-            guard.subscribe(topic, subscription_name).unwrap();
+            guard
+                .initialize_or_open_cursor(
+                    topic,
+                    subscription_name,
+                    CursorInitOptions {
+                        initial_position: InitialPosition::Earliest,
+                        start_message_id: None,
+                    },
+                )
+                .unwrap();
             let acked = guard.append_message(topic, -1, b"acked").unwrap();
             let pending = guard.append_message(topic, -1, b"pending").unwrap();
             guard

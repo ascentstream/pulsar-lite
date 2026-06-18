@@ -109,10 +109,6 @@ impl ManagedLedgerStorage for InMemoryManagedLedgerStorage {
         Ok(message_id)
     }
 
-    fn subscribe(&mut self, _topic: &str, _subscription: &str) -> Result<()> {
-        Ok(())
-    }
-
     fn initialize_or_open_cursor(
         &mut self,
         topic: &str,
@@ -196,45 +192,6 @@ impl ManagedLedgerStorage for InMemoryManagedLedgerStorage {
         message_id: &MessageId,
     ) -> Result<bool> {
         Ok(self.is_acknowledged_inner(topic, subscription, message_id))
-    }
-
-    fn get_next_unassigned_message(
-        &mut self,
-        topic: &str,
-        subscription: &str,
-        _consumer_id: u64,
-    ) -> Result<Option<(MessageId, Vec<u8>)>> {
-        let cursor_key = format!("{}:{}", topic, subscription);
-        let current_entry = self.cursors.get(&cursor_key).copied().unwrap_or(u64::MAX);
-        let shared_cursor = self.subscription_cursors.get(&cursor_key);
-
-        let mut next_message = None;
-        if let Some(messages) = self.factory.messages(topic) {
-            if messages.is_empty() {
-                return Ok(None);
-            }
-
-            for (message_id, data) in messages {
-                let is_acknowledged = if shared_cursor.is_some() {
-                    is_message_acknowledged(shared_cursor, message_id.entry)
-                } else {
-                    current_entry != u64::MAX && message_id.entry <= current_entry
-                };
-
-                if is_acknowledged {
-                    continue;
-                }
-
-                next_message = Some((message_id.clone(), data.clone()));
-                break;
-            }
-        }
-
-        if let Some((message_id, data)) = next_message {
-            return Ok(Some((message_id, data)));
-        }
-
-        Ok(None)
     }
 
     fn ack_message(

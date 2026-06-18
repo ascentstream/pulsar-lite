@@ -1,6 +1,6 @@
 use crate::broker::service::topic::{Subscription, SubscriptionType};
 use crate::broker::service::{Consumer, PendingMessage, SharedStorage};
-use crate::storage::Storage;
+use crate::storage::{CursorInitOptions, InitialPosition, Storage};
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -9,6 +9,19 @@ use tokio::time::{timeout, Duration};
 
 fn create_persistent_storage(path: &Path) -> SharedStorage {
     Arc::new(Mutex::new(Storage::new(path).unwrap()))
+}
+
+fn open_earliest_cursor(storage: &mut Storage, topic: &str, subscription: &str) {
+    storage
+        .initialize_or_open_cursor(
+            topic,
+            subscription,
+            CursorInitOptions {
+                initial_position: InitialPosition::Earliest,
+                start_message_id: None,
+            },
+        )
+        .unwrap();
 }
 
 fn create_persistent_subscription(
@@ -71,7 +84,7 @@ async fn persistent_exclusive_dispatches_recovered_backlog() {
     {
         let mut storage = Storage::new(&db_path).unwrap();
         storage.create_topic(topic).unwrap();
-        storage.subscribe(topic, subscription_name).unwrap();
+        open_earliest_cursor(&mut storage, topic, subscription_name);
         storage.append_message(topic, -1, b"backlog").unwrap();
     }
 
@@ -104,7 +117,7 @@ async fn persistent_exclusive_ack_cursor_recovers_after_reopen() {
     {
         let mut storage = Storage::new(&db_path).unwrap();
         storage.create_topic(topic).unwrap();
-        storage.subscribe(topic, subscription_name).unwrap();
+        open_earliest_cursor(&mut storage, topic, subscription_name);
         storage.append_message(topic, -1, b"acked").unwrap();
         storage.append_message(topic, -1, b"pending").unwrap();
     }
@@ -172,7 +185,7 @@ async fn persistent_shared_ack_state_recovers_after_reopen() {
     {
         let mut storage = Storage::new(&db_path).unwrap();
         storage.create_topic(topic).unwrap();
-        storage.subscribe(topic, subscription_name).unwrap();
+        open_earliest_cursor(&mut storage, topic, subscription_name);
         storage.append_message(topic, -1, b"first").unwrap();
         storage.append_message(topic, -1, b"second").unwrap();
         storage.append_message(topic, -1, b"acked-hole").unwrap();

@@ -5,7 +5,7 @@ mod resources;
 pub(crate) mod rocksdb;
 
 use anyhow::Result;
-use log::{debug, info, warn};
+use log::{debug, info};
 use std::path::Path;
 
 #[cfg(feature = "rocksdb-storage")]
@@ -136,31 +136,6 @@ impl Storage {
         Ok(message_id)
     }
 
-    /// Create or reuse a subscription for a topic.
-    pub fn subscribe(&mut self, topic: &str, subscription: &str) -> Result<()> {
-        if let Err(error) =
-            self.resources_mut()
-                .ensure_subscription(topic, subscription, Self::METADATA_VERSION)
-        {
-            warn!(
-                "Skipping metadata persistence for subscription '{}' on topic '{}': {}",
-                subscription, topic, error
-            );
-        }
-
-        let key = format!("{}:{}", topic, subscription);
-        if self.managed_ledger.subscribe(topic, subscription).is_ok() {
-            info!(
-                "Subscribed to topic {} with subscription {}",
-                topic, subscription
-            );
-        } else {
-            info!("Subscription {} already exists for topic {}", key, topic);
-        }
-
-        Ok(())
-    }
-
     pub fn initialize_or_open_cursor(
         &mut self,
         topic: &str,
@@ -218,17 +193,6 @@ impl Storage {
     ) -> Result<bool> {
         self.managed_ledger
             .is_acknowledged(topic, subscription, message_id)
-    }
-
-    /// Return the next deliverable message for the current in-memory flow.
-    pub fn get_next_unassigned_message(
-        &mut self,
-        topic: &str,
-        subscription: &str,
-        consumer_id: u64,
-    ) -> Result<Option<(MessageId, Vec<u8>)>> {
-        self.managed_ledger
-            .get_next_unassigned_message(topic, subscription, consumer_id)
     }
 
     /// Acknowledge a message under cumulative-style cursor semantics.
@@ -327,6 +291,19 @@ mod tests {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("test-storage-{unique}.db"));
         Storage::new_memory(&path).unwrap()
+    }
+
+    fn open_earliest_cursor(storage: &mut Storage, topic: &str, subscription: &str) {
+        storage
+            .initialize_or_open_cursor(
+                topic,
+                subscription,
+                CursorInitOptions {
+                    initial_position: InitialPosition::Earliest,
+                    start_message_id: None,
+                },
+            )
+            .unwrap();
     }
 
     #[test]
@@ -443,7 +420,7 @@ mod tests {
         let acked = {
             let mut storage = Storage::new_rocksdb(&db_path).unwrap();
             storage.create_topic(topic).unwrap();
-            storage.subscribe(topic, subscription).unwrap();
+            open_earliest_cursor(&mut storage, topic, subscription);
             storage.append_message(topic, -1, b"0").unwrap();
             let msg1 = storage.append_message(topic, -1, b"1").unwrap();
             storage
@@ -452,13 +429,11 @@ mod tests {
             msg1
         };
 
-        let mut storage = Storage::new_rocksdb(&db_path).unwrap();
-        assert_eq!(
-            storage
-                .get_next_unassigned_message(topic, subscription, 1)
-                .unwrap(),
-            None
-        );
+        let storage = Storage::new_rocksdb(&db_path).unwrap();
+        assert!(storage
+            .first_unacked_position(topic, subscription)
+            .unwrap()
+            .is_none());
         assert_eq!(
             storage.get_mark_delete_position(topic, subscription),
             Some(acked.entry)
@@ -476,7 +451,7 @@ mod tests {
         let (msg0, msg1, msg2) = {
             let mut storage = Storage::new_rocksdb(&db_path).unwrap();
             storage.create_topic(topic).unwrap();
-            storage.subscribe(topic, subscription).unwrap();
+            open_earliest_cursor(&mut storage, topic, subscription);
             let msg0 = storage.append_message(topic, -1, b"0").unwrap();
             let msg1 = storage.append_message(topic, -1, b"1").unwrap();
             let msg2 = storage.append_message(topic, -1, b"2").unwrap();
@@ -512,7 +487,7 @@ mod tests {
         let sub = "sub";
 
         storage.create_topic(topic).unwrap();
-        storage.subscribe(topic, sub).unwrap();
+        open_earliest_cursor(&mut storage, topic, sub);
 
         let msg0 = storage.append_message(topic, -1, b"0").unwrap();
         let msg1 = storage.append_message(topic, -1, b"1").unwrap();
@@ -541,7 +516,7 @@ mod tests {
         let sub = "sub";
 
         storage.create_topic(topic).unwrap();
-        storage.subscribe(topic, sub).unwrap();
+        open_earliest_cursor(&mut storage, topic, sub);
         for i in 0..6u8 {
             storage.append_message(topic, -1, &[i]).unwrap();
         }
@@ -556,11 +531,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(storage.get_mark_delete_position(topic, sub), None);
-        let next = storage
-            .get_next_unassigned_message(topic, sub, 1)
-            .unwrap()
-            .unwrap();
-        assert_eq!(next.0.entry, 0);
+        assert_eq!(
+            storage
+                .first_unacked_position(topic, sub)
+                .unwrap()
+                .unwrap()
+                .entry_id,
+            0
+        );
         assert!(storage.is_acknowledged_shared(topic, sub, &msg5));
     }
 

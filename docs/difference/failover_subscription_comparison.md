@@ -1,6 +1,6 @@
 # Failover Dispatcher 实现对比分析
 
-> 分析日期: 2026-03-09
+> 分析日期: 2026-03-09（2026-06 更新：persistent Failover SingleActive rewind / priority 已落地）
 > 对比版本: Pulsar Lite (当前实现) vs Apache Pulsar (官方实现)
 
 ---
@@ -14,60 +14,23 @@
 ```rust
 pub struct FailoverDispatcher {
     consumers: Vec<Arc<Consumer>>,
+    active_consumer_id: Option<u64>,
     total_available_permits: AtomicU32,
+    read_position: RwLock<Option<ManagedLedgerPosition>>,
 }
 
-// 消息分发逻辑
-async fn dispatch_messages(&self, ...) {
-    // 只分发给第一个消费者
-    if let Some(primary_consumer) = self.consumers.first() {
-        // 检查 permits
-        let available_permits = self.total_available_permits.load(Ordering::Relaxed);
-        if available_permits == 0 {
-            return Ok(());
-        }
-
-        let max_messages = std::cmp::min(available_permits, DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE);
-
-        for _ in 0..max_messages {
-            if !primary_consumer.use_permit().await {
-                break;
-            }
-            self.total_available_permits.fetch_sub(1, Ordering::Relaxed);
-
-            let message_opt = {
-                let mut guard = storage.lock().await;
-                guard.get_next_unassigned_message(&topic, &subscription, primary_consumer.consumer_id)?
-            };
-
-            if let Some((message_id, payload)) = message_opt {
-                primary_consumer.enqueue_message(message_id, payload.clone()).await;
-                primary_consumer.record_message_dispatched(payload.len()).await;
-            } else {
-                primary_consumer.add_permits(1).await;
-                self.total_available_permits.fetch_add(1, Ordering::Relaxed);
-                break;
-            }
-        }
-    }
-}
-
-// 移除消费者
-fn remove_consumer(&mut self, consumer_id: u64) -> Option<Arc<Consumer>> {
-    if let Some(pos) = self.consumers.iter().position(|c| c.consumer_id == consumer_id) {
-        Some(self.consumers.remove(pos))
-    } else {
-        None
-    }
-}
+// 消息分发：仅 active consumer；读路径 read_from(read_position)
+// remove_consumer_with_recovery：active 关闭时 drain pending → rewind_read_position → promote
 ```
 
-**分析**:
-- ✅ 简单的 Vec 存储消费者，第一个为 Primary
-- ❌ **无消费者优先级支持**
-- ❌ **无 Failover 延迟机制**
-- ❌ **无 Active Consumer 切换通知**
-- ❌ **无 Cursor Rewind 逻辑**
+**分析（2026-06）**:
+- ✅ 按 priority + consumer name 排序并选择 active
+- ✅ Active Consumer 变更通知（`notify_active_consumer_change`）
+- ✅ **Persistent Cursor Rewind**（`single_active::rewind_read_position`）
+- ✅ `read_position` 由 dispatcher 持有，配合 hole-aware 读
+- ❌ **无 Failover 延迟机制**（默认 1000ms）
+- ❌ **无 Pending Read 取消**（异步 read 链简化）
+- ❌ **无一致性哈希 / 分区 topic 主消费者策略**
 
 ### 1.2 原生 Pulsar 实现
 
@@ -215,19 +178,19 @@ public void redeliverUnacknowledgedMessages(Consumer consumer, long consumerEpoc
 
 | 特性 | Pulsar Lite | 原生 Pulsar | 影响等级 |
 |------|-------------|-------------|----------|
-| **基本分发** | ✅ 第一个消费者 | ✅ Active Consumer | 低 |
-| **消费者优先级** | ❌ 不支持 | ✅ priorityLevel 排序 | **高** |
+| **基本分发** | ✅ Active Consumer | ✅ Active Consumer | 低 |
+| **消费者优先级** | ✅ priority + name | ✅ priorityLevel 排序 | 低 |
 | **分区 Topic 支持** | ❌ 简单列表 | ✅ partitionIndex % consumersSize | **高** |
 | **一致性哈希** | ❌ 不支持 | ✅ 100 虚拟节点 (可选) | 中 |
 | **Failover 延迟** | ❌ 立即切换 | ✅ 1000ms 延迟 (可配置) | **高** |
-| **Cursor Rewind** | ❌ 无 | ✅ 从 unacked 重读 | **高** |
-| **Active 通知** | ❌ 无 | ✅ notifyActiveConsumerChange | 中 |
+| **Cursor Rewind** | ✅ persistent（SingleActive） | ✅ 从 unacked 重读 | 低 |
+| **Active 通知** | ✅ notifyActiveConsumerChange | ✅ notifyActiveConsumerChange | 低 |
 | **Pending Read 取消** | ❌ 无 | ✅ cancelPendingRead | **高** |
-| **消费者断开处理** | ⚠️ 简单移除 | ✅ 完整切换逻辑 | **高** |
+| **消费者断开处理** | ✅ rewind + promote（persistent） | ✅ 完整切换逻辑 | 中 |
 | **Topic 转移检测** | ❌ 无 | ✅ isTransferring 检查 | 中 |
 | **Dispatch Rate Limiter** | ❌ 无 | ✅ 流量限制 | 低 |
 | **Compacted Topic 支持** | ❌ 无 | ✅ readCompacted | 低 |
-| **重投递未确认消息** | ❌ 无 | ✅ redeliverUnacknowledgedMessages | **高** |
+| **Redeliver 命令** | ❌ SingleActive 忽略（靠 close rewind） | ✅ redeliverUnacknowledgedMessages | 中 |
 | **Consumer Epoch** | ❌ 无 | ✅ 防止旧请求干扰 | 中 |
 
 ---
@@ -239,19 +202,21 @@ public void redeliverUnacknowledgedMessages(Consumer consumer, long consumerEpoc
 | 功能 | 优先级 | 影响 | 描述 |
 |------|--------|------|------|
 | **Failover 延迟机制** | 高 | 消息可能重复 | 切换时需要等待 pending 消息处理完成 |
-| **Cursor Rewind** | 高 | 消息可能丢失 | 主消费者切换后需要从 unacked 位置重读 |
 | **Pending Read 取消** | 高 | 消息状态混乱 | 需要取消旧消费者的 pending read |
-| **消费者优先级** | 高 | 无法控制主消费者 | 需要按优先级选择 Active Consumer |
-| **重投递未确认消息** | 高 | 消息无法恢复 | 需要支持 redeliverUnacknowledgedMessages |
+| **分区 Topic 主消费者分配** | 中 | 主消费者分布不均 | 需要根据 partitionIndex 分配 |
+| **一致性哈希选择** | 中 | 切换频繁 | 分区 topic 的稳定主消费者选择 |
+| **Consumer Epoch** | 中 | 旧请求干扰 | 防止过期请求影响当前状态 |
+
+**已实现（2026-06，persistent）**：消费者优先级、Active 通知、Cursor Rewind、standby 接管 unacked backlog（`tests/persist/test_persistent_subscription_modes.py`）。
 
 ### 3.2 中优先级 (影响功能完整性)
 
 | 功能 | 优先级 | 影响 | 描述 |
 |------|--------|------|------|
 | **分区 Topic 支持** | 中 | 主消费者分布不均 | 需要根据 partitionIndex 分配 |
-| **Active Consumer 通知** | 中 | 消费者无法感知状态 | 需要通知消费者主/备状态 |
 | **一致性哈希选择** | 中 | 切换频繁 | 分区 topic 的稳定主消费者选择 |
 | **Consumer Epoch** | 中 | 旧请求干扰 | 防止过期请求影响当前状态 |
+| **Exclusive/Failover 显式 Redeliver** | 中 | nack 行为与原生不一致 | SingleActive 当前忽略 Redeliver 命令 |
 
 ### 3.3 低优先级 (可选优化)
 
@@ -682,19 +647,20 @@ impl HashRing {
 - [x] 消费者添加/移除
 - [x] Flow 控制 (permits)
 - [x] 批量大小限制
+- [x] 消费者优先级排序（persistent）
+- [x] Active Consumer 通知
+- [x] Cursor Rewind（persistent SingleActive）
+- [x] Standby 接管 active 未 ack backlog
 
 ### 缺失功能 (高优先级)
-- [ ] **消费者优先级排序**
 - [ ] **Failover 延迟切换** (1000ms)
-- [ ] **Cursor Rewind**
 - [ ] **Pending Read 取消**
-- [ ] **重投递未确认消息**
 
 ### 缺失功能 (中优先级)
-- [ ] **Active Consumer 通知**
 - [ ] **分区 Topic 主消费者分配**
 - [ ] **一致性哈希选择**
 - [ ] **Consumer Epoch**
+- [ ] **Exclusive/Failover 显式 Redeliver 命令**（当前忽略，依赖 close + rewind）
 
 ### 缺失功能 (低优先级)
 - [ ] Dispatch Rate Limiter
@@ -732,21 +698,20 @@ impl HashRing {
 
 ### 8.1 核心差异
 
-Pulsar Lite 的 Failover 实现是一个**简化版本**，缺少了多个关键的可靠性机制：
+Pulsar Lite 的 Failover 实现是**面向 embedded 的 SingleActive MVP**，persistent 已具备 rewind 与 priority，仍缺少原生 Failover 的延迟切换与异步 read 取消：
 
-| 最关键的缺失 | 影响 |
+| 最关键的剩余差距 | 影响 |
 |-------------|------|
-| **Failover 延迟** | 消息可能重复 |
-| **Cursor Rewind** | 消息可能丢失 |
-| **优先级支持** | 无法控制主消费者 |
-| **Pending Read 取消** | 消息状态混乱 |
+| **Failover 延迟** | 切换瞬间可能重复投递 |
+| **Pending Read 取消** | 复杂并发下状态可能混乱 |
+| **分区 / 一致性哈希选主** | 多分区场景与原生不一致 |
 
 ### 8.2 Pulsar Lite 定位
 
-作为一个 **轻量级嵌入式消息队列**，Pulsar Lite 当前的 Failover 模式实现：
-- ✅ 适合开发测试场景
-- ✅ 基本的主备切换可用
-- ⚠️ 不适合生产环境（缺失关键可靠性机制）
+作为一个 **轻量级嵌入式消息队列**，Pulsar Lite 的 Failover 模式：
+- ✅ Persistent 基本主备切换 + rewind 可用（`tests/persist/`）
+- ⚠️ 无 Failover 延迟，生产高并发切换需谨慎
+- ⚠️ 不支持分区 topic 专用选主策略
 - ⚠️ 需要补充 Failover 延迟和 Cursor Rewind 才能用于正式场景
 
 ### 8.3 建议实施顺序

@@ -19,8 +19,6 @@ pub trait ManagedLedgerStorage: Send + Sync {
         self.append_message(topic, partition, payload)
     }
 
-    fn subscribe(&mut self, topic: &str, subscription: &str) -> Result<()>;
-
     fn initialize_or_open_cursor(
         &mut self,
         topic: &str,
@@ -86,13 +84,6 @@ pub trait ManagedLedgerStorage: Send + Sync {
         let _ = (topic, subscription, message_id);
         anyhow::bail!("is_acknowledged is not implemented for this managed-ledger store")
     }
-
-    fn get_next_unassigned_message(
-        &mut self,
-        topic: &str,
-        subscription: &str,
-        consumer_id: u64,
-    ) -> Result<Option<(MessageId, Vec<u8>)>>;
 
     fn ack_message(&mut self, topic: &str, subscription: &str, message_id: MessageId)
         -> Result<()>;

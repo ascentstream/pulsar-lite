@@ -264,12 +264,15 @@ impl Subscription {
                     SubscriptionType::Exclusive => "Exclusive",
                     SubscriptionType::Shared => "Shared",
                     SubscriptionType::Failover => "Failover",
-                    SubscriptionType::KeyShared => "KeyShared (fallback to Shared)",
+                    SubscriptionType::KeyShared => "KeyShared",
                 },
                 self.name,
                 self.topic
             );
-            self.dispatcher = Some(DispatcherEnum::new(self.sub_type));
+            self.dispatcher = Some(DispatcherEnum::new_with_key_shared_policy(
+                self.sub_type,
+                self.key_shared_policy.clone(),
+            ));
         }
     }
 

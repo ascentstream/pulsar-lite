@@ -474,3 +474,90 @@ impl Dispatcher for KeySharedDispatcher {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::broker::service::topic::{Subscription, SubscriptionRuntimeMode};
+    use crate::broker::service::ConnectionWriteState;
+    use crate::storage::Storage;
+    use bytes::Bytes;
+    use std::path::Path;
+    use tokio::sync::{mpsc, Mutex, RwLock};
+
+    fn create_test_storage() -> SharedStorage {
+        Arc::new(Mutex::new(
+            Storage::new_memory(Path::new("/tmp/test-key-shared-dispatcher-storage")).unwrap(),
+        ))
+    }
+
+    fn create_consumer(consumer_id: u64) -> Arc<Consumer> {
+        let subscription = Arc::new(RwLock::new(Subscription::new_with_options(
+            "sub".to_string(),
+            "persistent://public/default/key-shared".to_string(),
+            SubscriptionType::KeyShared,
+            SubscriptionRuntimeMode::Persistent,
+            HashMap::new(),
+            None,
+            create_test_storage(),
+        )));
+        let (tx, _rx) = mpsc::channel(16);
+        Arc::new(Consumer::new_with_options(
+            consumer_id,
+            format!("consumer-{consumer_id}"),
+            subscription,
+            "conn".to_string(),
+            tx,
+            Arc::new(ConnectionWriteState::new(64 * 1024, 32 * 1024)),
+            0,
+            None,
+        ))
+    }
+
+    fn metadata_with_ordering_key(key: &str) -> Bytes {
+        Bytes::from(
+            MessageMetadata {
+                ordering_key: Some(key.as_bytes().to_vec()),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )
+    }
+
+    #[tokio::test]
+    async fn removing_owner_requeues_pending_for_surviving_key_owner() {
+        let mut dispatcher = KeySharedDispatcher::new(None);
+        let owner = create_consumer(1);
+        let survivor = create_consumer(2);
+        dispatcher.add_consumer(owner.clone()).unwrap();
+        dispatcher.add_consumer(survivor.clone()).unwrap();
+        survivor.add_permits(1).await;
+        dispatcher.consumer_flow(2, 1);
+
+        let message_id = MessageId {
+            ledger: 0,
+            entry: 7,
+            partition: -1,
+        };
+        owner.track_message_dispatched(&message_id, 0).await;
+
+        let removed = dispatcher
+            .remove_consumer_with_recovery(
+                1,
+                create_test_storage(),
+                "persistent://public/default/key-shared",
+                "sub",
+            )
+            .await
+            .expect("owner should be removed");
+
+        assert_eq!(removed.consumer_id, 1);
+        assert!(!owner.has_pending_ack(&message_id).await);
+        assert_eq!(dispatcher.pop_redelivery_message(), Some((message_id, 0)));
+
+        let selected = dispatcher
+            .select_consumer(&metadata_with_ordering_key("stable-key"))
+            .expect("survivor should own key after rebuild");
+        assert_eq!(selected.consumer_id, survivor.consumer_id);
+    }
+}

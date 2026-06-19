@@ -336,6 +336,22 @@ impl Consumer {
         M: Into<Bytes>,
         P: Into<Bytes>,
     {
+        self.send_message_with_sticky_hash(message_id, metadata, payload, redelivery_count, None)
+            .await
+    }
+
+    pub async fn send_message_with_sticky_hash<M, P>(
+        &self,
+        message_id: MessageId,
+        metadata: M,
+        payload: P,
+        redelivery_count: u32,
+        sticky_key_hash: Option<i32>,
+    ) -> bool
+    where
+        M: Into<Bytes>,
+        P: Into<Bytes>,
+    {
         let metadata = metadata.into();
         let payload = payload.into();
         let wire_size = crate::protocol::codec::estimate_message_parts_size(
@@ -361,7 +377,11 @@ impl Consumer {
             self.get_sub_type(),
             SubscriptionType::Shared | SubscriptionType::KeyShared
         ) && !self
-            .track_message_dispatched(&message_id, redelivery_count)
+            .track_message_dispatched_with_sticky_hash(
+                &message_id,
+                redelivery_count,
+                sticky_key_hash,
+            )
             .await
         {
             log::debug!(

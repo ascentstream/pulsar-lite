@@ -384,15 +384,24 @@ impl SharedDispatcher {
 
     /// Add messages to redelivery queue
     pub fn add_to_redelivery_queue(&self, message_ids: Vec<(MessageId, u32)>) {
+        self.add_redelivery_entries(
+            message_ids
+                .into_iter()
+                .map(|(message_id, redelivery_count)| RedeliveryEntry {
+                    message_id,
+                    redelivery_count,
+                    sticky_key_hash: None,
+                })
+                .collect(),
+        );
+    }
+
+    pub fn add_redelivery_entries(&self, entries: Vec<RedeliveryEntry>) {
         let mut controller = self.redelivery_controller.write().unwrap();
         let count_before = controller.len();
 
-        for (msg_id, redelivery_count) in message_ids {
-            controller.add(RedeliveryEntry {
-                message_id: msg_id,
-                redelivery_count,
-                sticky_key_hash: None,
-            });
+        for entry in entries {
+            controller.add(entry);
         }
 
         log::debug!(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 
-import pulsar
+import pulsar 
 
 from non_persist.test_non_persist_dynamic_consumers import _find_key_in_range
 from persist.support import (
@@ -212,10 +212,10 @@ def test_persistent_key_shared_redelivery_blocks_same_key_but_not_other_key(
     other_key = _find_key_in_range("ks-redelivery-other", 32768, 65535)
 
     with _broker(tmp_path, db_path) as broker:
-        client = pulsar.Client(broker.broker_url)
+        client= pulsar.Client("127.0.0.1:6650")
         try:
             same_owner = _subscribe(
-                client,
+                broker,
                 topic,
                 subscription,
                 consumer_name="ks-low",
@@ -240,9 +240,9 @@ def test_persistent_key_shared_redelivery_blocks_same_key_but_not_other_key(
             )
             producer = client.create_producer(topic, batching_enabled=False)
 
-            producer.send(b"same-redeliver", ordering_key=same_key)
+            producer.send(b"same-redeliver1", ordering_key=same_key)
             first = same_owner.receive(timeout_millis=5000)
-            assert first.data() == b"same-redeliver"
+            assert first.data() == b"same-redeliver1"
             same_owner.close()
 
             same_replacement = _subscribe(
@@ -261,7 +261,7 @@ def test_persistent_key_shared_redelivery_blocks_same_key_but_not_other_key(
             producer.send(b"other-continues", ordering_key=other_key)
 
             redelivered = same_replacement.receive(timeout_millis=5000)
-            assert redelivered.data() == b"same-redeliver"
+            assert redelivered.data() == b"same-redeliver1"
             assert redelivered.redelivery_count() >= 1
 
             other = other_owner.receive(timeout_millis=5000)

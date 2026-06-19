@@ -712,7 +712,9 @@ impl Consumer {
 
                 let mut acked_for_storage = Vec::with_capacity(message_ids.len());
                 for message_id in &message_ids {
-                    let Some(owner) = self.resolve_ack_owner(message_id).await else {
+                    let Some((owner, tracked_message_id)) =
+                        self.resolve_ack_owner(message_id).await
+                    else {
                         log::warn!(
                             "Consumer {} attempted to ack message {}:{} without ownership; ignoring",
                             self.consumer_id,
@@ -722,7 +724,7 @@ impl Consumer {
                         continue;
                     };
 
-                    if !owner.remove_pending_ack(message_id).await {
+                    if !owner.remove_pending_ack(&tracked_message_id).await {
                         log::warn!(
                             "Consumer {} found owner {} for message {}:{} but pending ack removal failed; ignoring",
                             self.consumer_id,
@@ -734,7 +736,7 @@ impl Consumer {
                     }
 
                     owner.record_message_acked().await;
-                    acked_for_storage.push(message_id.clone());
+                    acked_for_storage.push(tracked_message_id);
                 }
 
                 if is_persistent && !acked_for_storage.is_empty() {
@@ -763,9 +765,19 @@ impl Consumer {
         Ok(())
     }
 
-    async fn resolve_ack_owner(self: &Arc<Self>, message_id: &MessageId) -> Option<Arc<Consumer>> {
+    async fn resolve_ack_owner(
+        self: &Arc<Self>,
+        message_id: &MessageId,
+    ) -> Option<(Arc<Consumer>, MessageId)> {
         if self.has_pending_ack(message_id).await {
-            return Some(Arc::clone(self));
+            return Some((Arc::clone(self), message_id.clone()));
+        }
+
+        if let Some(tracked_message_id) = self
+            .find_pending_ack_by_position(message_id.ledger, message_id.entry)
+            .await
+        {
+            return Some((Arc::clone(self), tracked_message_id));
         }
 
         let sub = self.subscription.read().await;
@@ -773,7 +785,15 @@ impl Consumer {
             if candidate.consumer_id != self.consumer_id
                 && candidate.has_pending_ack(message_id).await
             {
-                return Some(candidate);
+                return Some((candidate, message_id.clone()));
+            }
+            if candidate.consumer_id != self.consumer_id {
+                if let Some(tracked_message_id) = candidate
+                    .find_pending_ack_by_position(message_id.ledger, message_id.entry)
+                    .await
+                {
+                    return Some((candidate, tracked_message_id));
+                }
             }
         }
 
@@ -798,7 +818,7 @@ impl std::hash::Hash for Consumer {
 
 #[cfg(test)]
 mod tests {
-    use super::super::topic::Subscription;
+    use super::super::topic::{Subscription, SubscriptionRuntimeMode};
     use super::super::{ConnectionWriteState, SharedStorage};
     use super::*;
     use crate::storage::Storage;
@@ -816,6 +836,16 @@ mod tests {
             "test-sub".to_string(),
             "test-topic".to_string(),
             SubscriptionType::Shared,
+            create_test_storage(),
+        )))
+    }
+
+    fn create_non_persistent_test_subscription() -> Arc<RwLock<Subscription>> {
+        Arc::new(RwLock::new(Subscription::new_with_runtime_mode(
+            "test-sub".to_string(),
+            "non-persistent://public/default/test-topic".to_string(),
+            SubscriptionType::Shared,
+            SubscriptionRuntimeMode::NonPersistent,
             create_test_storage(),
         )))
     }
@@ -994,6 +1024,37 @@ mod tests {
         assert_eq!(drained[0].0, msg);
         assert_eq!(drained[0].1.redelivery_count, 4);
         assert_eq!(drained[0].1.sticky_key_hash, Some(2048));
+    }
+
+    #[tokio::test]
+    async fn shared_ack_matches_pending_ack_by_position_when_partition_differs() {
+        let subscription = create_non_persistent_test_subscription();
+        let consumer = Arc::new(create_test_consumer(
+            9,
+            "test-consumer",
+            subscription,
+            "conn-9",
+        ));
+        let tracked = MessageId {
+            ledger: 1,
+            entry: 9,
+            partition: -1,
+        };
+        let ack_from_client = MessageId {
+            ledger: 1,
+            entry: 9,
+            partition: 0,
+        };
+
+        assert!(consumer.track_message_dispatched(&tracked, 1).await);
+        consumer
+            .clone()
+            .message_acked(AckCommandType::Individual, vec![ack_from_client])
+            .await
+            .unwrap();
+
+        assert!(!consumer.has_pending_ack(&tracked).await);
+        assert_eq!(consumer.pending_ack_count().await, 0);
     }
 
     #[tokio::test]

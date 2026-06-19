@@ -10,6 +10,8 @@ pub struct PendingAck {
     pub dispatched_at: Instant,
     /// Redelivery count
     pub redelivery_count: u32,
+    /// Sticky key hash used by KeyShared ordered redelivery.
+    pub sticky_key_hash: Option<i32>,
 }
 
 #[derive(Debug, Default)]
@@ -27,7 +29,12 @@ impl PendingAcksMap {
         }
     }
 
-    pub async fn add_pending_ack(&self, message_id: MessageId, redelivery_count: u32) -> bool {
+    pub async fn add_pending_ack(
+        &self,
+        message_id: MessageId,
+        redelivery_count: u32,
+        sticky_key_hash: Option<i32>,
+    ) -> bool {
         if self.closed.load(Ordering::Acquire) {
             return false;
         }
@@ -40,6 +47,7 @@ impl PendingAcksMap {
             PendingAck {
                 dispatched_at: Instant::now(),
                 redelivery_count,
+                sticky_key_hash,
             },
         );
         true
@@ -102,21 +110,33 @@ mod tests {
     async fn pending_acks_map_tracks_remove_and_drain() {
         let map = PendingAcksMap::new();
 
-        assert!(map.add_pending_ack(msg(1, 1), 0).await);
+        assert!(map.add_pending_ack(msg(1, 1), 0, None).await);
         assert!(map.contains(&msg(1, 1)).await);
         assert_eq!(map.len().await, 1);
 
         assert!(map.remove(&msg(1, 1)).await.is_some());
         assert!(!map.contains(&msg(1, 1)).await);
 
-        assert!(map.add_pending_ack(msg(1, 2), 1).await);
-        assert!(map.add_pending_ack(msg(1, 3), 2).await);
+        assert!(map.add_pending_ack(msg(1, 2), 1, None).await);
+        assert!(map.add_pending_ack(msg(1, 3), 2, None).await);
 
         let drained = map.drain().await;
         assert_eq!(drained.len(), 2);
         assert_eq!(map.len().await, 0);
 
         map.close();
-        assert!(!map.add_pending_ack(msg(1, 4), 0).await);
+        assert!(!map.add_pending_ack(msg(1, 4), 0, None).await);
+    }
+
+    #[tokio::test]
+    async fn pending_acks_map_preserves_sticky_key_hash_on_drain() {
+        let map = PendingAcksMap::new();
+
+        assert!(map.add_pending_ack(msg(2, 1), 3, Some(1234)).await);
+
+        let drained = map.drain().await;
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].1.redelivery_count, 3);
+        assert_eq!(drained[0].1.sticky_key_hash, Some(1234));
     }
 }

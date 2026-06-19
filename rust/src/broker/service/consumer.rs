@@ -524,9 +524,19 @@ impl Consumer {
         message_id: &MessageId,
         redelivery_count: u32,
     ) -> bool {
+        self.track_message_dispatched_with_sticky_hash(message_id, redelivery_count, None)
+            .await
+    }
+
+    pub async fn track_message_dispatched_with_sticky_hash(
+        &self,
+        message_id: &MessageId,
+        redelivery_count: u32,
+        sticky_key_hash: Option<i32>,
+    ) -> bool {
         let tracked = self
             .pending_acks
-            .add_pending_ack(message_id.clone(), redelivery_count)
+            .add_pending_ack(message_id.clone(), redelivery_count, sticky_key_hash)
             .await;
 
         if tracked {
@@ -943,6 +953,27 @@ mod tests {
         assert_eq!(drained[0].0, msg2);
         assert_eq!(drained[0].1.redelivery_count, 2);
         assert_eq!(consumer.pending_ack_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_pending_ack_tracking_preserves_sticky_key_hash() {
+        let subscription = create_test_subscription();
+        let consumer = create_test_consumer(8, "test-consumer", subscription, "conn-8");
+        let msg = MessageId {
+            ledger: 1,
+            entry: 9,
+            partition: -1,
+        };
+
+        consumer
+            .track_message_dispatched_with_sticky_hash(&msg, 4, Some(2048))
+            .await;
+
+        let drained = consumer.drain_pending_acks().await;
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, msg);
+        assert_eq!(drained[0].1.redelivery_count, 4);
+        assert_eq!(drained[0].1.sticky_key_hash, Some(2048));
     }
 
     #[tokio::test]

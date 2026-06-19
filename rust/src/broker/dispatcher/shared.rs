@@ -5,11 +5,12 @@
  */
 
 use super::read_position::{commit_read_position, next_unacked_candidate, ReadCandidate};
+use super::redelivery_controller::{RedeliveryController, RedeliveryEntry};
 use crate::broker::dispatcher::Dispatcher;
 use crate::broker::service::topic::SubscriptionType;
 use crate::broker::service::{Consumer, SharedStorage};
 use crate::storage::{ManagedLedgerPosition, MessageId};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -35,9 +36,8 @@ pub struct SharedDispatcher {
     /// Flag to prevent reentrant dispatching
     dispatch_in_progress: AtomicBool,
 
-    // Pending messages to redeliver (ordered for debugging)
-    // When a Consumer disconnects, its held messages are added to this queue
-    messages_to_redeliver: Arc<RwLock<BTreeMap<MessageId, u32>>>,
+    // Pending messages to redeliver. Shared does not use sticky hash blocking.
+    redelivery_controller: Arc<RwLock<RedeliveryController>>,
 
     /// Next managed-ledger position to read from for new dispatches.
     read_position: RwLock<Option<ManagedLedgerPosition>>,
@@ -52,7 +52,7 @@ impl SharedDispatcher {
             round_robin_index: AtomicUsize::new(0),
             total_available_permits: AtomicU32::new(0),
             dispatch_in_progress: AtomicBool::new(false),
-            messages_to_redeliver: Arc::new(RwLock::new(BTreeMap::new())),
+            redelivery_controller: Arc::new(RwLock::new(RedeliveryController::new(false))),
             read_position: RwLock::new(None),
         }
     }
@@ -260,7 +260,9 @@ impl SharedDispatcher {
             self.total_available_permits.fetch_sub(1, Ordering::Relaxed);
 
             // 1. Priority: get message from redelivery queue
-            if let Some((msg_id, redelivery_count)) = self.pop_redelivery_message() {
+            if let Some(redelivery) = self.pop_redelivery_message() {
+                let msg_id = redelivery.message_id.clone();
+                let redelivery_count = redelivery.redelivery_count;
                 let already_acked = {
                     let guard = storage.lock().await;
                     guard.is_acknowledged(&topic, &subscription, &msg_id)?
@@ -288,7 +290,7 @@ impl SharedDispatcher {
                             entry.message_id.clone(),
                             entry.metadata.clone(),
                             entry.payload.clone(),
-                            redelivery_count + 1,
+                            redelivery_count,
                         )
                         .await
                     {
@@ -306,10 +308,11 @@ impl SharedDispatcher {
                             self.total_available_permits.load(Ordering::Relaxed)
                         );
                     } else {
-                        self.add_to_redelivery_queue(vec![(
-                            entry.message_id,
-                            redelivery_count + 1,
-                        )]);
+                        self.restore_redelivery_message(RedeliveryEntry {
+                            message_id: entry.message_id,
+                            redelivery_count: redelivery_count + 1,
+                            sticky_key_hash: None,
+                        });
                         consumer.add_permits(1).await;
                         self.total_available_permits.fetch_add(1, Ordering::Relaxed);
                     }
@@ -353,7 +356,7 @@ impl SharedDispatcher {
                         self.total_available_permits.load(Ordering::Relaxed)
                     );
                 } else {
-                    self.add_to_redelivery_queue(vec![(candidate.message_id, 0)]);
+                    self.add_to_redelivery_queue(vec![(candidate.message_id, 1)]);
                     commit_read_position(&self.read_position, candidate.next_position);
                     consumer.add_permits(1).await;
                     self.total_available_permits.fetch_add(1, Ordering::Relaxed);
@@ -381,27 +384,31 @@ impl SharedDispatcher {
 
     /// Add messages to redelivery queue
     pub fn add_to_redelivery_queue(&self, message_ids: Vec<(MessageId, u32)>) {
-        let mut redeliver = self.messages_to_redeliver.write().unwrap();
-        let count_before = redeliver.len();
+        let mut controller = self.redelivery_controller.write().unwrap();
+        let count_before = controller.len();
 
         for (msg_id, redelivery_count) in message_ids {
-            redeliver
-                .entry(msg_id)
-                .and_modify(|count| *count = (*count).max(redelivery_count))
-                .or_insert(redelivery_count);
+            controller.add(RedeliveryEntry {
+                message_id: msg_id,
+                redelivery_count,
+                sticky_key_hash: None,
+            });
         }
 
         log::debug!(
             "Added {} messages to redelivery queue, total={}",
-            redeliver.len() - count_before,
-            redeliver.len()
+            controller.len() - count_before,
+            controller.len()
         );
     }
 
     /// Pop next message from redelivery queue
-    pub fn pop_redelivery_message(&self) -> Option<(MessageId, u32)> {
-        let mut redeliver = self.messages_to_redeliver.write().unwrap();
-        redeliver.pop_first()
+    pub fn pop_redelivery_message(&self) -> Option<RedeliveryEntry> {
+        self.redelivery_controller.write().unwrap().pop_next()
+    }
+
+    fn restore_redelivery_message(&self, entry: RedeliveryEntry) {
+        self.redelivery_controller.write().unwrap().restore(entry);
     }
 
     pub async fn on_ack_state_updated(
@@ -411,8 +418,8 @@ impl SharedDispatcher {
         subscription: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let queued_message_ids = {
-            let redeliver = self.messages_to_redeliver.read().unwrap();
-            redeliver.keys().cloned().collect::<Vec<_>>()
+            let controller = self.redelivery_controller.read().unwrap();
+            controller.queued_message_ids()
         };
 
         let (acked_redeliveries, first_unacked) = {
@@ -428,9 +435,9 @@ impl SharedDispatcher {
         };
 
         if !acked_redeliveries.is_empty() {
-            let mut redeliver = self.messages_to_redeliver.write().unwrap();
+            let mut controller = self.redelivery_controller.write().unwrap();
             for message_id in acked_redeliveries {
-                redeliver.remove(&message_id);
+                controller.remove(&message_id);
             }
         }
 
@@ -497,7 +504,7 @@ impl SharedDispatcher {
             let pending = consumer.drain_pending_acks().await;
             let mut recovered = Vec::with_capacity(pending.len());
             for (message_id, pending_ack) in pending {
-                recovered.push((message_id, pending_ack.redelivery_count));
+                recovered.push((message_id, pending_ack.redelivery_count + 1));
             }
             self.add_to_redelivery_queue(recovered);
 
@@ -513,13 +520,13 @@ impl SharedDispatcher {
 
     /// Get redelivery queue size
     pub fn get_redelivery_queue_size(&self) -> usize {
-        self.messages_to_redeliver.read().unwrap().len()
+        self.redelivery_controller.read().unwrap().len()
     }
 
     /// Remove a message from the redelivery queue after it has been acked.
     pub fn on_message_acknowledged(&self, message_id: &MessageId) {
-        let mut redeliver = self.messages_to_redeliver.write().unwrap();
-        if redeliver.remove(message_id).is_some() {
+        let mut controller = self.redelivery_controller.write().unwrap();
+        if controller.remove(message_id).is_some() {
             log::debug!(
                 "Removed acked message {}:{} from redelivery queue",
                 message_id.ledger,
@@ -782,6 +789,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(dispatcher.get_redelivery_queue_size(), 1);
-        assert_eq!(dispatcher.pop_redelivery_message().unwrap().0, pending);
+        assert_eq!(
+            dispatcher.pop_redelivery_message().unwrap().message_id,
+            pending
+        );
     }
 }

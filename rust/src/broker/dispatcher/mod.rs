@@ -8,6 +8,7 @@ mod exclusive;
 mod failover;
 mod key_shared;
 mod read_position;
+pub mod redelivery_controller;
 mod shared;
 mod single_active;
 mod traits;

@@ -263,10 +263,10 @@ def test_persistent_key_shared_redelivery_blocks_same_key_but_not_other_key(
     other_key = _find_key_in_range("ks-redelivery-other", 32768, 65535)
 
     with _broker(tmp_path, db_path) as broker:
-        client= pulsar.Client("127.0.0.1:6650")
+        client = pulsar.Client(broker.broker_url)
         try:
             same_owner = _subscribe(
-                broker,
+                client,
                 topic,
                 subscription,
                 consumer_name="ks-low",

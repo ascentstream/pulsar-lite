@@ -109,6 +109,57 @@ def test_persistent_acked_message_does_not_redeliver_after_consumer_close(
             client.close()
 
 
+def test_persistent_shared_ack_hole_redelivery_increments_count(
+    tmp_path, unique_name
+):
+    db_path = tmp_path / "persistent.db"
+    topic = persistent_topic(unique_name, "persist-shared-ack-hole-redelivery-count")
+    subscription = unique_name("persist-sub")
+
+    with _broker(tmp_path, db_path) as broker:
+        client = pulsar.Client(broker.broker_url)
+        try:
+            consumer = _subscribe(
+                client,
+                topic,
+                subscription,
+                consumer_type=pulsar.ConsumerType.Shared,
+                receiver_queue_size=3,
+            )
+            producer = client.create_producer(topic, batching_enabled=False)
+
+            for payload in [b"hole-0", b"hole-1", b"hole-2"]:
+                producer.send(payload)
+
+            first = consumer.receive(timeout_millis=5000)
+            second = consumer.receive(timeout_millis=5000)
+            third = consumer.receive(timeout_millis=5000)
+            assert [first.data(), second.data(), third.data()] == [
+                b"hole-0",
+                b"hole-1",
+                b"hole-2",
+            ]
+
+            consumer.acknowledge(first)
+            consumer.acknowledge(third)
+            consumer.close()
+
+            replacement = _subscribe(
+                client,
+                topic,
+                subscription,
+                consumer_type=pulsar.ConsumerType.Shared,
+                receiver_queue_size=1,
+            )
+            redelivered = replacement.receive(timeout_millis=5000)
+            assert redelivered.data() == b"hole-1"
+            assert redelivered.redelivery_count() >= 1
+            replacement.acknowledge(redelivered)
+            assert_no_message(replacement, timeout_millis=1000)
+        finally:
+            client.close()
+
+
 def test_persistent_shared_negative_ack_redelivers_message(tmp_path, unique_name):
     db_path = tmp_path / "persistent.db"
     topic = persistent_topic(unique_name, "persist-negative-ack")

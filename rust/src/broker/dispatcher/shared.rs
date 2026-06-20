@@ -162,6 +162,14 @@ impl SharedDispatcher {
         }
     }
 
+    fn subtract_total_permits(&self, permits: u32) {
+        let _ = self.total_available_permits.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(permits)),
+        );
+    }
+
     /// Get next available consumer using Round-Robin algorithm
     ///
     /// This implements the same logic as Apache Pulsar's AbstractDispatcherMultipleConsumers.getNextConsumer()
@@ -509,6 +517,7 @@ impl SharedDispatcher {
 
         if let Some(ref consumer) = consumer {
             self.remove_consumer_order(consumer_id);
+            self.subtract_total_permits(consumer.available_permits_now());
             consumer.close_pending_acks();
             let pending = consumer.drain_pending_acks().await;
             let mut recovered = Vec::with_capacity(pending.len());
@@ -573,8 +582,9 @@ impl Dispatcher for SharedDispatcher {
 
     fn remove_consumer(&mut self, consumer_id: u64) -> Option<Arc<Consumer>> {
         let consumer = self.consumers.remove(&consumer_id);
-        if consumer.is_some() {
+        if let Some(ref consumer) = consumer {
             self.remove_consumer_order(consumer_id);
+            self.subtract_total_permits(consumer.available_permits_now());
         }
         consumer
     }

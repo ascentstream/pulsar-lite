@@ -12,7 +12,7 @@ mod producer_handler;
 pub use connection_handler::{handle_connect, handle_ping, handle_pong};
 pub use consumer_handler::{
     handle_ack, handle_close_consumer, handle_flow, handle_redeliver_unacknowledged_messages,
-    handle_subscribe, handle_unsubscribe,
+    handle_seek, handle_subscribe, handle_unsubscribe,
 };
 pub use lookup_handler::{handle_lookup, handle_partition_metadata};
 pub use producer_handler::{handle_close_producer, handle_producer, handle_send};

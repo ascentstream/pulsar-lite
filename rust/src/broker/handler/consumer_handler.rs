@@ -384,6 +384,71 @@ where
     Ok(())
 }
 
+pub async fn handle_seek<T>(
+    framed: &mut Framed<T, PulsarFrameCodec>,
+    cmd: BaseCommand,
+    consumers: &HashMap<u64, Arc<Consumer>>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let seek_cmd = cmd.seek.as_ref().ok_or("Missing seek command")?;
+    log::info!(
+        "Handling Seek command: consumer_id={}, request_id={}",
+        seek_cmd.consumer_id,
+        seek_cmd.request_id
+    );
+
+    let Some(message_id) = seek_cmd.message_id.as_ref().map(|id| MessageId {
+        ledger: id.ledger_id,
+        entry: id.entry_id,
+        partition: id.partition.unwrap_or(-1),
+    }) else {
+        let response = ServerCommand::Error {
+            request_id: seek_cmd.request_id,
+            error: "seek by publish time is not implemented".to_string(),
+        };
+        framed.send(response).await?;
+        return Ok(());
+    };
+
+    let Some(consumer) = consumers.get(&seek_cmd.consumer_id) else {
+        let response = ServerCommand::Error {
+            request_id: seek_cmd.request_id,
+            error: format!("Unknown consumer ID: {}", seek_cmd.consumer_id),
+        };
+        framed.send(response).await?;
+        return Ok(());
+    };
+
+    let subscription = consumer.get_subscription();
+    subscription
+        .write()
+        .await
+        .seek_to_message_id(&message_id)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let cleared = consumer.drain_pending_acks().await.len();
+    if cleared > 0 {
+        log::debug!(
+            "Cleared {} pending acks for consumer {} after seek",
+            cleared,
+            seek_cmd.consumer_id
+        );
+    }
+
+    let response = ServerCommand::Success {
+        request_id: seek_cmd.request_id,
+    };
+    framed.send(response).await?;
+    log::info!(
+        "Sent Success response for Seek request {}",
+        seek_cmd.request_id
+    );
+
+    Ok(())
+}
+
 /// Handle CloseConsumer command (Apache Pulsar style)
 pub async fn handle_close_consumer<T>(
     framed: &mut Framed<T, PulsarFrameCodec>,

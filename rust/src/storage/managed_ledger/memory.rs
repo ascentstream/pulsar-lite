@@ -145,6 +145,40 @@ impl ManagedLedgerStorage for InMemoryManagedLedgerStorage {
         Ok(())
     }
 
+    fn seek_cursor(
+        &mut self,
+        topic: &str,
+        subscription: &str,
+        message_id: &MessageId,
+        shared: bool,
+    ) -> Result<()> {
+        let key = Self::cursor_key(topic, subscription);
+        let target = ManagedLedgerPosition::from(message_id);
+        let previous = self
+            .messages(topic)
+            .into_iter()
+            .map(|(stored_id, _)| ManagedLedgerPosition::from(stored_id))
+            .take_while(|position| position < &target)
+            .last();
+
+        if shared {
+            self.cursors.remove(&key);
+            self.subscription_cursors.insert(
+                key,
+                SubscriptionCursor {
+                    mark_delete: previous.map(|position| position.entry_id),
+                    acked_holes: Default::default(),
+                },
+            );
+        } else {
+            self.subscription_cursors.remove(&key);
+            self.cursors
+                .insert(key, previous.map_or(u64::MAX, |position| position.entry_id));
+        }
+
+        Ok(())
+    }
+
     fn first_unacked_position(
         &self,
         topic: &str,

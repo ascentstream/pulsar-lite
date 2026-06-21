@@ -261,3 +261,44 @@ def test_persistent_send_async_returns_ids_and_payloads_survive_restart(
             assert received == payloads
         finally:
             client.close()
+
+
+def test_persistent_unsubscribe_deletes_subscription_cursor(tmp_path, unique_name):
+    db_path = tmp_path / "persistent.db"
+    topic = persistent_topic(unique_name, "persist-unsubscribe")
+    subscription = unique_name("persist-sub")
+
+    with _broker(tmp_path, db_path) as broker:
+        client = pulsar.Client(broker.broker_url, operation_timeout_seconds=3)
+        try:
+            producer = client.create_producer(topic, batching_enabled=False)
+            producer.send(b"before-unsubscribe")
+
+            consumer = _subscribe_exclusive(client, topic, subscription)
+            message = consumer.receive(timeout_millis=5000)
+            assert message.data() == b"before-unsubscribe"
+            consumer.acknowledge(message)
+            consumer.unsubscribe()
+
+            producer.send(b"after-unsubscribe")
+        finally:
+            client.close()
+
+    with _broker(tmp_path, db_path) as broker:
+        client = pulsar.Client(broker.broker_url, operation_timeout_seconds=3)
+        try:
+            consumer = _subscribe_exclusive(
+                client,
+                topic,
+                subscription,
+                initial_position=pulsar.InitialPosition.Earliest,
+            )
+            received = []
+            for _ in range(2):
+                message = consumer.receive(timeout_millis=5000)
+                received.append(message.data())
+                consumer.acknowledge(message)
+
+            assert received == [b"before-unsubscribe", b"after-unsubscribe"]
+        finally:
+            client.close()

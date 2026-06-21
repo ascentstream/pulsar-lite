@@ -464,6 +464,61 @@ where
     Ok(())
 }
 
+pub async fn handle_get_last_message_id<T>(
+    framed: &mut Framed<T, PulsarFrameCodec>,
+    cmd: BaseCommand,
+    consumers: &HashMap<u64, Arc<Consumer>>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let get_last_cmd = cmd
+        .get_last_message_id
+        .as_ref()
+        .ok_or("Missing getLastMessageId command")?;
+    log::info!(
+        "Handling GetLastMessageId command: consumer_id={}, request_id={}",
+        get_last_cmd.consumer_id,
+        get_last_cmd.request_id
+    );
+
+    let Some(consumer) = consumers.get(&get_last_cmd.consumer_id) else {
+        let response = ServerCommand::Error {
+            request_id: get_last_cmd.request_id,
+            error: format!("Unknown consumer ID: {}", get_last_cmd.consumer_id),
+        };
+        framed.send(response).await?;
+        return Ok(());
+    };
+
+    let subscription = consumer.get_subscription();
+    let last_message_id = subscription
+        .read()
+        .await
+        .get_last_message_id()
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    let Some(last_message_id) = last_message_id else {
+        let response = ServerCommand::Error {
+            request_id: get_last_cmd.request_id,
+            error: "Topic has no messages".to_string(),
+        };
+        framed.send(response).await?;
+        return Ok(());
+    };
+
+    let response = ServerCommand::LastMessageIdResponse {
+        request_id: get_last_cmd.request_id,
+        ledger_id: last_message_id.ledger,
+        entry_id: last_message_id.entry,
+        partition: last_message_id.partition,
+    };
+    framed.send(response).await?;
+
+    Ok(())
+}
+
 /// Handle CloseConsumer command (Apache Pulsar style)
 pub async fn handle_close_consumer<T>(
     framed: &mut Framed<T, PulsarFrameCodec>,

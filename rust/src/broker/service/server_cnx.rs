@@ -437,6 +437,9 @@ where
                 self.handle_unsubscribe(base_command).await?
             }
             x if x == base_command::Type::Seek as i32 => self.handle_seek(base_command).await?,
+            x if x == base_command::Type::GetLastMessageId as i32 => {
+                self.handle_get_last_message_id(base_command).await?
+            }
             x if x == base_command::Type::RedeliverUnacknowledgedMessages as i32 => {
                 self.handle_redeliver_unacknowledged_messages(base_command)
                     .await?
@@ -712,6 +715,12 @@ where
 
     async fn handle_seek(&mut self, cmd: BaseCommand) -> CnxResult<()> {
         handler::handle_seek(&mut self.framed, cmd, &self.consumers)
+            .await
+            .map_err(to_cnx_error)
+    }
+
+    async fn handle_get_last_message_id(&mut self, cmd: BaseCommand) -> CnxResult<()> {
+        handler::handle_get_last_message_id(&mut self.framed, cmd, &self.consumers)
             .await
             .map_err(to_cnx_error)
     }

@@ -6,9 +6,9 @@
 use super::codec::proto::pulsar::{
     base_command, command_lookup_topic_response, command_partitioned_topic_metadata_response,
     BaseCommand, CommandAckResponse, CommandConnected, CommandConsumerStatsResponse, CommandError,
-    CommandLookupTopicResponse, CommandMessage, CommandPartitionedTopicMetadataResponse,
-    CommandPing, CommandPong, CommandProducerSuccess, CommandSendError, CommandSendReceipt,
-    CommandSuccess, MessageIdData, ServerError,
+    CommandGetLastMessageIdResponse, CommandLookupTopicResponse, CommandMessage,
+    CommandPartitionedTopicMetadataResponse, CommandPing, CommandPong, CommandProducerSuccess,
+    CommandSendError, CommandSendReceipt, CommandSuccess, MessageIdData, ServerError,
 };
 use bytes::Bytes;
 use prost::Message;
@@ -68,6 +68,12 @@ pub enum ServerCommand {
     AckResponse {
         consumer_id: u64,
         request_id: u64,
+    },
+    LastMessageIdResponse {
+        request_id: u64,
+        ledger_id: u64,
+        entry_id: u64,
+        partition: i32,
     },
     Ping,
     Pong,
@@ -237,6 +243,25 @@ impl ServerCommand {
                 ack_response: Some(CommandAckResponse {
                     consumer_id: *consumer_id,
                     request_id: Some(*request_id),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ServerCommand::LastMessageIdResponse {
+                request_id,
+                ledger_id,
+                entry_id,
+                partition,
+            } => BaseCommand {
+                r#type: Type::GetLastMessageIdResponse as i32,
+                get_last_message_id_response: Some(CommandGetLastMessageIdResponse {
+                    request_id: *request_id,
+                    last_message_id: MessageIdData {
+                        ledger_id: *ledger_id,
+                        entry_id: *entry_id,
+                        partition: Some(*partition),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 }),
                 ..Default::default()

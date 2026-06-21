@@ -453,6 +453,20 @@ impl Subscription {
         Ok(())
     }
 
+    pub async fn get_last_message_id(&self) -> Result<Option<MessageId>, String> {
+        if !self.is_persistent() {
+            return Err(
+                "getLastMessageId is unsupported for non-persistent subscriptions".to_string(),
+            );
+        }
+
+        let guard = self.storage.lock().await;
+        guard
+            .get_last_position(&self.topic)
+            .map(|position| position.map(MessageId::from))
+            .map_err(|e| e.to_string())
+    }
+
     /// Persist cursor updates and notify the dispatcher after a message was acked.
     ///
     /// The caller (`Consumer::message_acked`) must handle Shared ownership resolution

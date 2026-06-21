@@ -86,6 +86,25 @@ def test_persistent_latest_late_subscriber_skips_existing_backlog(tmp_path, uniq
             client.close()
 
 
+def test_persistent_consumer_get_last_message_id(tmp_path, unique_name):
+    db_path = tmp_path / "persistent.db"
+    topic = persistent_topic(unique_name, "persist-last-message-id")
+    subscription = unique_name("persist-sub")
+
+    with _broker(tmp_path, db_path) as broker:
+        client = pulsar.Client(broker.broker_url, operation_timeout_seconds=3)
+        try:
+            producer = client.create_producer(topic, batching_enabled=False)
+            producer.send(b"last-0")
+            expected = producer.send(b"last-1")
+
+            consumer = _subscribe_exclusive(client, topic, subscription)
+
+            assert consumer.get_last_message_id() == expected
+        finally:
+            client.close()
+
+
 def test_persistent_unacked_message_does_not_repeat_on_additional_flow(tmp_path, unique_name):
     db_path = tmp_path / "persistent.db"
     topic = persistent_topic(unique_name, "persist-no-repeat-flow")

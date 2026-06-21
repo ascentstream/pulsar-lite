@@ -331,8 +331,20 @@ def test_persistent_consumer_seek_to_message_id_redelivers_from_target(
             assert received == [b"seek-0", b"seek-1", b"seek-2"]
 
             consumer.seek(message_ids[1])
-            replayed = consumer.receive(timeout_millis=5000)
-            assert replayed.data() == b"seek-1"
-            consumer.acknowledge(replayed)
+            consumer.close()
+
+            replay_consumer = _subscribe_exclusive(
+                client,
+                topic,
+                subscription,
+                initial_position=pulsar.InitialPosition.Latest,
+            )
+            replayed = []
+            for _ in range(2):
+                message = replay_consumer.receive(timeout_millis=5000)
+                replayed.append(message.data())
+                replay_consumer.acknowledge(message)
+
+            assert replayed == [b"seek-1", b"seek-2"]
         finally:
             client.close()

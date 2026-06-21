@@ -314,6 +314,76 @@ pub async fn handle_redeliver_unacknowledged_messages(
     Ok(())
 }
 
+/// Handle Unsubscribe command.
+///
+/// Native Pulsar treats unsubscribe as deleting the subscription cursor, unlike
+/// CloseConsumer which only detaches the current consumer.
+pub async fn handle_unsubscribe<T>(
+    framed: &mut Framed<T, PulsarFrameCodec>,
+    cmd: BaseCommand,
+    consumers: &mut HashMap<u64, Arc<Consumer>>,
+    broker_service: SharedBrokerService,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let unsubscribe_cmd = cmd
+        .unsubscribe
+        .as_ref()
+        .ok_or("Missing unsubscribe command")?;
+    log::info!(
+        "Handling Unsubscribe command: consumer_id={}, request_id={}",
+        unsubscribe_cmd.consumer_id,
+        unsubscribe_cmd.request_id
+    );
+
+    if let Some(consumer) = consumers.remove(&unsubscribe_cmd.consumer_id) {
+        let (topic_name, subscription_name) = {
+            let sub_guard = consumer.subscription.read().await;
+            (sub_guard.topic.clone(), sub_guard.name.clone())
+        };
+
+        {
+            let mut sub_guard = consumer.subscription.write().await;
+            sub_guard
+                .unsubscribe_consumer(consumer.consumer_id)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        }
+
+        let topic = {
+            let broker = broker_service.read().await;
+            broker.get_topic(&topic_name)
+        };
+        if let Some(topic) = topic {
+            topic.write().await.remove_subscription(&subscription_name);
+        }
+
+        log::info!(
+            "Unsubscribed consumer {} from subscription '{}' on topic '{}'",
+            consumer.consumer_id,
+            subscription_name,
+            topic_name
+        );
+    } else {
+        log::warn!(
+            "Attempted to unsubscribe unknown consumer {}",
+            unsubscribe_cmd.consumer_id
+        );
+    }
+
+    let response = ServerCommand::Success {
+        request_id: unsubscribe_cmd.request_id,
+    };
+    framed.send(response).await?;
+    log::info!(
+        "Sent Success response for Unsubscribe request {}",
+        unsubscribe_cmd.request_id
+    );
+
+    Ok(())
+}
+
 /// Handle CloseConsumer command (Apache Pulsar style)
 pub async fn handle_close_consumer<T>(
     framed: &mut Framed<T, PulsarFrameCodec>,

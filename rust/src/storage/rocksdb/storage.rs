@@ -152,6 +152,12 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         })
     }
 
+    fn delete_cursor(&mut self, topic: &str, subscription: &str) -> Result<()> {
+        let ledger_name = keys::managed_ledger_name(topic);
+        let cursor_name = keys::encode_cursor_name(subscription);
+        self.factory.delete_cursor_state(&ledger_name, &cursor_name)
+    }
+
     fn first_unacked_position(
         &self,
         topic: &str,

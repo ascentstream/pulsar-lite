@@ -78,6 +78,14 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         }
     }
 
+    fn delete_cursor(&mut self, topic: &str, subscription: &str) -> Result<()> {
+        match self {
+            Self::Memory(inner) => inner.delete_cursor(topic, subscription),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(inner) => inner.delete_cursor(topic, subscription),
+        }
+    }
+
     fn first_unacked_position(
         &self,
         topic: &str,

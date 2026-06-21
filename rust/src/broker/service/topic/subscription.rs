@@ -414,6 +414,19 @@ impl Subscription {
         }
     }
 
+    pub async fn unsubscribe_consumer(&mut self, consumer_id: u64) -> Result<(), String> {
+        self.remove_consumer_with_recovery(consumer_id).await;
+
+        if self.is_persistent() {
+            let mut guard = self.storage.lock().await;
+            guard
+                .delete_cursor(&self.topic, &self.name)
+                .map_err(|e| e.to_string())?;
+        }
+
+        Ok(())
+    }
+
     /// Persist cursor updates and notify the dispatcher after a message was acked.
     ///
     /// The caller (`Consumer::message_acked`) must handle Shared ownership resolution

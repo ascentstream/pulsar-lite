@@ -28,6 +28,12 @@ impl RocksDBManagedLedgerFactory {
             .is_some())
     }
 
+    pub(super) fn delete_cursor_state(&self, ledger_name: &str, cursor_name: &str) -> Result<()> {
+        self.db
+            .delete(keys::managed_cursor_key(ledger_name, cursor_name))?;
+        Ok(())
+    }
+
     fn open_ledger_with_config(
         &self,
         name: &str,

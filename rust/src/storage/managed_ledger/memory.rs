@@ -138,6 +138,13 @@ impl ManagedLedgerStorage for InMemoryManagedLedgerStorage {
         })
     }
 
+    fn delete_cursor(&mut self, topic: &str, subscription: &str) -> Result<()> {
+        let key = Self::cursor_key(topic, subscription);
+        self.cursors.remove(&key);
+        self.subscription_cursors.remove(&key);
+        Ok(())
+    }
+
     fn first_unacked_position(
         &self,
         topic: &str,

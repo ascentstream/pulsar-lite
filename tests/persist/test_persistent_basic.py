@@ -348,3 +348,29 @@ def test_persistent_consumer_seek_to_message_id_redelivers_from_target(
             assert replayed == [b"seek-1", b"seek-2"]
         finally:
             client.close()
+
+
+def test_persistent_reader_from_earliest_reads_existing_messages(tmp_path, unique_name):
+    db_path = tmp_path / "persistent.db"
+    topic = persistent_topic(unique_name, "persist-reader-earliest")
+
+    with _broker(tmp_path, db_path) as broker:
+        client = pulsar.Client(broker.broker_url, operation_timeout_seconds=3)
+        try:
+            producer = client.create_producer(topic, batching_enabled=False)
+            producer.send(b"reader-0")
+            producer.send(b"reader-1")
+
+            reader = client.create_reader(
+                topic,
+                pulsar.MessageId.earliest,
+                receiver_queue_size=1,
+            )
+            received = [
+                reader.read_next(timeout_millis=5000).data(),
+                reader.read_next(timeout_millis=5000).data(),
+            ]
+
+            assert received == [b"reader-0", b"reader-1"]
+        finally:
+            client.close()

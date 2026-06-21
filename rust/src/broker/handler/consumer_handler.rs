@@ -19,6 +19,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 
+const PULSAR_EARLIEST_MESSAGE_ID: u64 = u64::MAX;
+const PULSAR_LATEST_MESSAGE_ID: u64 = i64::MAX as u64;
+
 /// Handle Subscribe command (Apache Pulsar style)
 pub async fn handle_subscribe<T>(
     framed: &mut Framed<T, PulsarFrameCodec>,
@@ -81,14 +84,26 @@ where
                 .collect(),
             allow_out_of_order_delivery: meta.allow_out_of_order_delivery.unwrap_or(false),
         });
-    let initial_position = match subscribe_cmd.initial_position.unwrap_or(0) {
+    let mut initial_position = match subscribe_cmd.initial_position.unwrap_or(0) {
         1 => InitialPosition::Earliest,
         _ => InitialPosition::Latest,
     };
-    let start_message_id = subscribe_cmd.start_message_id.as_ref().map(|id| MessageId {
-        ledger: id.ledger_id,
-        entry: id.entry_id,
-        partition: id.partition.unwrap_or(-1),
+    let start_message_id = subscribe_cmd.start_message_id.as_ref().and_then(|id| {
+        if id.ledger_id == PULSAR_EARLIEST_MESSAGE_ID && id.entry_id == PULSAR_EARLIEST_MESSAGE_ID {
+            initial_position = InitialPosition::Earliest;
+            None
+        } else if id.ledger_id == PULSAR_LATEST_MESSAGE_ID
+            && id.entry_id == PULSAR_LATEST_MESSAGE_ID
+        {
+            initial_position = InitialPosition::Latest;
+            None
+        } else {
+            Some(MessageId {
+                ledger: id.ledger_id,
+                entry: id.entry_id,
+                partition: id.partition.unwrap_or(-1),
+            })
+        }
     });
     let cursor_options = CursorInitOptions {
         initial_position,

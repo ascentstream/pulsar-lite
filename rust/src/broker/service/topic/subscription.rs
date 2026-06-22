@@ -398,7 +398,12 @@ impl Subscription {
                         );
                     }
 
-                    if !dispatcher.is_consumer_connected() {
+                    if !dispatcher.is_consumer_connected()
+                        && !matches!(
+                            dispatcher.get_type(),
+                            SubscriptionType::Shared | SubscriptionType::KeyShared
+                        )
+                    {
                         self.dispatcher = None;
                     }
                 }

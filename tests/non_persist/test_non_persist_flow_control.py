@@ -12,7 +12,10 @@ from non_persist.support import (
     non_persistent_runtime_topic,
     wait_for_delivery_ready,
 )
-from non_persist.test_non_persist_dynamic_consumers import _find_key_in_range, _murmur3_32
+from non_persist.test_non_persist_dynamic_consumers import (
+    _find_key_in_range,
+    _murmur3_32,
+)
 
 
 def test_non_persist_shared_flow_full_consumer_stops_receiving_new_messages(
@@ -63,9 +66,7 @@ def test_non_persist_shared_flow_full_consumer_stops_receiving_new_messages(
         client.close()
 
 
-def test_non_persist_shared_flow_consumer_resumes_after_buffer_is_drained(
-    broker_url, unique_name
-):
+def test_non_persist_shared_flow_consumer_resumes_after_buffer_is_drained(broker_url, unique_name):
     client = pulsar.Client(broker_url)
     topic = non_persistent_runtime_topic(unique_name, "np-shared-flow-resume")
     subscription = unique_name("np-sub")
@@ -158,9 +159,7 @@ def test_non_persist_shared_flow_prefers_consumers_with_available_receive_capaci
         "the non-persistent pre-FLOW drop window is not deterministically observable here."
     )
 )
-def test_non_persist_shared_flow_not_ready_drops_message_by_current_design(
-    broker_url, unique_name
-):
+def test_non_persist_shared_flow_not_ready_drops_message_by_current_design(broker_url, unique_name):
     client = pulsar.Client(broker_url)
     topic = non_persistent_runtime_topic(unique_name, "np-shared-flow-not-ready")
     subscription = unique_name("np-sub")

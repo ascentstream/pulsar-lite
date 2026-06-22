@@ -30,7 +30,11 @@ def test_build_broker_image_reuses_existing_clean_commit_image(
         return _completed(args)
 
     monkeypatch.setattr(docker_image, "_run", fake_run)
-    monkeypatch.setattr(docker_image, "_sha256_file", lambda path: "349664eafa409a12646bb44fba03bbbf3558fb22ae3c10ee831d4308043ce54a")
+    monkeypatch.setattr(
+        docker_image,
+        "_sha256_file",
+        lambda path: "349664eafa409a12646bb44fba03bbbf3558fb22ae3c10ee831d4308043ce54a",
+    )
 
     result = docker_image.build_broker_image()
 
@@ -82,7 +86,11 @@ def test_build_broker_image_builds_missing_clean_commit_image(
         return _completed(args)
 
     monkeypatch.setattr(docker_image, "_run", fake_run)
-    monkeypatch.setattr(docker_image, "_sha256_file", lambda path: "349664eafa409a12646bb44fba03bbbf3558fb22ae3c10ee831d4308043ce54a")
+    monkeypatch.setattr(
+        docker_image,
+        "_sha256_file",
+        lambda path: "349664eafa409a12646bb44fba03bbbf3558fb22ae3c10ee831d4308043ce54a",
+    )
 
     result = docker_image.build_broker_image()
 
@@ -132,7 +140,11 @@ def test_build_broker_image_refreshes_dirty_binary_and_reuses_existing_image(
         return _completed(args)
 
     monkeypatch.setattr(docker_image, "_run", fake_run)
-    monkeypatch.setattr(docker_image, "_sha256_file", lambda path: "349664eafa409a12646bb44fba03bbbf3558fb22ae3c10ee831d4308043ce54a")
+    monkeypatch.setattr(
+        docker_image,
+        "_sha256_file",
+        lambda path: "349664eafa409a12646bb44fba03bbbf3558fb22ae3c10ee831d4308043ce54a",
+    )
 
     result = docker_image.build_broker_image(skip_docker_build=True)
 
@@ -171,7 +183,11 @@ def test_build_broker_image_errors_when_skip_requested_but_clean_image_missing(
         return _completed(args)
 
     monkeypatch.setattr(docker_image, "_run", fake_run)
-    monkeypatch.setattr(docker_image, "_sha256_file", lambda path: "349664eafa409a12646bb44fba03bbbf3558fb22ae3c10ee831d4308043ce54a")
+    monkeypatch.setattr(
+        docker_image,
+        "_sha256_file",
+        lambda path: "349664eafa409a12646bb44fba03bbbf3558fb22ae3c10ee831d4308043ce54a",
+    )
 
     with pytest.raises(RuntimeError, match="does not exist"):
         docker_image.build_broker_image(skip_docker_build=True)

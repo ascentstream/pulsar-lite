@@ -13,7 +13,6 @@ from pathlib import Path
 
 from test_support import current_log_offset, persistent_topic, wait_for_log
 
-
 CLIENT_PROCESS = Path(__file__).with_name("pulsar_client_process.py")
 READY_SENTINEL = "__PULSAR_LITE_READY__"
 

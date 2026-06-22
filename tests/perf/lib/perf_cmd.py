@@ -4,64 +4,99 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import BROKER_BIN, CLASSPATH_FILE, ENV_BASE, JAVA, PULSAR_ROOT, PULSAR_TESTCLIENT_JAR
+from . import (
+    BROKER_BIN,
+    CLASSPATH_FILE,
+    ENV_BASE,
+    JAVA,
+    PULSAR_ROOT,
+    PULSAR_TESTCLIENT_JAR,
+)
 
 
 def ensure_prereqs(*, require_broker_bin: bool = True) -> None:
     if require_broker_bin and not BROKER_BIN.exists():
-        raise FileNotFoundError(f'broker binary missing: {BROKER_BIN}')
+        raise FileNotFoundError(f"broker binary missing: {BROKER_BIN}")
     if not PULSAR_TESTCLIENT_JAR.exists():
         raise FileNotFoundError(
-            f'pulsar-testclient jar missing: {PULSAR_TESTCLIENT_JAR}\n'
-            'Set PULSAR_ROOT=/path/to/pulsar or '
-            'PULSAR_TESTCLIENT_JAR=/path/to/pulsar-testclient.jar.\n'
-            'If using a Pulsar source checkout, build it with:\n'
-            '  mvn -pl pulsar-testclient -am -DskipTests package'
+            f"pulsar-testclient jar missing: {PULSAR_TESTCLIENT_JAR}\n"
+            "Set PULSAR_ROOT=/path/to/pulsar or "
+            "PULSAR_TESTCLIENT_JAR=/path/to/pulsar-testclient.jar.\n"
+            "If using a Pulsar source checkout, build it with:\n"
+            "  mvn -pl pulsar-testclient -am -DskipTests package"
         )
     if not CLASSPATH_FILE.exists():
         if not PULSAR_ROOT.exists():
             raise FileNotFoundError(
-                f'pulsar source checkout missing: {PULSAR_ROOT}\n'
-                'Set PULSAR_ROOT=/path/to/pulsar, or set '
-                'PULSAR_TESTCLIENT_CLASSPATH_FILE to an existing runtime classpath file.'
+                f"pulsar source checkout missing: {PULSAR_ROOT}\n"
+                "Set PULSAR_ROOT=/path/to/pulsar, or set "
+                "PULSAR_TESTCLIENT_CLASSPATH_FILE to an existing runtime classpath file."
             )
         CLASSPATH_FILE.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(
-            ['mvn', '-pl', 'pulsar-testclient', 'dependency:build-classpath',
-            '-DincludeScope=runtime', f'-Dmdep.outputFile={CLASSPATH_FILE}'],
-            cwd=str(PULSAR_ROOT), check=True,
+            [
+                "mvn",
+                "-pl",
+                "pulsar-testclient",
+                "dependency:build-classpath",
+                "-DincludeScope=runtime",
+                f"-Dmdep.outputFile={CLASSPATH_FILE}",
+            ],
+            cwd=str(PULSAR_ROOT),
+            check=True,
+        )
+
+
+def perf_cmd(
+    subcommand: str,
+    service_url: str,
+    extra_args: list[str],
+    topic: str,
+    histogram_path: Path,
+) -> list[str]:
+    classpath = (
+        f"{PULSAR_TESTCLIENT_JAR}:{CLASSPATH_FILE.read_text(encoding='utf-8').strip()}"
     )
-
-
-def perf_cmd(subcommand: str, service_url: str, extra_args: list[str], topic: str, histogram_path: Path) -> list[str]:
-    classpath = f"{PULSAR_TESTCLIENT_JAR}:{CLASSPATH_FILE.read_text(encoding='utf-8').strip()}"
     return [
         str(JAVA),
-        '-cp',
+        "-cp",
         classpath,
-        'org.apache.pulsar.testclient.PulsarPerfTestTool',
-        str(PULSAR_ROOT / 'conf' / 'client.conf'),
+        "org.apache.pulsar.testclient.PulsarPerfTestTool",
+        str(PULSAR_ROOT / "conf" / "client.conf"),
         subcommand,
-        '-u', service_url,
-        '--histogram-file', str(histogram_path),
+        "-u",
+        service_url,
+        "--histogram-file",
+        str(histogram_path),
         *extra_args,
         topic,
     ]
 
 
-def run_sync(cmd: list[str], stdout_path: Path, timeout: float = 300.0) -> subprocess.CompletedProcess[str]:
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout, env=ENV_BASE)
-    stdout_path.write_text(proc.stdout, encoding='utf-8')
+def run_sync(
+    cmd: list[str], stdout_path: Path, timeout: float = 300.0
+) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout,
+        env=ENV_BASE,
+    )
+    stdout_path.write_text(proc.stdout, encoding="utf-8")
     return proc
 
 
 def wait_for_log(path: Path, needle: str, timeout: float = 30.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if path.exists() and needle in path.read_text(encoding='utf-8', errors='replace'):
+        if path.exists() and needle in path.read_text(
+            encoding="utf-8", errors="replace"
+        ):
             return
         time.sleep(0.2)
-    raise RuntimeError(f'timed out waiting for {needle!r} in {path}')
+    raise RuntimeError(f"timed out waiting for {needle!r} in {path}")
 
 
 def run_consumer_then_feed(

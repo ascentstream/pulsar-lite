@@ -101,9 +101,7 @@ def test_persistent_failover_standby_takes_unacked_backlog_after_active_closes(
             client.close()
 
 
-def test_persistent_shared_distributes_messages_without_duplicates(
-    tmp_path, unique_name
-):
+def test_persistent_shared_distributes_messages_without_duplicates(tmp_path, unique_name):
     db_path = tmp_path / "persistent.db"
     topic = persistent_topic(unique_name, "persist-shared-distribution")
     subscription = unique_name("persist-sub")
@@ -228,9 +226,7 @@ def test_persistent_key_shared_routes_same_key_to_same_consumer(tmp_path, unique
             client.close()
 
 
-def test_persistent_key_shared_unacked_redelivery_preserves_key_owner(
-    tmp_path, unique_name
-):
+def test_persistent_key_shared_unacked_redelivery_preserves_key_owner(tmp_path, unique_name):
     db_path = tmp_path / "persistent.db"
     topic = persistent_topic(unique_name, "persist-key-shared-redelivery")
     subscription = unique_name("persist-sub")

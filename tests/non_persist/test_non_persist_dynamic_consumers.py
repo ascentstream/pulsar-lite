@@ -119,9 +119,7 @@ def test_non_persist_shared_new_consumer_only_sees_live_traffic_and_shares_load(
         client.close()
 
 
-def test_non_persist_shared_survivor_continues_after_other_consumer_closes(
-    broker_url, unique_name
-):
+def test_non_persist_shared_survivor_continues_after_other_consumer_closes(broker_url, unique_name):
     topic = non_persistent_runtime_topic(unique_name, "np-shared-remove-consumer")
     subscription = unique_name("np-sub")
     client = pulsar.Client(broker_url)
@@ -299,9 +297,7 @@ def test_non_persist_key_shared_sticky_survivor_keeps_own_range_and_does_not_tak
         client.close()
 
 
-def test_non_persist_key_shared_auto_split_new_consumer_shares_live_keys(
-    broker_url, unique_name
-):
+def test_non_persist_key_shared_auto_split_new_consumer_shares_live_keys(broker_url, unique_name):
     topic = non_persistent_runtime_topic(unique_name, "np-key-shared-auto-add")
     subscription = unique_name("np-sub")
     low_key = _find_key_in_range("auto-low", 0, 32767)

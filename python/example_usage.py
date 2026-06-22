@@ -13,8 +13,9 @@ Pulsar Lite 使用示例
 - 完整订阅模式（Shared, Failover, Exclusive）
 """
 
-from pulsar_lite import PulsarClient
 import time
+
+from pulsar_lite import PulsarClient
 
 
 def example_partitioned_topic():
@@ -50,7 +51,7 @@ def example_partitioned_topic():
     consumer = client.subscribe(
         "persistent://public/default/partitioned-topic",
         "partition-sub",
-        consumer_type=pulsar.ConsumerType.Shared
+        consumer_type=pulsar.ConsumerType.Shared,
     )
 
     # 消费消息
@@ -88,7 +89,7 @@ def example_embedded_mode():
 
         # 发送消息
         for i in range(10):
-            message = f"Message {i} from Pulsar Lite".encode('utf-8')
+            message = f"Message {i} from Pulsar Lite".encode("utf-8")
             msg_id = producer.send(message)
             print(f"  ✓ Sent message {i}: {msg_id}")
             time.sleep(0.1)
@@ -209,6 +210,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\n❌ 错误: {e}")
         import traceback
+
         traceback.print_exc()
         print("\n提示：")
         print("  - 确保已构建 Rust Broker: cd rust && cargo build --release")

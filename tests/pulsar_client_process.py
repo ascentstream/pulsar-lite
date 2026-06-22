@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import time
+from pathlib import Path
 
 import pulsar
 
@@ -35,7 +35,7 @@ def main() -> int:
             time.sleep(1)
     except Exception as exc:
         if args.ready_file:
-            Path(args.ready_file).write_text(f"ERROR:{exc!r}\n",encoding="utf-8")
+            Path(args.ready_file).write_text(f"ERROR:{exc!r}\n", encoding="utf-8")
         raise
     finally:
         consumer.close()

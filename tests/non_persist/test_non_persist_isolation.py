@@ -14,9 +14,7 @@ from non_persist.support import (
 )
 
 
-def test_non_persist_multi_producer_single_topic_delivers_all_messages(
-    broker_url, unique_name
-):
+def test_non_persist_multi_producer_single_topic_delivers_all_messages(broker_url, unique_name):
     topic = non_persistent_runtime_topic(unique_name, "np-multi-producer")
     subscription = unique_name("np-sub")
     client = pulsar.Client(broker_url)
@@ -53,11 +51,7 @@ def test_non_persist_multi_producer_single_topic_delivers_all_messages(
         for thread in threads:
             thread.join()
 
-        expected = [
-            payload
-            for payloads in producer_payloads.values()
-            for payload in payloads
-        ]
+        expected = [payload for payloads in producer_payloads.values() for payload in payloads]
         received = []
         for _ in expected:
             message = consumer.receive(timeout_millis=5000)
@@ -70,9 +64,7 @@ def test_non_persist_multi_producer_single_topic_delivers_all_messages(
         client.close()
 
 
-def test_non_persist_same_topic_multiple_subscriptions_are_independent(
-    broker_url, unique_name
-):
+def test_non_persist_same_topic_multiple_subscriptions_are_independent(broker_url, unique_name):
     topic = non_persistent_runtime_topic(unique_name, "np-multi-sub")
     sub_a = unique_name("np-sub-a")
     sub_b = unique_name("np-sub-b")
@@ -111,9 +103,7 @@ def test_non_persist_same_topic_multiple_subscriptions_are_independent(
         client.close()
 
 
-def test_non_persist_different_topics_do_not_cross_deliver_messages(
-    broker_url, unique_name
-):
+def test_non_persist_different_topics_do_not_cross_deliver_messages(broker_url, unique_name):
     topic_a = non_persistent_runtime_topic(unique_name, "np-topic-a")
     topic_b = non_persistent_runtime_topic(unique_name, "np-topic-b")
     client = pulsar.Client(broker_url)

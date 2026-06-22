@@ -48,9 +48,7 @@ def test_non_persist_exclusive_preserves_send_order(broker_url, unique_name):
         client.close()
 
 
-def test_non_persist_exclusive_handoff_preserves_order_after_rejoin(
-    broker_url, unique_name
-):
+def test_non_persist_exclusive_handoff_preserves_order_after_rejoin(broker_url, unique_name):
     topic = non_persistent_runtime_topic(unique_name, "np-exclusive-handoff-order")
     subscription = unique_name("np-sub")
     client = pulsar.Client(broker_url)
@@ -93,9 +91,7 @@ def test_non_persist_exclusive_handoff_preserves_order_after_rejoin(
         client.close()
 
 
-def test_non_persist_failover_preserves_order_within_active_epochs(
-    broker_url, unique_name
-):
+def test_non_persist_failover_preserves_order_within_active_epochs(broker_url, unique_name):
     topic = non_persistent_runtime_topic(unique_name, "np-failover-order")
     subscription = unique_name("np-sub")
     client = pulsar.Client(broker_url)
@@ -128,7 +124,10 @@ def test_non_persist_failover_preserves_order_within_active_epochs(
         owner.acknowledge(first)
         active = owner
         standby = consumer_2 if active is consumer_1 else consumer_1
-        before_received = [first.data(), *_receive_payloads(active, len(before_payloads) - 1)]
+        before_received = [
+            first.data(),
+            *_receive_payloads(active, len(before_payloads) - 1),
+        ]
         assert before_received == before_payloads
 
         active.close()
@@ -142,9 +141,7 @@ def test_non_persist_failover_preserves_order_within_active_epochs(
         client.close()
 
 
-def test_non_persist_shared_single_consumer_preserves_send_order(
-    broker_url, unique_name
-):
+def test_non_persist_shared_single_consumer_preserves_send_order(broker_url, unique_name):
     topic = non_persistent_runtime_topic(unique_name, "np-shared-order")
     subscription = unique_name("np-sub")
     client = pulsar.Client(broker_url)
@@ -170,9 +167,7 @@ def test_non_persist_shared_single_consumer_preserves_send_order(
         client.close()
 
 
-def test_non_persist_key_shared_sticky_preserves_same_key_order(
-    broker_url, unique_name
-):
+def test_non_persist_key_shared_sticky_preserves_same_key_order(broker_url, unique_name):
     topic = non_persistent_runtime_topic(unique_name, "np-key-shared-sticky-order")
     subscription = unique_name("np-sub")
     sticky_key = _find_key_in_range("sticky-order", 0, 32767)
@@ -279,9 +274,7 @@ def test_non_persist_key_shared_sticky_dynamic_join_preserves_same_key_order(
         client.close()
 
 
-def test_non_persist_key_shared_auto_split_preserves_same_key_order(
-    broker_url, unique_name
-):
+def test_non_persist_key_shared_auto_split_preserves_same_key_order(broker_url, unique_name):
     topic = non_persistent_runtime_topic(unique_name, "np-key-shared-auto-order")
     subscription = unique_name("np-sub")
     sticky_key = _find_key_in_range("auto-order", 32768, 65535)

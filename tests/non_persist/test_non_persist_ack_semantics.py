@@ -98,9 +98,7 @@ def test_non_persist_shared_acked_message_is_not_redelivered_after_owner_closes(
 
         try:
             unexpected = survivor.receive(timeout_millis=1500)
-            raise AssertionError(
-                f"unexpected redelivery after ack: {unexpected.data()!r}"
-            )
+            raise AssertionError(f"unexpected redelivery after ack: {unexpected.data()!r}")
         except pulsar.Timeout:
             pass
     finally:

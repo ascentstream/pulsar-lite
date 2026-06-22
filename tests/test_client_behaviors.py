@@ -7,7 +7,6 @@ import threading
 
 import pulsar
 import pytest
-
 from test_support import persistent_topic
 
 
@@ -59,7 +58,9 @@ def test_async_send_delivers_all_messages(broker_url, unique_name):
         client.close()
 
 
-@pytest.mark.skip(reason="pulsar-lite message metadata for batched payload decoding is not implemented yet")
+@pytest.mark.skip(
+    reason="pulsar-lite message metadata for batched payload decoding is not implemented yet"
+)
 def test_batched_send_delivers_all_messages(broker_url, unique_name):
     topic = persistent_topic(unique_name("batched-send"))
     subscription = unique_name("batched-sub")
@@ -97,7 +98,9 @@ def test_batched_send_delivers_all_messages(broker_url, unique_name):
         client.close()
 
 
-@pytest.mark.skip(reason="pulsar-lite message metadata for batched payload decoding is not implemented yet")
+@pytest.mark.skip(
+    reason="pulsar-lite message metadata for batched payload decoding is not implemented yet"
+)
 def test_compressed_send_preserves_payload(broker_url, unique_name):
     topic = persistent_topic(unique_name("compressed-send"))
     subscription = unique_name("compressed-sub")
@@ -118,7 +121,7 @@ def test_compressed_send_preserves_payload(broker_url, unique_name):
             batching_enabled=False,
         )
 
-        payload = (b"compressible-payload-" * 64)
+        payload = b"compressible-payload-" * 64
         producer.send(payload)
 
         message = consumer.receive(timeout_millis=5000)

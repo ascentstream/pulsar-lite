@@ -220,7 +220,7 @@ fn position_range(position: &ManagedLedgerPosition) -> proto::MessageRange {
         entry_id: position.entry_id as i64,
     };
     proto::MessageRange {
-        lower_endpoint: endpoint.clone(),
+        lower_endpoint: endpoint,
         upper_endpoint: endpoint,
     }
 }

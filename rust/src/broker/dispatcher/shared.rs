@@ -105,16 +105,18 @@ impl SharedDispatcher {
         let mut scan_index = current_index + 1;
         let mut end_priority_level_index = current_index;
         loop {
-            let scan_consumer = consumers.get(scan_index);
-            if scan_consumer.is_none()
-                || scan_consumer.unwrap().get_priority_level() != target_priority
-            {
-                end_priority_level_index = scan_index;
-                scan_index = Self::first_consumer_index_of_priority(consumers, target_priority)?;
-            } else if scan_consumer.unwrap().get_available_permits().await > 0 {
-                return Some(scan_index);
-            } else {
-                scan_index += 1;
+            match consumers.get(scan_index) {
+                Some(scan_consumer) if scan_consumer.get_priority_level() == target_priority => {
+                    if scan_consumer.get_available_permits().await > 0 {
+                        return Some(scan_index);
+                    }
+                    scan_index += 1;
+                }
+                _ => {
+                    end_priority_level_index = scan_index;
+                    scan_index =
+                        Self::first_consumer_index_of_priority(consumers, target_priority)?;
+                }
             }
 
             if scan_index == current_index {
@@ -551,6 +553,12 @@ impl SharedDispatcher {
                 message_id.entry
             );
         }
+    }
+}
+
+impl Default for SharedDispatcher {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

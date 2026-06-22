@@ -89,6 +89,10 @@ impl PendingAcksMap {
         self.inner.read().await.len()
     }
 
+    pub async fn is_empty(&self) -> bool {
+        self.inner.read().await.is_empty()
+    }
+
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }

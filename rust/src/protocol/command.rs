@@ -268,16 +268,12 @@ impl ServerCommand {
             },
             ServerCommand::Ping => BaseCommand {
                 r#type: Type::Ping as i32,
-                ping: Some(CommandPing {
-                    ..Default::default()
-                }),
+                ping: Some(CommandPing {}),
                 ..Default::default()
             },
             ServerCommand::Pong => BaseCommand {
                 r#type: Type::Pong as i32,
-                pong: Some(CommandPong {
-                    ..Default::default()
-                }),
+                pong: Some(CommandPong {}),
                 ..Default::default()
             },
         }

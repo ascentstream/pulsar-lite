@@ -254,10 +254,7 @@ impl ManagedLedgerStorage for InMemoryManagedLedgerStorage {
     ) -> Result<()> {
         let cursor_key = format!("{}:{}", topic, subscription);
         let (mark_delete, holes_count) = {
-            let cursor = self
-                .subscription_cursors
-                .entry(cursor_key)
-                .or_insert_with(SubscriptionCursor::default);
+            let cursor = self.subscription_cursors.entry(cursor_key).or_default();
             ack_shared(cursor, message_id.entry)
         };
 

@@ -15,18 +15,13 @@ use crate::broker::service::persistent::PersistentSubscriptionRuntime;
 use crate::storage::{ManagedLedgerPosition, MessageId, NonPersistentEntry};
 
 /// Subscription type (matches Pulsar protocol)
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum SubscriptionType {
+    #[default]
     Exclusive = 0,
     Shared = 1,
     Failover = 2,
     KeyShared = 3,
-}
-
-impl Default for SubscriptionType {
-    fn default() -> Self {
-        SubscriptionType::Exclusive
-    }
 }
 
 /// Mirrors `CommandAck.AckType` in PulsarApi.proto (Individual = 0, Cumulative = 1).

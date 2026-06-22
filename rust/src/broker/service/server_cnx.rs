@@ -262,13 +262,10 @@ where
                         send_error = Some(e);
                     }
 
-                    match send_error {
-                        Some(e) => {
-                            self.set_failed(CloseReason::ProtocolError(e.to_string()));
-                            log::error!("Error sending message batch to client: {}", e);
-                            break Err(e);
-                        }
-                        None => {}
+                    if let Some(e) = send_error {
+                        self.set_failed(CloseReason::ProtocolError(e.to_string()));
+                        log::error!("Error sending message batch to client: {}", e);
+                        break Err(e);
                     }
                 }
 

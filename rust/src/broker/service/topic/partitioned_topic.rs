@@ -272,9 +272,9 @@ impl PartitionedTopic {
         PartitionedTopicStats {
             topic_name: self.topic_name.clone(),
             partition_count: self.partition_count,
-            total_producers: total_producers,
-            total_consumers: total_consumers,
-            total_subscriptions: total_subscriptions,
+            total_producers,
+            total_consumers,
+            total_subscriptions,
             partitions: partition_stats,
         }
     }

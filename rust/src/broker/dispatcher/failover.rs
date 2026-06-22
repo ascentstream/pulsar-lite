@@ -152,6 +152,12 @@ impl FailoverDispatcher {
     }
 }
 
+impl Default for FailoverDispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Dispatcher for FailoverDispatcher {
     fn get_type(&self) -> SubscriptionType {
         SubscriptionType::Failover

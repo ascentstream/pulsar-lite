@@ -129,7 +129,7 @@ impl NonPersistentDispatcherMultipleConsumers {
                 log::debug!("Dropping non-persistent shared entry due to zero aggregate permits");
                 self.record_drop(1);
                 entry.release();
-                while let Some(remaining) = pending_entries.next() {
+                for remaining in pending_entries.by_ref() {
                     self.record_drop(1);
                     remaining.release();
                 }

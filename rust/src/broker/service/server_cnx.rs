@@ -225,26 +225,23 @@ where
             tokio::select! {
                 // Inbound protocol commands — skipped when read_paused (TCP backpressure).
                 frame_result = self.framed.next(), if !self.read_paused && self.connection_write_state.is_writable() => {
-                    match frame_result {
-                        Some(frame) => {
-                            let frame = frame.map_err(to_cnx_error)?;
-                            let base_command = BaseCommand::decode(&frame.command[..]).map_err(to_cnx_error)?;
-                            log::debug!("Received command: {:?}", base_command.r#type);
+                    let Some(frame) = frame_result else {
+                        self.close_reason.get_or_insert(CloseReason::ClientClosed);
+                        break Ok(());
+                    };
 
-                            self.mark_inbound_activity();
+                    let frame = frame.map_err(to_cnx_error)?;
+                    let base_command = BaseCommand::decode(&frame.command[..]).map_err(to_cnx_error)?;
+                    log::debug!("Received command: {:?}", base_command.r#type);
 
-                            if let Err(e) = self.handle_command(base_command, frame).await {
-                                self.set_failed(CloseReason::ProtocolError(e.to_string()));
-                                log::error!("Error handling command: {}", e);
-                                break Err(e);
-                            }
-                            self.sync_connection_writable_from_framed_buffer();
-                        }
-                        None => {
-                            self.close_reason.get_or_insert(CloseReason::ClientClosed);
-                            break Ok(());
-                        }
+                    self.mark_inbound_activity();
+
+                    if let Err(e) = self.handle_command(base_command, frame).await {
+                        self.set_failed(CloseReason::ProtocolError(e.to_string()));
+                        log::error!("Error handling command: {}", e);
+                        break Err(e);
                     }
+                    self.sync_connection_writable_from_framed_buffer();
                 }
 
                 // Outbound broker messages are batched: drain all pending, encode

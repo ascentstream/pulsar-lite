@@ -48,6 +48,7 @@ Thumbs.db
 *.db
 *.db-lock
 *.sock
+rust/pulsar-lite.rocksdb/
 
 # Temporary files
 tmp/

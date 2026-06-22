@@ -86,6 +86,25 @@ def test_persistent_latest_late_subscriber_skips_existing_backlog(tmp_path, uniq
             client.close()
 
 
+def test_persistent_consumer_get_last_message_id(tmp_path, unique_name):
+    db_path = tmp_path / "persistent.db"
+    topic = persistent_topic(unique_name, "persist-last-message-id")
+    subscription = unique_name("persist-sub")
+
+    with _broker(tmp_path, db_path) as broker:
+        client = pulsar.Client(broker.broker_url, operation_timeout_seconds=3)
+        try:
+            producer = client.create_producer(topic, batching_enabled=False)
+            producer.send(b"last-0")
+            expected = producer.send(b"last-1")
+
+            consumer = _subscribe_exclusive(client, topic, subscription)
+
+            assert consumer.get_last_message_id() == expected
+        finally:
+            client.close()
+
+
 def test_persistent_unacked_message_does_not_repeat_on_additional_flow(tmp_path, unique_name):
     db_path = tmp_path / "persistent.db"
     topic = persistent_topic(unique_name, "persist-no-repeat-flow")
@@ -259,5 +278,118 @@ def test_persistent_send_async_returns_ids_and_payloads_survive_restart(
                 consumer.acknowledge(message)
 
             assert received == payloads
+        finally:
+            client.close()
+
+
+def test_persistent_unsubscribe_deletes_subscription_cursor(tmp_path, unique_name):
+    db_path = tmp_path / "persistent.db"
+    topic = persistent_topic(unique_name, "persist-unsubscribe")
+    subscription = unique_name("persist-sub")
+
+    with _broker(tmp_path, db_path) as broker:
+        client = pulsar.Client(broker.broker_url, operation_timeout_seconds=3)
+        try:
+            producer = client.create_producer(topic, batching_enabled=False)
+            producer.send(b"before-unsubscribe")
+
+            consumer = _subscribe_exclusive(client, topic, subscription)
+            message = consumer.receive(timeout_millis=5000)
+            assert message.data() == b"before-unsubscribe"
+            consumer.acknowledge(message)
+            consumer.unsubscribe()
+
+            producer.send(b"after-unsubscribe")
+        finally:
+            client.close()
+
+    with _broker(tmp_path, db_path) as broker:
+        client = pulsar.Client(broker.broker_url, operation_timeout_seconds=3)
+        try:
+            consumer = _subscribe_exclusive(
+                client,
+                topic,
+                subscription,
+                initial_position=pulsar.InitialPosition.Earliest,
+            )
+            received = []
+            for _ in range(2):
+                message = consumer.receive(timeout_millis=5000)
+                received.append(message.data())
+                consumer.acknowledge(message)
+
+            assert received == [b"before-unsubscribe", b"after-unsubscribe"]
+        finally:
+            client.close()
+
+
+def test_persistent_consumer_seek_to_message_id_redelivers_from_target(
+    tmp_path, unique_name
+):
+    db_path = tmp_path / "persistent.db"
+    topic = persistent_topic(unique_name, "persist-seek-message-id")
+    subscription = unique_name("persist-sub")
+
+    with _broker(tmp_path, db_path) as broker:
+        client = pulsar.Client(broker.broker_url, operation_timeout_seconds=3)
+        try:
+            producer = client.create_producer(topic, batching_enabled=False)
+            message_ids = [
+                producer.send(b"seek-0"),
+                producer.send(b"seek-1"),
+                producer.send(b"seek-2"),
+            ]
+
+            consumer = _subscribe_exclusive(client, topic, subscription)
+            received = []
+            for _ in message_ids:
+                message = consumer.receive(timeout_millis=5000)
+                received.append(message.data())
+                consumer.acknowledge(message)
+
+            assert received == [b"seek-0", b"seek-1", b"seek-2"]
+
+            consumer.seek(message_ids[1])
+            consumer.close()
+
+            replay_consumer = _subscribe_exclusive(
+                client,
+                topic,
+                subscription,
+                initial_position=pulsar.InitialPosition.Latest,
+            )
+            replayed = []
+            for _ in range(2):
+                message = replay_consumer.receive(timeout_millis=5000)
+                replayed.append(message.data())
+                replay_consumer.acknowledge(message)
+
+            assert replayed == [b"seek-1", b"seek-2"]
+        finally:
+            client.close()
+
+
+def test_persistent_reader_from_earliest_reads_existing_messages(tmp_path, unique_name):
+    db_path = tmp_path / "persistent.db"
+    topic = persistent_topic(unique_name, "persist-reader-earliest")
+
+    with _broker(tmp_path, db_path) as broker:
+        client = pulsar.Client(broker.broker_url, operation_timeout_seconds=3)
+        try:
+            producer = client.create_producer(topic, batching_enabled=False)
+            producer.send(b"reader-0")
+            producer.send(b"reader-1")
+
+            reader = client.create_reader(
+                topic,
+                pulsar.MessageId.earliest,
+                receiver_queue_size=1,
+            )
+            received = [
+                reader.read_next(timeout_millis=5000).data(),
+                reader.read_next(timeout_millis=5000).data(),
+            ]
+
+            assert received == [b"reader-0", b"reader-1"]
         finally:
             client.close()

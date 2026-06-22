@@ -55,7 +55,7 @@ pub struct PendingMessage {
 /// - flow-control permit
 /// - outbound bytes reservation
 /// - channel slot
-/// - pending ack entry (Shared/KeyShared only)
+/// - pending ack entry
 ///
 /// Call `send()` to commit the dispatch. If dropped without sending, all
 /// resources are automatically rolled back (dispatch-or-drop semantics).
@@ -373,10 +373,7 @@ impl Consumer {
 
         // Native Pulsar writes pending acks before the message is written so that
         // disconnect/close races cannot lose ownership bookkeeping.
-        if matches!(
-            self.get_sub_type(),
-            SubscriptionType::Shared | SubscriptionType::KeyShared
-        ) && !self
+        if !self
             .track_message_dispatched_with_sticky_hash(
                 &message_id,
                 redelivery_count,
@@ -397,12 +394,7 @@ impl Consumer {
         // Failure = channel full (consumer backpressure) → return false,
         // dispatcher batch interrupts and handles partial success.
         let Some(permit) = self.try_acquire_send_permit() else {
-            if matches!(
-                self.get_sub_type(),
-                SubscriptionType::Shared | SubscriptionType::KeyShared
-            ) {
-                self.remove_pending_ack(&message_id).await;
-            }
+            self.remove_pending_ack(&message_id).await;
             return false;
         };
 
@@ -421,7 +413,7 @@ impl Consumer {
     /// Atomically reserve all resources needed to dispatch one message.
     ///
     /// Checks and acquires (in order): flow-control permit
-    /// → connection writability → channel slot → pending ack entry (Shared/KeyShared only).
+    /// → connection writability → channel slot → pending ack entry.
     ///
     /// Returns `Some(DispatchReservation)` on success, `None` if any check
     /// fails (dispatch-or-drop: the dispatcher should immediately drop the
@@ -464,22 +456,18 @@ impl Consumer {
             }
         };
 
-        // Step 5: Track pending ack (Shared/KeyShared only)
-        let mut pending_ack_message_id = None;
-        if matches!(
-            self.get_sub_type(),
-            SubscriptionType::Shared | SubscriptionType::KeyShared
-        ) {
-            if !self
-                .track_message_dispatched(message_id, redelivery_count)
-                .await
-            {
-                self.available_permits.fetch_add(1, Ordering::Relaxed);
-                // owned_permit drops here, releasing channel slot
-                return None;
-            }
-            pending_ack_message_id = Some(message_id.clone());
+        // Step 5: Track pending ack ownership before handoff. Shared/KeyShared
+        // use this for ownership resolution, while Exclusive/Failover use it
+        // to reject stale acks after seek/redelivery boundaries.
+        if !self
+            .track_message_dispatched(message_id, redelivery_count)
+            .await
+        {
+            self.available_permits.fetch_add(1, Ordering::Relaxed);
+            // owned_permit drops here, releasing channel slot
+            return None;
         }
+        let pending_ack_message_id = Some(message_id.clone());
 
         // Step 6: Build reservation
         let message = PendingMessage {
@@ -748,15 +736,29 @@ impl Consumer {
                 }
             }
             SubscriptionType::Exclusive | SubscriptionType::Failover => {
+                let mut acked_for_storage = Vec::with_capacity(message_ids.len());
                 for message_id in &message_ids {
+                    if ack_type == AckCommandType::Individual
+                        && !self.remove_pending_ack(message_id).await
+                    {
+                        log::warn!(
+                            "Consumer {} ignored stale ack for message {}:{}",
+                            self.consumer_id,
+                            message_id.ledger,
+                            message_id.entry
+                        );
+                        continue;
+                    }
+
                     self.ack_message(message_id.clone()).await;
+                    acked_for_storage.push(message_id.clone());
                 }
 
-                if is_persistent {
+                if is_persistent && !acked_for_storage.is_empty() {
                     self.subscription
                         .write()
                         .await
-                        .acknowledge_message(&message_ids, ack_type)
+                        .acknowledge_message(&acked_for_storage, ack_type)
                         .await?;
                 }
             }

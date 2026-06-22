@@ -414,6 +414,59 @@ impl Subscription {
         }
     }
 
+    pub async fn unsubscribe_consumer(&mut self, consumer_id: u64) -> Result<(), String> {
+        self.remove_consumer_with_recovery(consumer_id).await;
+
+        if self.is_persistent() {
+            let mut guard = self.storage.lock().await;
+            guard
+                .delete_cursor(&self.topic, &self.name)
+                .map_err(|e| e.to_string())?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn seek_to_message_id(&mut self, message_id: &MessageId) -> Result<(), String> {
+        if !self.is_persistent() {
+            return Err("seek is not supported for non-persistent subscriptions".to_string());
+        }
+
+        let shared_cursor = matches!(
+            self.sub_type,
+            SubscriptionType::Shared | SubscriptionType::KeyShared
+        );
+        let first_unacked = {
+            let mut guard = self.storage.lock().await;
+            guard
+                .seek_cursor(&self.topic, &self.name, message_id, shared_cursor)
+                .map_err(|e| e.to_string())?;
+            guard
+                .first_unacked_position(&self.topic, &self.name)
+                .map_err(|e| e.to_string())?
+        };
+
+        if let Some(dispatcher) = self.dispatcher.as_ref() {
+            dispatcher.init_read_position(first_unacked);
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_last_message_id(&self) -> Result<Option<MessageId>, String> {
+        if !self.is_persistent() {
+            return Err(
+                "getLastMessageId is unsupported for non-persistent subscriptions".to_string(),
+            );
+        }
+
+        let guard = self.storage.lock().await;
+        guard
+            .get_last_position(&self.topic)
+            .map(|position| position.map(MessageId::from))
+            .map_err(|e| e.to_string())
+    }
+
     /// Persist cursor updates and notify the dispatcher after a message was acked.
     ///
     /// The caller (`Consumer::message_acked`) must handle Shared ownership resolution

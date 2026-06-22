@@ -78,6 +78,28 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         }
     }
 
+    fn delete_cursor(&mut self, topic: &str, subscription: &str) -> Result<()> {
+        match self {
+            Self::Memory(inner) => inner.delete_cursor(topic, subscription),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(inner) => inner.delete_cursor(topic, subscription),
+        }
+    }
+
+    fn seek_cursor(
+        &mut self,
+        topic: &str,
+        subscription: &str,
+        message_id: &MessageId,
+        shared: bool,
+    ) -> Result<()> {
+        match self {
+            Self::Memory(inner) => inner.seek_cursor(topic, subscription, message_id, shared),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(inner) => inner.seek_cursor(topic, subscription, message_id, shared),
+        }
+    }
+
     fn first_unacked_position(
         &self,
         topic: &str,

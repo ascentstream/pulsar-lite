@@ -19,6 +19,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 
+const PULSAR_EARLIEST_MESSAGE_ID: u64 = u64::MAX;
+const PULSAR_LATEST_MESSAGE_ID: u64 = i64::MAX as u64;
+
 /// Handle Subscribe command (Apache Pulsar style)
 pub async fn handle_subscribe<T>(
     framed: &mut Framed<T, PulsarFrameCodec>,
@@ -81,14 +84,26 @@ where
                 .collect(),
             allow_out_of_order_delivery: meta.allow_out_of_order_delivery.unwrap_or(false),
         });
-    let initial_position = match subscribe_cmd.initial_position.unwrap_or(0) {
+    let mut initial_position = match subscribe_cmd.initial_position.unwrap_or(0) {
         1 => InitialPosition::Earliest,
         _ => InitialPosition::Latest,
     };
-    let start_message_id = subscribe_cmd.start_message_id.as_ref().map(|id| MessageId {
-        ledger: id.ledger_id,
-        entry: id.entry_id,
-        partition: id.partition.unwrap_or(-1),
+    let start_message_id = subscribe_cmd.start_message_id.as_ref().and_then(|id| {
+        if id.ledger_id == PULSAR_EARLIEST_MESSAGE_ID && id.entry_id == PULSAR_EARLIEST_MESSAGE_ID {
+            initial_position = InitialPosition::Earliest;
+            None
+        } else if id.ledger_id == PULSAR_LATEST_MESSAGE_ID
+            && id.entry_id == PULSAR_LATEST_MESSAGE_ID
+        {
+            initial_position = InitialPosition::Latest;
+            None
+        } else {
+            Some(MessageId {
+                ledger: id.ledger_id,
+                entry: id.entry_id,
+                partition: id.partition.unwrap_or(-1),
+            })
+        }
     });
     let cursor_options = CursorInitOptions {
         initial_position,
@@ -310,6 +325,196 @@ pub async fn handle_redeliver_unacknowledged_messages(
         .redeliver_unacknowledged_messages(redeliver_cmd.consumer_id, message_ids)
         .await
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    Ok(())
+}
+
+/// Handle Unsubscribe command.
+///
+/// Native Pulsar treats unsubscribe as deleting the subscription cursor, unlike
+/// CloseConsumer which only detaches the current consumer.
+pub async fn handle_unsubscribe<T>(
+    framed: &mut Framed<T, PulsarFrameCodec>,
+    cmd: BaseCommand,
+    consumers: &mut HashMap<u64, Arc<Consumer>>,
+    broker_service: SharedBrokerService,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let unsubscribe_cmd = cmd
+        .unsubscribe
+        .as_ref()
+        .ok_or("Missing unsubscribe command")?;
+    log::info!(
+        "Handling Unsubscribe command: consumer_id={}, request_id={}",
+        unsubscribe_cmd.consumer_id,
+        unsubscribe_cmd.request_id
+    );
+
+    if let Some(consumer) = consumers.remove(&unsubscribe_cmd.consumer_id) {
+        let (topic_name, subscription_name) = {
+            let sub_guard = consumer.subscription.read().await;
+            (sub_guard.topic.clone(), sub_guard.name.clone())
+        };
+
+        {
+            let mut sub_guard = consumer.subscription.write().await;
+            sub_guard
+                .unsubscribe_consumer(consumer.consumer_id)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        }
+
+        let topic = {
+            let broker = broker_service.read().await;
+            broker.get_topic(&topic_name)
+        };
+        if let Some(topic) = topic {
+            topic.write().await.remove_subscription(&subscription_name);
+        }
+
+        log::info!(
+            "Unsubscribed consumer {} from subscription '{}' on topic '{}'",
+            consumer.consumer_id,
+            subscription_name,
+            topic_name
+        );
+    } else {
+        log::warn!(
+            "Attempted to unsubscribe unknown consumer {}",
+            unsubscribe_cmd.consumer_id
+        );
+    }
+
+    let response = ServerCommand::Success {
+        request_id: unsubscribe_cmd.request_id,
+    };
+    framed.send(response).await?;
+    log::info!(
+        "Sent Success response for Unsubscribe request {}",
+        unsubscribe_cmd.request_id
+    );
+
+    Ok(())
+}
+
+pub async fn handle_seek<T>(
+    framed: &mut Framed<T, PulsarFrameCodec>,
+    cmd: BaseCommand,
+    consumers: &HashMap<u64, Arc<Consumer>>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let seek_cmd = cmd.seek.as_ref().ok_or("Missing seek command")?;
+    log::info!(
+        "Handling Seek command: consumer_id={}, request_id={}",
+        seek_cmd.consumer_id,
+        seek_cmd.request_id
+    );
+
+    let Some(message_id) = seek_cmd.message_id.as_ref().map(|id| MessageId {
+        ledger: id.ledger_id,
+        entry: id.entry_id,
+        partition: id.partition.unwrap_or(-1),
+    }) else {
+        let response = ServerCommand::Error {
+            request_id: seek_cmd.request_id,
+            error: "seek by publish time is not implemented".to_string(),
+        };
+        framed.send(response).await?;
+        return Ok(());
+    };
+
+    let Some(consumer) = consumers.get(&seek_cmd.consumer_id) else {
+        let response = ServerCommand::Error {
+            request_id: seek_cmd.request_id,
+            error: format!("Unknown consumer ID: {}", seek_cmd.consumer_id),
+        };
+        framed.send(response).await?;
+        return Ok(());
+    };
+
+    let subscription = consumer.get_subscription();
+    subscription
+        .write()
+        .await
+        .seek_to_message_id(&message_id)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let cleared = consumer.drain_pending_acks().await.len();
+    if cleared > 0 {
+        log::debug!(
+            "Cleared {} pending acks for consumer {} after seek",
+            cleared,
+            seek_cmd.consumer_id
+        );
+    }
+
+    let response = ServerCommand::Success {
+        request_id: seek_cmd.request_id,
+    };
+    framed.send(response).await?;
+    log::info!(
+        "Sent Success response for Seek request {}",
+        seek_cmd.request_id
+    );
+
+    Ok(())
+}
+
+pub async fn handle_get_last_message_id<T>(
+    framed: &mut Framed<T, PulsarFrameCodec>,
+    cmd: BaseCommand,
+    consumers: &HashMap<u64, Arc<Consumer>>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let get_last_cmd = cmd
+        .get_last_message_id
+        .as_ref()
+        .ok_or("Missing getLastMessageId command")?;
+    log::info!(
+        "Handling GetLastMessageId command: consumer_id={}, request_id={}",
+        get_last_cmd.consumer_id,
+        get_last_cmd.request_id
+    );
+
+    let Some(consumer) = consumers.get(&get_last_cmd.consumer_id) else {
+        let response = ServerCommand::Error {
+            request_id: get_last_cmd.request_id,
+            error: format!("Unknown consumer ID: {}", get_last_cmd.consumer_id),
+        };
+        framed.send(response).await?;
+        return Ok(());
+    };
+
+    let subscription = consumer.get_subscription();
+    let last_message_id = subscription
+        .read()
+        .await
+        .get_last_message_id()
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    let Some(last_message_id) = last_message_id else {
+        let response = ServerCommand::Error {
+            request_id: get_last_cmd.request_id,
+            error: "Topic has no messages".to_string(),
+        };
+        framed.send(response).await?;
+        return Ok(());
+    };
+
+    let response = ServerCommand::LastMessageIdResponse {
+        request_id: get_last_cmd.request_id,
+        ledger_id: last_message_id.ledger,
+        entry_id: last_message_id.entry,
+        partition: last_message_id.partition,
+    };
+    framed.send(response).await?;
 
     Ok(())
 }

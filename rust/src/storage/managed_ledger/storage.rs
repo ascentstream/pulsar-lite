@@ -29,6 +29,22 @@ pub trait ManagedLedgerStorage: Send + Sync {
         anyhow::bail!("initialize_or_open_cursor is not implemented for this managed-ledger store")
     }
 
+    fn delete_cursor(&mut self, topic: &str, subscription: &str) -> Result<()> {
+        let _ = (topic, subscription);
+        anyhow::bail!("delete_cursor is not implemented for this managed-ledger store")
+    }
+
+    fn seek_cursor(
+        &mut self,
+        topic: &str,
+        subscription: &str,
+        message_id: &MessageId,
+        shared: bool,
+    ) -> Result<()> {
+        let _ = (topic, subscription, message_id, shared);
+        anyhow::bail!("seek_cursor is not implemented for this managed-ledger store")
+    }
+
     fn first_unacked_position(
         &self,
         topic: &str,

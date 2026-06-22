@@ -146,6 +146,21 @@ impl Storage {
             .initialize_or_open_cursor(topic, subscription, options)
     }
 
+    pub fn delete_cursor(&mut self, topic: &str, subscription: &str) -> Result<()> {
+        self.managed_ledger.delete_cursor(topic, subscription)
+    }
+
+    pub fn seek_cursor(
+        &mut self,
+        topic: &str,
+        subscription: &str,
+        message_id: &MessageId,
+        shared: bool,
+    ) -> Result<()> {
+        self.managed_ledger
+            .seek_cursor(topic, subscription, message_id, shared)
+    }
+
     pub fn first_unacked_position(
         &self,
         topic: &str,

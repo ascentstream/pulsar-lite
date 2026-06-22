@@ -4,15 +4,15 @@
  */
 
 use super::read_position::{commit_read_position, next_unacked_candidate, ReadCandidate};
+use super::redelivery_controller::{RedeliveryController, RedeliveryEntry};
+use super::sticky_key::sticky_key_hash_from_metadata;
 use crate::broker::dispatcher::Dispatcher;
 use crate::broker::service::topic::{
     KeySharedHashRange, KeySharedMode, KeySharedPolicy, SubscriptionType,
 };
 use crate::broker::service::{Consumer, SharedStorage};
-use crate::protocol::codec::proto::pulsar::MessageMetadata;
 use crate::storage::{ManagedLedgerPosition, MessageId};
-use prost::Message;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -25,23 +25,25 @@ pub struct KeySharedDispatcher {
     key_shared_policy: KeySharedPolicy,
     total_available_permits: AtomicU32,
     read_position: RwLock<Option<ManagedLedgerPosition>>,
-    messages_to_redeliver: RwLock<BTreeMap<MessageId, u32>>,
+    redelivery_controller: RwLock<RedeliveryController>,
 }
 
 impl KeySharedDispatcher {
     pub fn new(key_shared_policy: Option<KeySharedPolicy>) -> Self {
+        let key_shared_policy = key_shared_policy.unwrap_or(KeySharedPolicy {
+            mode: KeySharedMode::AutoSplit,
+            ranges: Vec::new(),
+            allow_out_of_order_delivery: false,
+        });
+        let block_hashes = !key_shared_policy.allow_out_of_order_delivery;
         Self {
             consumers_by_id: HashMap::new(),
             auto_split_assignments: Vec::new(),
             sticky_assignments: Vec::new(),
-            key_shared_policy: key_shared_policy.unwrap_or(KeySharedPolicy {
-                mode: KeySharedMode::AutoSplit,
-                ranges: Vec::new(),
-                allow_out_of_order_delivery: false,
-            }),
+            key_shared_policy,
             total_available_permits: AtomicU32::new(0),
             read_position: RwLock::new(None),
-            messages_to_redeliver: RwLock::new(BTreeMap::new()),
+            redelivery_controller: RwLock::new(RedeliveryController::new(block_hashes)),
         }
     }
 
@@ -111,84 +113,7 @@ impl KeySharedDispatcher {
         self.rebuild_sticky_assignments();
     }
 
-    fn resolve_sticky_key(metadata: &[u8]) -> Vec<u8> {
-        let Ok(metadata) = MessageMetadata::decode(metadata) else {
-            return Vec::new();
-        };
-
-        if let Some(ordering_key) = metadata.ordering_key {
-            return ordering_key;
-        }
-        if let Some(partition_key) = metadata.partition_key {
-            return partition_key.into_bytes();
-        }
-        if !metadata.producer_name.is_empty() {
-            return format!("{}-{}", metadata.producer_name, metadata.sequence_id).into_bytes();
-        }
-
-        Vec::new()
-    }
-
-    fn murmur3_32(bytes: &[u8], seed: u32) -> u32 {
-        const C1: u32 = 0xcc9e2d51;
-        const C2: u32 = 0x1b873593;
-
-        let mut hash = seed;
-        let mut chunks = bytes.chunks_exact(4);
-
-        for chunk in &mut chunks {
-            let mut k = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            k = k.wrapping_mul(C1);
-            k = k.rotate_left(15);
-            k = k.wrapping_mul(C2);
-
-            hash ^= k;
-            hash = hash.rotate_left(13);
-            hash = hash.wrapping_mul(5).wrapping_add(0xe6546b64);
-        }
-
-        let tail = chunks.remainder();
-        let mut k1 = 0u32;
-        match tail.len() {
-            3 => {
-                k1 ^= (tail[2] as u32) << 16;
-                k1 ^= (tail[1] as u32) << 8;
-                k1 ^= tail[0] as u32;
-            }
-            2 => {
-                k1 ^= (tail[1] as u32) << 8;
-                k1 ^= tail[0] as u32;
-            }
-            1 => {
-                k1 ^= tail[0] as u32;
-            }
-            _ => {}
-        }
-        if !tail.is_empty() {
-            k1 = k1.wrapping_mul(C1);
-            k1 = k1.rotate_left(15);
-            k1 = k1.wrapping_mul(C2);
-            hash ^= k1;
-        }
-
-        hash ^= bytes.len() as u32;
-        hash ^= hash >> 16;
-        hash = hash.wrapping_mul(0x85ebca6b);
-        hash ^= hash >> 13;
-        hash = hash.wrapping_mul(0xc2b2ae35);
-        hash ^= hash >> 16;
-        hash
-    }
-
-    fn sticky_key_hash(sticky_key: &[u8]) -> i32 {
-        const RANGE_SIZE: u32 = 2 << 15;
-        (Self::murmur3_32(sticky_key, 0) % RANGE_SIZE) as i32
-    }
-
-    fn select_consumer(&self, metadata: &[u8]) -> Option<Arc<Consumer>> {
-        let sticky_key = Self::resolve_sticky_key(metadata);
-        let sticky_key_hash = Self::sticky_key_hash(&sticky_key);
-
+    fn select_consumer_for_hash(&self, sticky_key_hash: i32) -> Option<Arc<Consumer>> {
         for (range, consumer) in self.active_assignments() {
             if sticky_key_hash >= range.start
                 && sticky_key_hash <= range.end
@@ -203,21 +128,83 @@ impl KeySharedDispatcher {
     }
 
     pub fn add_to_redelivery_queue(&self, entries: Vec<(MessageId, u32)>) {
-        let mut redeliver = self.messages_to_redeliver.write().unwrap();
-        for (message_id, redelivery_count) in entries {
-            redeliver
-                .entry(message_id)
-                .and_modify(|count| *count = (*count).max(redelivery_count))
-                .or_insert(redelivery_count);
+        let entries = entries
+            .into_iter()
+            .map(|(message_id, redelivery_count)| RedeliveryEntry {
+                message_id,
+                redelivery_count,
+                sticky_key_hash: None,
+            })
+            .collect();
+        self.add_redelivery_entries(entries);
+    }
+
+    pub fn add_redelivery_entries(&self, entries: Vec<RedeliveryEntry>) {
+        let mut controller = self.redelivery_controller.write().unwrap();
+        for entry in entries {
+            controller.add(entry);
         }
     }
 
-    fn pop_redelivery_message(&self) -> Option<(MessageId, u32)> {
-        self.messages_to_redeliver.write().unwrap().pop_first()
+    fn pop_dispatchable_redelivery_message(
+        &self,
+        storage: &crate::storage::Storage,
+        topic: &str,
+        subscription: &str,
+    ) -> Result<
+        Option<(
+            RedeliveryEntry,
+            crate::storage::StoredMessage,
+            Arc<Consumer>,
+        )>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let queued = self.redelivery_controller.read().unwrap().queued_entries();
+        for queued_entry in queued {
+            if storage.is_acknowledged(topic, subscription, &queued_entry.message_id)? {
+                self.redelivery_controller
+                    .write()
+                    .unwrap()
+                    .remove(&queued_entry.message_id);
+                continue;
+            }
+            let Some(stored) = storage.get_message_entry_by_id(topic, &queued_entry.message_id)
+            else {
+                self.redelivery_controller
+                    .write()
+                    .unwrap()
+                    .remove(&queued_entry.message_id);
+                continue;
+            };
+            let sticky_key_hash = queued_entry
+                .sticky_key_hash
+                .unwrap_or_else(|| sticky_key_hash_from_metadata(&stored.metadata));
+            if self
+                .redelivery_controller
+                .read()
+                .unwrap()
+                .has_in_flight_hash(sticky_key_hash)
+            {
+                continue;
+            }
+            let Some(consumer) = self.select_consumer_for_hash(sticky_key_hash) else {
+                continue;
+            };
+            let Some(entry) = self
+                .redelivery_controller
+                .write()
+                .unwrap()
+                .take_for_delivery_with_hash(&queued_entry.message_id, Some(sticky_key_hash))
+            else {
+                continue;
+            };
+            return Ok(Some((entry, stored, consumer)));
+        }
+        Ok(None)
     }
 
-    fn restore_redelivery_message(&self, message_id: MessageId, redelivery_count: u32) {
-        self.add_to_redelivery_queue(vec![(message_id, redelivery_count)]);
+    fn restore_redelivery_message(&self, entry: RedeliveryEntry) {
+        self.redelivery_controller.write().unwrap().restore(entry);
     }
 
     async fn is_message_pending(&self, message_id: &MessageId) -> bool {
@@ -253,7 +240,7 @@ impl KeySharedDispatcher {
     }
 
     pub fn on_message_acknowledged(&self, message_id: &MessageId) {
-        self.messages_to_redeliver
+        self.redelivery_controller
             .write()
             .unwrap()
             .remove(message_id);
@@ -266,8 +253,8 @@ impl KeySharedDispatcher {
         subscription: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let queued_message_ids = {
-            let redeliver = self.messages_to_redeliver.read().unwrap();
-            redeliver.keys().cloned().collect::<Vec<_>>()
+            let controller = self.redelivery_controller.read().unwrap();
+            controller.queued_message_ids()
         };
 
         let (acked_redeliveries, first_unacked) = {
@@ -283,9 +270,9 @@ impl KeySharedDispatcher {
         };
 
         if !acked_redeliveries.is_empty() {
-            let mut redeliver = self.messages_to_redeliver.write().unwrap();
+            let mut controller = self.redelivery_controller.write().unwrap();
             for message_id in acked_redeliveries {
-                redeliver.remove(&message_id);
+                controller.remove(&message_id);
             }
         }
 
@@ -317,9 +304,13 @@ impl KeySharedDispatcher {
             let pending = consumer.drain_pending_acks().await;
             let mut recovered = Vec::with_capacity(pending.len());
             for (message_id, pending_ack) in pending {
-                recovered.push((message_id, pending_ack.redelivery_count));
+                recovered.push(RedeliveryEntry {
+                    message_id,
+                    redelivery_count: pending_ack.redelivery_count + 1,
+                    sticky_key_hash: pending_ack.sticky_key_hash,
+                });
             }
-            self.add_to_redelivery_queue(recovered);
+            self.add_redelivery_entries(recovered);
         }
         self.rebuild_assignments();
         consumer
@@ -390,35 +381,34 @@ impl Dispatcher for KeySharedDispatcher {
             return Ok(());
         }
 
-        for _ in 0..max_batch {
-            if let Some((message_id, redelivery_count)) = self.pop_redelivery_message() {
-                let entry = {
-                    let guard = storage.lock().await;
-                    if guard.is_acknowledged(&topic, &subscription, &message_id)? {
-                        continue;
-                    }
-                    guard.get_message_entry_by_id(&topic, &message_id)
-                };
+        let mut remaining_dispatches = max_batch;
+        while remaining_dispatches > 0 {
+            let redelivery = {
+                let guard = storage.lock().await;
+                self.pop_dispatchable_redelivery_message(&guard, &topic, &subscription)?
+            };
 
-                let Some(entry) = entry else {
-                    continue;
-                };
-                let Some(consumer) = self.select_consumer(&entry.metadata) else {
-                    self.restore_redelivery_message(entry.message_id, redelivery_count);
-                    break;
-                };
+            if let Some((redelivery, entry, consumer)) = redelivery {
+                let sticky_key_hash = redelivery
+                    .sticky_key_hash
+                    .unwrap_or_else(|| sticky_key_hash_from_metadata(&entry.metadata));
                 if !consumer.use_permit().await {
-                    self.restore_redelivery_message(entry.message_id, redelivery_count);
+                    self.restore_redelivery_message(RedeliveryEntry {
+                        sticky_key_hash: Some(sticky_key_hash),
+                        ..redelivery
+                    });
                     break;
                 }
+                remaining_dispatches -= 1;
                 self.subtract_total_permits(1);
 
                 if consumer
-                    .send_message(
+                    .send_message_with_sticky_hash(
                         entry.message_id.clone(),
                         entry.metadata,
                         entry.payload.clone(),
-                        redelivery_count + 1,
+                        redelivery.redelivery_count,
+                        Some(sticky_key_hash),
                     )
                     .await
                 {
@@ -426,7 +416,11 @@ impl Dispatcher for KeySharedDispatcher {
                         .record_message_dispatched(entry.payload.len())
                         .await;
                 } else {
-                    self.restore_redelivery_message(entry.message_id, redelivery_count + 1);
+                    self.restore_redelivery_message(RedeliveryEntry {
+                        message_id: entry.message_id,
+                        redelivery_count: redelivery.redelivery_count + 1,
+                        sticky_key_hash: Some(sticky_key_hash),
+                    });
                     consumer.add_permits(1).await;
                     self.total_available_permits.fetch_add(1, Ordering::Relaxed);
                     break;
@@ -440,21 +434,40 @@ impl Dispatcher for KeySharedDispatcher {
             else {
                 break;
             };
+            
+            let sticky_key_hash = sticky_key_hash_from_metadata(&candidate.metadata);
+            log::debug!("NORMAL SEND {:?} hash={} blocked={}", candidate.message_id, sticky_key_hash, self.redelivery_controller.read().unwrap().is_hash_blocked(sticky_key_hash));
+            if self
+                .redelivery_controller
+                .read()
+                .unwrap()
+                .is_hash_blocked(sticky_key_hash)
+            {
+                self.add_redelivery_entries(vec![RedeliveryEntry {
+                    message_id: candidate.message_id,
+                    redelivery_count: 0,
+                    sticky_key_hash: Some(sticky_key_hash),
+                }]);
+                commit_read_position(&self.read_position, candidate.next_position);
+                continue;
+            }
 
-            let Some(consumer) = self.select_consumer(&candidate.metadata) else {
+            let Some(consumer) = self.select_consumer_for_hash(sticky_key_hash) else {
                 break;
             };
             if !consumer.use_permit().await {
                 break;
             }
+            remaining_dispatches -= 1;
             self.subtract_total_permits(1);
 
             if consumer
-                .send_message(
+                .send_message_with_sticky_hash(
                     candidate.message_id.clone(),
                     candidate.metadata,
                     candidate.payload.clone(),
                     0,
+                    Some(sticky_key_hash),
                 )
                 .await
             {
@@ -463,7 +476,11 @@ impl Dispatcher for KeySharedDispatcher {
                     .record_message_dispatched(candidate.payload.len())
                     .await;
             } else {
-                self.restore_redelivery_message(candidate.message_id, 0);
+                self.restore_redelivery_message(RedeliveryEntry {
+                    message_id: candidate.message_id,
+                    redelivery_count: 1,
+                    sticky_key_hash: Some(sticky_key_hash),
+                });
                 commit_read_position(&self.read_position, candidate.next_position);
                 consumer.add_permits(1).await;
                 self.total_available_permits.fetch_add(1, Ordering::Relaxed);
@@ -479,11 +496,15 @@ impl Dispatcher for KeySharedDispatcher {
 mod tests {
     use super::*;
     use crate::broker::service::topic::{Subscription, SubscriptionRuntimeMode};
-    use crate::broker::service::ConnectionWriteState;
-    use crate::storage::Storage;
+    use crate::broker::service::{ConnectionWriteState, PendingMessage};
+    use crate::protocol::codec::proto::pulsar::MessageMetadata;
+    use crate::storage::{CursorInitOptions, InitialPosition, Storage};
     use bytes::Bytes;
+    use prost::Message;
     use std::path::Path;
+    use std::time::Duration;
     use tokio::sync::{mpsc, Mutex, RwLock};
+    use tokio::time::timeout;
 
     fn create_test_storage() -> SharedStorage {
         Arc::new(Mutex::new(
@@ -492,6 +513,12 @@ mod tests {
     }
 
     fn create_consumer(consumer_id: u64) -> Arc<Consumer> {
+        create_consumer_with_receiver(consumer_id).0
+    }
+
+    fn create_consumer_with_receiver(
+        consumer_id: u64,
+    ) -> (Arc<Consumer>, mpsc::Receiver<(u64, PendingMessage)>) {
         let subscription = Arc::new(RwLock::new(Subscription::new_with_options(
             "sub".to_string(),
             "persistent://public/default/key-shared".to_string(),
@@ -501,17 +528,20 @@ mod tests {
             None,
             create_test_storage(),
         )));
-        let (tx, _rx) = mpsc::channel(16);
-        Arc::new(Consumer::new_with_options(
-            consumer_id,
-            format!("consumer-{consumer_id}"),
-            subscription,
-            "conn".to_string(),
-            tx,
-            Arc::new(ConnectionWriteState::new(64 * 1024, 32 * 1024)),
-            0,
-            None,
-        ))
+        let (tx, rx) = mpsc::channel(16);
+        (
+            Arc::new(Consumer::new_with_options(
+                consumer_id,
+                format!("consumer-{consumer_id}"),
+                subscription,
+                "conn".to_string(),
+                tx,
+                Arc::new(ConnectionWriteState::new(64 * 1024, 32 * 1024)),
+                0,
+                None,
+            )),
+            rx,
+        )
     }
 
     fn metadata_with_ordering_key(key: &str) -> Bytes {
@@ -553,11 +583,117 @@ mod tests {
 
         assert_eq!(removed.consumer_id, 1);
         assert!(!owner.has_pending_ack(&message_id).await);
-        assert_eq!(dispatcher.pop_redelivery_message(), Some((message_id, 0)));
+        let queued = dispatcher
+            .redelivery_controller
+            .read()
+            .unwrap()
+            .queued_entries();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].message_id, message_id);
+        assert_eq!(queued[0].redelivery_count, 1);
 
         let selected = dispatcher
-            .select_consumer(&metadata_with_ordering_key("stable-key"))
+            .select_consumer_for_hash(sticky_key_hash_from_metadata(&metadata_with_ordering_key(
+                "stable-key",
+            )))
             .expect("survivor should own key after rebuild");
         assert_eq!(selected.consumer_id, survivor.consumer_id);
+    }
+
+    #[tokio::test]
+    async fn redelivery_in_flight_blocks_same_hash_and_allows_different_hash() {
+        let topic = "persistent://public/default/key-shared-blocking";
+        let subscription = "sub";
+        let storage = create_test_storage();
+        let same_key_metadata = metadata_with_ordering_key("same-key");
+        let other_key_metadata = metadata_with_ordering_key("other-key");
+
+        let (redelivery_id, same_hash_id, other_hash_id) = {
+            let mut guard = storage.lock().await;
+            guard.create_topic(topic).unwrap();
+            guard
+                .initialize_or_open_cursor(
+                    topic,
+                    subscription,
+                    CursorInitOptions {
+                        initial_position: InitialPosition::Earliest,
+                        start_message_id: None,
+                    },
+                )
+                .unwrap();
+            let redelivery_id = guard
+                .append_message_with_metadata(topic, -1, &same_key_metadata, b"redelivery")
+                .unwrap();
+            let same_hash_id = guard
+                .append_message_with_metadata(topic, -1, &same_key_metadata, b"same")
+                .unwrap();
+            let other_hash_id = guard
+                .append_message_with_metadata(topic, -1, &other_key_metadata, b"other")
+                .unwrap();
+            (redelivery_id, same_hash_id, other_hash_id)
+        };
+
+        let mut dispatcher = KeySharedDispatcher::new(None);
+        let (consumer, mut rx) = create_consumer_with_receiver(1);
+        dispatcher.add_consumer(consumer.clone()).unwrap();
+        consumer.add_permits(4).await;
+        dispatcher.consumer_flow(1, 4);
+        dispatcher.init_read_position(Some(ManagedLedgerPosition::from(&same_hash_id)));
+        dispatcher.add_redelivery_entries(vec![RedeliveryEntry {
+            message_id: redelivery_id.clone(),
+            redelivery_count: 1,
+            sticky_key_hash: None,
+        }]);
+
+        dispatcher
+            .dispatch_messages(storage.clone(), topic.to_string(), subscription.to_string())
+            .await
+            .unwrap();
+
+        let first = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first.1.message_id, redelivery_id);
+        assert_eq!(first.1.redelivery_count, 1);
+        assert_eq!(second.1.message_id, other_hash_id);
+        assert_eq!(second.1.redelivery_count, 0);
+        assert!(timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .is_err());
+
+        let same_hash = sticky_key_hash_from_metadata(&same_key_metadata);
+        let queued = dispatcher
+            .redelivery_controller
+            .read()
+            .unwrap()
+            .queued_entries();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].message_id, same_hash_id);
+        assert_eq!(queued[0].redelivery_count, 0);
+        assert_eq!(queued[0].sticky_key_hash, Some(same_hash));
+        assert!(dispatcher
+            .redelivery_controller
+            .read()
+            .unwrap()
+            .is_hash_blocked(same_hash));
+
+        dispatcher.on_message_acknowledged(&redelivery_id);
+        dispatcher
+            .dispatch_messages(storage, topic.to_string(), subscription.to_string())
+            .await
+            .unwrap();
+
+        let replayed_same_hash = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed_same_hash.1.message_id, same_hash_id);
+        assert_eq!(replayed_same_hash.1.redelivery_count, 0);
     }
 }

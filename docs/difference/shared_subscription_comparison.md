@@ -1,6 +1,6 @@
 # Pulsar Lite Shared 消费模式 vs 原生 Pulsar 全面对比分析
 
-> 分析日期: 2026-03-10（2026-06 更新：persistent Shared 读路径与 redelivery 已对齐 Phase 0–4）
+> 分析日期: 2026-03-10（2026-06 更新：persistent Shared / KeyShared 读路径与 redelivery controller 已对齐 Phase 0–5）
 > 对比版本: Pulsar Lite (当前实现) vs Apache Pulsar (官方实现)
 
 ---
@@ -14,7 +14,7 @@
 | **Dispatcher** | `SharedDispatcher` | `PersistentDispatcherMultipleConsumers` |
 | **消费者选择** | `get_next_available_consumer()` | `getNextConsumer()` (AbstractDispatcherMultipleConsumers) |
 | **消息分配器** | 无（直接在 storage 中跟踪） | `SharedConsumerAssignor` |
-| **重投递控制** | `BTreeMap` 简化队列（persistent） | `MessageRedeliveryController` |
+| **重投递控制** | `RedeliveryController`（persistent Shared / KeyShared） | `MessageRedeliveryController` |
 | **游标管理** | ManagedCursor（RocksDB / memory） | ManagedCursor + BookKeeper |
 | **连接管理** | 可治理版状态机 + keep-alive + 连接限流 | 完整的连接生命周期管理 |
 | **事务支持** | 无 | 完整事务支持 |
@@ -149,7 +149,7 @@ public Consumer getNextConsumer() {
 ```
 Flow 命令 → consumer_flow() → dispatch_messages_batch()
                                     ↓
-                         优先 pop messages_to_redeliver
+                         优先 pop RedeliveryController
                                     ↓
                          next_unacked_candidate(read_position)
                                     ↓
@@ -197,7 +197,7 @@ Flow 命令 → consumerFlow() → totalAvailablePermits += N
 | 特性 | Pulsar Lite | 原生 Pulsar |
 |------|-------------|-------------|
 | **读取模式** | 同步从内存读取 | 异步从 BookKeeper 读取 |
-| **Replay 机制** | ✅ persistent 简化版（BTreeMap + redelivery-first） | ✅ MessageRedeliveryController |
+| **Replay 机制** | ✅ persistent `RedeliveryController` + redelivery-first | ✅ MessageRedeliveryController |
 | **延迟消息** | ❌ 无 | ✅ DelayedDeliveryTracker |
 | **大消息分块** | ❌ 无 | ✅ SharedConsumerAssignor UUID 跟踪 |
 | **批量计算** | 固定 20 条 | 动态计算 |
@@ -338,16 +338,18 @@ consumer.getPendingAcks().forEachAndClose((ledgerId, entryId, batchSize, stickyK
 
 当前行为：
 - ✅ **Consumer 断开自动重投递** - 移除 Consumer 时会 drain `pending_acks`，释放 assignment，并放入 replay 队列
-- ✅ **优先 replay 再分发新消息** - dispatcher 先消费 `messages_to_redeliver`，再取新消息
+- ✅ **优先 replay 再分发新消息** - dispatcher 先消费 `RedeliveryController`，再取新消息
 - ✅ **发送失败自动回队** - 分发失败的消息会重新加入 redelivery queue
 - ✅ **已 ack 消息跳过 replay** - replay 前会检查 storage 中是否已确认，避免重复恢复
 - ✅ **close/recovery 与 ack 已对齐到更安全的 Shared 时序** - Consumer remove 前先关闭 pending ack 跟踪入口，再 drain 并回收真正仍未确认的消息
+- ✅ **KeyShared hash 阻塞** - ordered KeyShared redelivery 会用 sticky hash 阻塞同 hash 新消息，直到 in-flight redelivery ack；其他 hash 可继续投递
+- ✅ **持久化 metadata hash 路径** - redelivery 入队缺少 sticky hash 时，会从 storage 中的 `MessageMetadata` 恢复 ordering_key / partition_key 并计算 hash
 
 **与原生 Pulsar 的剩余差异**：
-- ⚠️ **重投递控制器仍是简化版** - 当前主要是 `BTreeMap<MessageId, redelivery_count>`，还不是官方 `MessageRedeliveryController`
-- ⚠️ **KeyShared hash 阻塞/有序重投递** - KeyShared persistent 已有 sticky 路由，但 `allow_out_of_order_delivery=false` 时尚无原生 `hashesToBeBlocked` 语义
+- ⚠️ **重投递控制器仍是轻量版** - 已有 message order、redelivery count、sticky hash refcount 与 in-flight block，但还没有官方 controller 的完整 bitmap/backoff/dispatcher wake-up 体系
+- ✅ **KeyShared hash 阻塞/有序重投递** - `allow_out_of_order_delivery=false` 时已具备 `hashesToBeBlocked` 等价语义
 - ✅ **Persistent 显式 redeliver** - `CommandRedeliverUnacknowledgedMessages` 已注册；nack / ack_timeout 由官方 Python client 发 Redeliver 触发（`tests/persist/test_persistent_redelivery.py`）
-- ⚠️ **Non-persistent Shared** - 仍不支持客户端 redeliver / nack 驱动重投（见 `tests/non_persist/`）
+- ✅ **Non-persistent redelivery 边界** - 与原生 live-only 语义一致，Shared / KeyShared 客户端 redeliver、nack、ack timeout 不触发 broker replay（见 `tests/non_persist/`）
 
 **本次修复前后的行为差异**：
 - 修复前：Shared ack 在 owner 查找失败时会直接跳过 storage ack；随后 consumer close 会把同一条消息当作 pending ack 放回 redelivery queue
@@ -474,7 +476,7 @@ pub struct ServerCnx<T> {
 **当前缺口**：
 - ⚠️ **无 consumer 级活动跟踪** - 仍没有更细粒度的 consumer liveness
 - ✅ **Persistent Shared ack timeout / negative ack** - 由客户端发 `RedeliverUnacknowledgedMessages`，broker handler 入队 redelivery（非 broker 定时器）
-- ⚠️ **Non-persistent** - 连接存活时的 nack/timeout 仍不触发 redelivery
+- ✅ **Non-persistent** - 连接存活时的 nack/timeout 不触发 redelivery，保持 non-persistent live-only 语义
 - ⚠️ **无连接可写性驱动的节流/暂停读取** - 尚未对齐官方的 channel writability / auto-read 协调
 - ⚠️ **显式 liveness check 仍偏内部化** - 已能发起一次性探测，但还没有官方那样更完整的异步结果语义与上层复用
 - ⚠️ **连接关闭生命周期仍较简化** - 已能统一 cleanup，但还没有官方那么完整的统计、回调、任务取消与上下文回收
@@ -692,7 +694,7 @@ public class MessageImpl {
 | **压缩支持** | ⚠️ 协议层基础透传（不解压、不持久化） | ✅ LZ4/Zlib/Zstd |
 
 **当前仍与原生存在的差异**：
-- `pulsar-lite` 这轮保留的是协议层/下发层接口，没有把 `MessageMetadata` 贯通到 storage 与 replay 路径
+- `pulsar-lite` 已将 persistent `MessageMetadata` 贯通到 storage、dispatch 与 KeyShared replay hash 计算路径；更完整的 schema/encryption/batch 字段仍未纳入本轮范围
 - 压缩目前只是**协议层透传能力保留**，不是 broker 侧编解码；broker 不会主动解压缩或重压缩
 - `partition_key`、更完整的 schema/encryption/batch 相关字段还未纳入本轮范围
 
@@ -805,10 +807,10 @@ pub struct SharedDispatcher {
 ### 12.3 Pulsar Lite 定位
 
 作为一个 **轻量级嵌入式消息队列**，Pulsar Lite 的 Shared 模式：
-- ✅ Persistent 主链路（cursor、ack hole、redelivery）已通过 `tests/persist/`
+- ✅ Persistent 主链路（cursor、ack hole、Shared / KeyShared redelivery）已通过 `tests/persist/`
 - ✅ 基本的 Round-Robin + 优先级分发可用
-- ⚠️ 与原生仍有差距：正式 RedeliveryController、unacked 限流、KeyShared hash 阻塞
-- ⚠️ Non-persistent Shared 的 redelivery 语义仍不完整
+- ⚠️ 与原生仍有差距：官方级 bitmap/backoff RedeliveryController、unacked 限流、复杂批消息/事务路径
+- ✅ Non-persistent Shared / KeyShared redelivery 保持原生 live-only 边界
 
 ---
 

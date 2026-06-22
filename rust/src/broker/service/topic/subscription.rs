@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 /// Forward declaration for Consumer type
 use super::super::{Consumer, SharedStorage};
+use crate::broker::dispatcher::redelivery_controller::RedeliveryEntry;
 use crate::broker::dispatcher::DispatcherEnum;
 use crate::broker::non_persistent::NonPersistentSubscriptionRuntime;
 use crate::storage::{ManagedLedgerPosition, MessageId, NonPersistentEntry};
@@ -534,21 +535,23 @@ impl Subscription {
 
         let mut redeliver = Vec::new();
         if message_ids.is_empty() {
-            redeliver.extend(
-                consumer
-                    .drain_pending_acks()
-                    .await
-                    .into_iter()
-                    .map(|(message_id, pending_ack)| {
-                        (message_id, pending_ack.redelivery_count + 1)
-                    }),
-            );
+            redeliver.extend(consumer.drain_pending_acks().await.into_iter().map(
+                |(message_id, pending_ack)| RedeliveryEntry {
+                    message_id,
+                    redelivery_count: pending_ack.redelivery_count + 1,
+                    sticky_key_hash: pending_ack.sticky_key_hash,
+                },
+            ));
         } else {
             for message_id in message_ids {
                 if let Some(pending_ack) =
                     consumer.take_pending_ack_for_redelivery(&message_id).await
                 {
-                    redeliver.push((message_id, pending_ack.redelivery_count + 1));
+                    redeliver.push(RedeliveryEntry {
+                        message_id,
+                        redelivery_count: pending_ack.redelivery_count + 1,
+                        sticky_key_hash: pending_ack.sticky_key_hash,
+                    });
                 } else {
                     log::debug!(
                         "Consumer {} requested redelivery for non-pending message {}:{}",
@@ -567,12 +570,12 @@ impl Subscription {
         let mut dispatchable = Vec::with_capacity(redeliver.len());
         {
             let guard = self.storage.lock().await;
-            for (message_id, redelivery_count) in redeliver {
+            for entry in redeliver {
                 let acknowledged = guard
-                    .is_acknowledged(&self.topic, &self.name, &message_id)
+                    .is_acknowledged(&self.topic, &self.name, &entry.message_id)
                     .map_err(|e| e.to_string())?;
                 if !acknowledged {
-                    dispatchable.push((message_id, redelivery_count));
+                    dispatchable.push(entry);
                 }
             }
         }

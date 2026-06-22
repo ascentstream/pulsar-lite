@@ -72,7 +72,7 @@ enum DecodeState {
 | **Ack** | 24 | C→S | 确认消息 | ✅ |
 | **AckResponse** | 25 | S→C | 确认响应（可选） | ✅ |
 | **CloseConsumer** | 19 | C→S | 关闭消费者 | ✅ |
-| **RedeliverUnacknowledgedMessages** | 26 | C→S | 重新投递未确认消息（Shared/KeyShared persistent） | ✅ |
+| **RedeliverUnacknowledgedMessages** | 26 | C→S | 重新投递未确认消息（persistent Shared/KeyShared） | ✅ |
 
 ### 订阅模式（通过 Subscribe 命令选择）
 
@@ -83,7 +83,7 @@ enum DecodeState {
 | Failover | 主备切换（priority + rewind） | ✅ | ✅ |
 | Key_Shared | 按 ordering_key sticky 路由 | ✅ | ✅ |
 
-> Persistent 订阅使用 `initialize_or_open_cursor` + dispatcher `read_position` + hole-aware `read_from`；negative ack / ack timeout 由官方客户端发送 `RedeliverUnacknowledgedMessages` 触发，broker 不实现独立 ack-timeout 定时器。
+> Persistent 订阅使用 `initialize_or_open_cursor` + dispatcher `read_position` + hole-aware `read_from`；negative ack / ack timeout 由官方客户端发送 `RedeliverUnacknowledgedMessages` 触发，broker 不实现独立 ack-timeout 定时器。Non-persistent 订阅与原生 Pulsar 的 live-only 语义保持一致：客户端 Redeliver / nack 不触发 broker 侧历史消息 replay。
 
 ## 交互流程
 
@@ -153,9 +153,9 @@ Client                              Server
 ```
 
 **订阅模式特性**:
-- **Shared / KeyShared**: 多消费者；KeyShared 按 `ordering_key` sticky 路由
+- **Shared / KeyShared**: 多消费者；KeyShared 按 `ordering_key` sticky 路由，并在 persistent ordered redelivery 中阻塞同 sticky hash，允许不同 hash 继续投递
 - **Exclusive / Failover**: SingleActive；Failover 按 priority + name 选 active，active 关闭时 rewind
-- Persistent 读路径：`redelivery-first` → `read_from(read_position)` → pending/ack 过滤
+- Persistent 读路径：`RedeliveryController` 优先 → `read_from(read_position)` → pending/ack 过滤；KeyShared 会从持久化 `MessageMetadata` 计算 sticky hash
 - 使用 `dispatcherMaxRoundRobinBatchSize = 20`（与 Apache Pulsar 一致）
 
 ## 实现细节

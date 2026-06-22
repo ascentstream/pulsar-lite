@@ -5,6 +5,7 @@
 
 use super::traits::Dispatcher;
 use super::{ExclusiveDispatcher, FailoverDispatcher, KeySharedDispatcher, SharedDispatcher};
+use crate::broker::dispatcher::redelivery_controller::RedeliveryEntry;
 use crate::broker::service::topic::{KeySharedPolicy, SubscriptionType};
 use crate::broker::service::{Consumer, SharedStorage};
 use crate::storage::{ManagedLedgerPosition, MessageId};
@@ -134,10 +135,10 @@ impl DispatcherEnum {
         }
     }
 
-    pub fn redeliver_messages(&mut self, entries: Vec<(MessageId, u32)>) {
+    pub fn redeliver_messages(&mut self, entries: Vec<RedeliveryEntry>) {
         match self {
-            DispatcherEnum::Shared(d) => d.add_to_redelivery_queue(entries),
-            DispatcherEnum::KeyShared(d) => d.add_to_redelivery_queue(entries),
+            DispatcherEnum::Shared(d) => d.add_redelivery_entries(entries),
+            DispatcherEnum::KeyShared(d) => d.add_redelivery_entries(entries),
             DispatcherEnum::Exclusive(_) | DispatcherEnum::Failover(_) => {
                 if !entries.is_empty() {
                     log::warn!(

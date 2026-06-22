@@ -7,6 +7,7 @@ use super::{
     KeySharedPolicy, Subscription, SubscriptionRuntimeMode, SubscriptionStats, SubscriptionType,
 };
 
+use crate::broker::service::persistent::PersistentTopicRuntime;
 use crate::broker::service::{Consumer, Producer, SharedStorage};
 use crate::storage::{CursorInitOptions, MessageId, NonPersistentEntry, Storage};
 use bytes::Bytes;
@@ -142,6 +143,7 @@ pub struct Topic {
     subscriptions: HashMap<String, SharedSubscription>,
     /// Internal topic runtime mode.
     runtime_mode: TopicRuntimeMode,
+    persistent_runtime: PersistentTopicRuntime,
     /// Storage backend
     storage: SharedStorage,
     publish_rate_limiter: TopicPublishRateLimiter,
@@ -172,12 +174,14 @@ impl Topic {
             partition,
             runtime_mode
         );
+        let persistent_runtime = PersistentTopicRuntime::new(storage.clone());
         Self {
             name,
             partition,
             producers: HashMap::new(),
             subscriptions: HashMap::new(),
             runtime_mode,
+            persistent_runtime,
             storage,
             publish_rate_limiter: TopicPublishRateLimiter::new(),
         }
@@ -374,24 +378,10 @@ impl Topic {
     ) -> Result<SharedSubscription, String> {
         if !self.subscriptions.contains_key(subscription_name) {
             let cursor_result = if self.runtime_mode == TopicRuntimeMode::Persistent {
-                let mut guard = self.storage.lock().await;
-                if let Err(e) = guard.resources_mut().ensure_subscription(
-                    &self.name,
-                    subscription_name,
-                    Storage::METADATA_VERSION,
-                ) {
-                    log::warn!(
-                        "Skipping metadata persistence for subscription '{}' on topic '{}': {}",
-                        subscription_name,
-                        self.name,
-                        e
-                    );
-                }
-
                 Some(
-                    guard
-                        .initialize_or_open_cursor(&self.name, subscription_name, cursor_options)
-                        .map_err(|e| format!("Failed to initialize cursor in storage: {}", e))?,
+                    self.persistent_runtime
+                        .open_subscription_cursor(&self.name, subscription_name, cursor_options)
+                        .await?,
                 )
             } else {
                 None
@@ -505,14 +495,9 @@ impl Topic {
 
         let message_id = match self.runtime_mode {
             TopicRuntimeMode::Persistent => {
-                let mut guard = self.storage.lock().await;
-                let metadata = metadata.unwrap_or_default();
-                guard.append_message_with_metadata(
-                    &self.name,
-                    self.partition,
-                    metadata.as_ref(),
-                    payload.as_ref(),
-                )?
+                self.persistent_runtime
+                    .publish_message(&self.name, self.partition, metadata, payload)
+                    .await?
             }
             TopicRuntimeMode::NonPersistent => {
                 let publish = self.build_non_persistent_publish(metadata, payload);
@@ -610,13 +595,11 @@ impl Topic {
 
     pub async fn get_last_message_id(&self) -> Result<Option<crate::storage::MessageId>, String> {
         match self.runtime_mode {
-            TopicRuntimeMode::Persistent => Ok(self
-                .storage
-                .lock()
-                .await
-                .get_messages(&self.name)
-                .last()
-                .map(|(message_id, _)| message_id.clone())),
+            TopicRuntimeMode::Persistent => {
+                self.persistent_runtime
+                    .get_last_message_id(&self.name)
+                    .await
+            }
             TopicRuntimeMode::NonPersistent => {
                 Err("getLastMessageId is unsupported for non-persistent topics".to_string())
             }

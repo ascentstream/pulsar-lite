@@ -434,9 +434,17 @@ impl Dispatcher for KeySharedDispatcher {
             else {
                 break;
             };
-            
+
             let sticky_key_hash = sticky_key_hash_from_metadata(&candidate.metadata);
-            log::debug!("NORMAL SEND {:?} hash={} blocked={}", candidate.message_id, sticky_key_hash, self.redelivery_controller.read().unwrap().is_hash_blocked(sticky_key_hash));
+            log::debug!(
+                "NORMAL SEND {:?} hash={} blocked={}",
+                candidate.message_id,
+                sticky_key_hash,
+                self.redelivery_controller
+                    .read()
+                    .unwrap()
+                    .is_hash_blocked(sticky_key_hash)
+            );
             if self
                 .redelivery_controller
                 .read()

@@ -23,13 +23,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          sudo apt-get install -y --no-install-recommends protobuf-compiler clang libclang-dev
 
       - name: Install macOS system dependencies
         if: runner.os == 'macOS'
@@ -44,7 +44,7 @@ jobs:
           enable-cache: false
 
       - name: Build Rust broker
-        run: cargo build --manifest-path rust/Cargo.toml --release
+        run: cargo build --manifest-path rust/Cargo.toml --release --features rocksdb-storage
 
       - name: Copy broker binary into Python package
         run: |
@@ -65,7 +65,7 @@ jobs:
           uv run --python 3.10 --managed-python --no-project python -m zipfile -l dist-private/*.whl | grep pulsar_lite/bin/pulsar-lite
 
       - name: Upload private wheel artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact-name }}
           path: python/dist-private/*.whl

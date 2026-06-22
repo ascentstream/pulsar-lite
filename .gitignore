@@ -24,11 +24,9 @@ wheels/
 .coverage
 htmlcov/
 .venv/
-pyrightconfig.json
 
 # Rust
 target/
-Cargo.lock
 **/*.rs.bk
 
 # IDEs

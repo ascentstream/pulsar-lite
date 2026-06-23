@@ -1,0 +1,64 @@
+default_stages: [pre-commit]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: bash -c 'cd rust && cargo fmt -- --check'
+        language: system
+        pass_filenames: false
+        types_or: [rust]
+
+      - id: ruff-format
+        name: ruff format
+        entry: bash -c 'cd python && ruff format --check . ../tests ../examples'
+        language: system
+        pass_filenames: false
+        types_or: [python]
+
+      - id: ruff-check
+        name: ruff
+        entry: bash -c 'cd python && ruff check . ../tests ../examples'
+        language: system
+        pass_filenames: false
+        types_or: [python]
+
+      - id: check-commit-msg
+        name: check commit message
+        entry: python3 scripts/check_commit_msg.py
+        language: system
+        stages: [commit-msg]
+
+      - id: rust-clippy
+        name: rust clippy
+        entry: scripts/run_rust_clippy.sh
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      - id: rust-tests
+        name: rust tests
+        entry: bash -c 'cd rust && cargo test --features rocksdb-storage'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      - id: python-integration-tests
+        name: python integration tests
+        entry: bash -c 'cargo build --manifest-path rust/Cargo.toml --release --features rocksdb-storage && scripts/run_python_tests_with_broker.sh'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

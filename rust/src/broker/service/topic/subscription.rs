@@ -10,23 +10,18 @@ use std::sync::Arc;
 /// Forward declaration for Consumer type
 use super::super::{Consumer, SharedStorage};
 use crate::broker::dispatcher::redelivery_controller::RedeliveryEntry;
-use crate::broker::dispatcher::DispatcherEnum;
 use crate::broker::non_persistent::NonPersistentSubscriptionRuntime;
+use crate::broker::service::persistent::PersistentSubscriptionRuntime;
 use crate::storage::{ManagedLedgerPosition, MessageId, NonPersistentEntry};
 
 /// Subscription type (matches Pulsar protocol)
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum SubscriptionType {
+    #[default]
     Exclusive = 0,
     Shared = 1,
     Failover = 2,
     KeyShared = 3,
-}
-
-impl Default for SubscriptionType {
-    fn default() -> Self {
-        SubscriptionType::Exclusive
-    }
 }
 
 /// Mirrors `CommandAck.AckType` in PulsarApi.proto (Individual = 0, Cumulative = 1).
@@ -92,11 +87,8 @@ pub struct Subscription {
     key_shared_policy: Option<KeySharedPolicy>,
     /// Dedicated non-persistent runtime path.
     non_persistent_runtime: Option<NonPersistentSubscriptionRuntime>,
-    /// Dispatcher for this subscription (created on first consumer)
-    /// Apache Pulsar style - subscription holds dispatcher, not consumers directly
-    dispatcher: Option<DispatcherEnum>,
-    /// Initial persistent read position captured when the storage cursor opens.
-    pending_first_unacked: Option<Option<ManagedLedgerPosition>>,
+    /// Persistent runtime path.
+    persistent_runtime: Option<PersistentSubscriptionRuntime>,
     /// Storage backend for reading messages
     storage: SharedStorage,
 }
@@ -111,13 +103,12 @@ impl std::fmt::Debug for Subscription {
             .field("properties", &self.properties)
             .field("key_shared_policy", &self.key_shared_policy)
             .field(
-                "dispatcher",
-                &self.dispatcher.as_ref().map(|d| d.get_type()),
-            )
-            .field("pending_first_unacked", &self.pending_first_unacked)
-            .field(
                 "non_persistent_runtime",
                 &self.non_persistent_runtime.as_ref().map(|_| "initialized"),
+            )
+            .field(
+                "persistent_runtime",
+                &self.persistent_runtime.as_ref().map(|_| "initialized"),
             )
             .finish()
     }
@@ -170,6 +161,18 @@ impl Subscription {
         key_shared_policy: Option<KeySharedPolicy>,
         storage: SharedStorage,
     ) -> Self {
+        let persistent_runtime = if runtime_mode == SubscriptionRuntimeMode::Persistent {
+            Some(PersistentSubscriptionRuntime::new(
+                topic.clone(),
+                name.clone(),
+                sub_type,
+                key_shared_policy.clone(),
+                storage.clone(),
+            ))
+        } else {
+            None
+        };
+
         Self {
             name,
             topic,
@@ -178,8 +181,7 @@ impl Subscription {
             properties,
             key_shared_policy,
             non_persistent_runtime: None,
-            dispatcher: None,
-            pending_first_unacked: None,
+            persistent_runtime,
             storage,
         }
     }
@@ -219,7 +221,9 @@ impl Subscription {
     }
 
     pub fn set_pending_first_unacked(&mut self, pos: Option<ManagedLedgerPosition>) {
-        self.pending_first_unacked = Some(pos);
+        if let Some(runtime) = self.persistent_runtime.as_mut() {
+            runtime.set_pending_first_unacked(pos);
+        }
     }
 
     pub fn is_fenced(&self) -> bool {
@@ -250,33 +254,6 @@ impl Subscription {
         self.fence();
     }
 
-    /// Create or reuse persistent dispatcher based on subscription type.
-    fn reuse_or_create_dispatcher(&mut self) {
-        let needs_recreate = self.dispatcher.as_ref().is_some_and(|dispatcher| {
-            !dispatcher.is_consumer_connected() && dispatcher.get_type() != self.sub_type
-        });
-        if needs_recreate {
-            self.dispatcher = None;
-        }
-        if self.dispatcher.is_none() {
-            log::info!(
-                "Creating {} dispatcher for subscription '{}' on topic '{}'",
-                match self.sub_type {
-                    SubscriptionType::Exclusive => "Exclusive",
-                    SubscriptionType::Shared => "Shared",
-                    SubscriptionType::Failover => "Failover",
-                    SubscriptionType::KeyShared => "KeyShared",
-                },
-                self.name,
-                self.topic
-            );
-            self.dispatcher = Some(DispatcherEnum::new_with_key_shared_policy(
-                self.sub_type,
-                self.key_shared_policy.clone(),
-            ));
-        }
-    }
-
     fn reuse_or_create_non_persistent_runtime(&mut self) {
         if self.non_persistent_runtime.is_none() {
             log::info!(
@@ -303,18 +280,11 @@ impl Subscription {
     /// Add a consumer to this subscription.
     pub fn add_consumer(&mut self, consumer: Arc<Consumer>) -> Result<(), String> {
         match self.runtime_mode {
-            SubscriptionRuntimeMode::Persistent => {
-                self.reuse_or_create_dispatcher();
-                if let Some(pos) = self.pending_first_unacked.take() {
-                    if let Some(dispatcher) = self.dispatcher.as_ref() {
-                        dispatcher.init_read_position(pos);
-                    }
-                }
-                self.dispatcher
-                    .as_mut()
-                    .ok_or_else(|| "Failed to create dispatcher".to_string())?
-                    .add_consumer(consumer)
-            }
+            SubscriptionRuntimeMode::Persistent => self
+                .persistent_runtime
+                .as_mut()
+                .ok_or_else(|| "persistent runtime is not initialized".to_string())?
+                .add_consumer(consumer),
             SubscriptionRuntimeMode::NonPersistent => {
                 self.reuse_or_create_non_persistent_runtime();
                 self.non_persistent_runtime
@@ -328,22 +298,10 @@ impl Subscription {
     /// Remove a consumer from this subscription
     pub fn remove_consumer(&mut self, consumer_id: u64) -> Option<Arc<Consumer>> {
         match self.runtime_mode {
-            SubscriptionRuntimeMode::Persistent => {
-                let consumer = self
-                    .dispatcher
-                    .as_mut()
-                    .and_then(|dispatcher| dispatcher.remove_consumer(consumer_id));
-
-                if self
-                    .dispatcher
-                    .as_ref()
-                    .is_some_and(|dispatcher| !dispatcher.is_consumer_connected())
-                {
-                    self.dispatcher = None;
-                }
-
-                consumer
-            }
+            SubscriptionRuntimeMode::Persistent => self
+                .persistent_runtime
+                .as_mut()
+                .and_then(|runtime| runtime.remove_consumer(consumer_id)),
             SubscriptionRuntimeMode::NonPersistent => {
                 let consumer = self
                     .non_persistent_runtime
@@ -369,46 +327,11 @@ impl Subscription {
     ) -> Option<Arc<Consumer>> {
         match self.runtime_mode {
             SubscriptionRuntimeMode::Persistent => {
-                let consumer = if let Some(ref mut dispatcher) = self.dispatcher {
-                    dispatcher
-                        .remove_consumer_with_recovery(
-                            consumer_id,
-                            self.storage.clone(),
-                            &self.topic,
-                            &self.name,
-                        )
-                        .await
+                if let Some(runtime) = self.persistent_runtime.as_mut() {
+                    runtime.remove_consumer_with_recovery(consumer_id).await
                 } else {
                     None
-                };
-
-                if let Some(ref dispatcher) = self.dispatcher {
-                    if let Err(e) = dispatcher
-                        .dispatch_messages(
-                            self.storage.clone(),
-                            self.topic.clone(),
-                            self.name.clone(),
-                        )
-                        .await
-                    {
-                        log::error!(
-                            "Failed to dispatch replay messages for subscription '{}': {}",
-                            self.name,
-                            e
-                        );
-                    }
-
-                    if !dispatcher.is_consumer_connected()
-                        && !matches!(
-                            dispatcher.get_type(),
-                            SubscriptionType::Shared | SubscriptionType::KeyShared
-                        )
-                    {
-                        self.dispatcher = None;
-                    }
                 }
-
-                consumer
             }
             SubscriptionRuntimeMode::NonPersistent => self.remove_consumer(consumer_id),
         }
@@ -446,8 +369,8 @@ impl Subscription {
                 .map_err(|e| e.to_string())?
         };
 
-        if let Some(dispatcher) = self.dispatcher.as_ref() {
-            dispatcher.init_read_position(first_unacked);
+        if let Some(runtime) = self.persistent_runtime.as_ref() {
+            runtime.init_read_position(first_unacked);
         }
 
         Ok(())
@@ -548,19 +471,17 @@ impl Subscription {
     }
 
     fn notify_dispatcher_message_acked(&mut self, message_id: &MessageId) {
-        if let Some(dispatcher) = self.dispatcher.as_mut() {
-            dispatcher.on_message_acknowledged(message_id);
+        if let Some(runtime) = self.persistent_runtime.as_mut() {
+            runtime.on_message_acknowledged(message_id);
         }
     }
 
     async fn notify_dispatcher_ack_state_updated(&mut self) -> Result<(), String> {
-        if let Some(dispatcher) = self.dispatcher.as_mut() {
-            dispatcher
-                .on_ack_state_updated(self.storage.clone(), &self.topic, &self.name)
-                .await
-                .map_err(|e| e.to_string())?;
+        if let Some(runtime) = self.persistent_runtime.as_mut() {
+            runtime.on_ack_state_updated().await
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
     pub async fn redeliver_unacknowledged_messages(
@@ -642,25 +563,8 @@ impl Subscription {
             return Ok(());
         }
 
-        if let Some(dispatcher) = self.dispatcher.as_mut() {
-            let queued = dispatchable.len();
-            dispatcher.redeliver_messages(dispatchable);
-            log::info!(
-                "Queued {} messages for redelivery on subscription '{}'",
-                queued,
-                self.name
-            );
-
-            if let Err(e) = dispatcher
-                .dispatch_messages(self.storage.clone(), self.topic.clone(), self.name.clone())
-                .await
-            {
-                log::error!(
-                    "Failed to dispatch redelivered messages for subscription '{}': {}",
-                    self.name,
-                    e
-                );
-            }
+        if let Some(runtime) = self.persistent_runtime.as_mut() {
+            runtime.redeliver_messages(dispatchable).await;
         }
 
         Ok(())
@@ -670,8 +574,9 @@ impl Subscription {
     pub fn get_consumer(&self, consumer_id: u64) -> Option<Arc<Consumer>> {
         match self.runtime_mode {
             SubscriptionRuntimeMode::Persistent => {
-                self.dispatcher.as_ref()?.get_consumer(consumer_id)
+                self.persistent_runtime.as_ref()?.get_consumer(consumer_id)
             }
+
             SubscriptionRuntimeMode::NonPersistent => self
                 .non_persistent_runtime
                 .as_ref()?
@@ -683,9 +588,9 @@ impl Subscription {
     pub fn get_consumers(&self) -> Vec<Arc<Consumer>> {
         match self.runtime_mode {
             SubscriptionRuntimeMode::Persistent => self
-                .dispatcher
+                .persistent_runtime
                 .as_ref()
-                .map(|d| d.get_consumers())
+                .map(|runtime| runtime.get_consumers())
                 .unwrap_or_default(),
             SubscriptionRuntimeMode::NonPersistent => self
                 .non_persistent_runtime
@@ -700,9 +605,9 @@ impl Subscription {
         match self.runtime_mode {
             SubscriptionRuntimeMode::Persistent => match self.sub_type {
                 SubscriptionType::Failover => self
-                    .dispatcher
+                    .persistent_runtime
                     .as_ref()
-                    .and_then(|dispatcher| dispatcher.get_active_consumer())
+                    .and_then(|runtime| runtime.get_active_consumer())
                     .into_iter()
                     .collect(),
                 _ => self.get_consumers(),
@@ -728,9 +633,9 @@ impl Subscription {
     pub fn has_consumers(&self) -> bool {
         match self.runtime_mode {
             SubscriptionRuntimeMode::Persistent => self
-                .dispatcher
+                .persistent_runtime
                 .as_ref()
-                .map(|d| d.is_consumer_connected())
+                .map(|runtime| runtime.has_consumers())
                 .unwrap_or(false),
             SubscriptionRuntimeMode::NonPersistent => self
                 .non_persistent_runtime
@@ -806,18 +711,10 @@ impl Subscription {
 
         match self.runtime_mode {
             SubscriptionRuntimeMode::Persistent => {
-                if let Some(ref dispatcher) = self.dispatcher {
-                    dispatcher
-                        .dispatch_messages(
-                            self.storage.clone(),
-                            self.topic.clone(),
-                            self.name.clone(),
-                        )
-                        .await
-                } else {
-                    log::warn!("No dispatcher found for subscription '{}'", self.name);
-                    Ok(())
+                if let Some(runtime) = self.persistent_runtime.as_ref() {
+                    runtime.dispatch_messages().await?;
                 }
+                Ok(())
             }
             SubscriptionRuntimeMode::NonPersistent => Ok(()),
         }
@@ -874,32 +771,13 @@ impl Subscription {
     pub async fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {
         match self.runtime_mode {
             SubscriptionRuntimeMode::Persistent => {
-                if let Some(ref dispatcher) = self.dispatcher {
-                    log::debug!(
-                        "Subscription '{}' received flow from consumer {}, permits={}",
-                        self.name,
-                        consumer_id,
-                        additional_permits
-                    );
-
-                    dispatcher.consumer_flow(consumer_id, additional_permits);
-
-                    if let Err(e) = dispatcher
-                        .dispatch_messages(
-                            self.storage.clone(),
-                            self.topic.clone(),
-                            self.name.clone(),
-                        )
-                        .await
-                    {
-                        log::error!(
-                            "Failed to dispatch messages for subscription '{}': {}",
-                            self.name,
-                            e
-                        );
-                    }
+                if let Some(runtime) = self.persistent_runtime.as_ref() {
+                    runtime.consumer_flow(consumer_id, additional_permits).await;
                 } else {
-                    log::warn!("No dispatcher available for subscription '{}'", self.name);
+                    log::warn!(
+                        "No persistent runtime available for subscription '{}'",
+                        self.name
+                    );
                 }
             }
             SubscriptionRuntimeMode::NonPersistent => {

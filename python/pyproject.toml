@@ -6,9 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "pulsar-lite"
 version = "0.1.0"
 description = "Embedded lightweight message queue compatible with Apache Pulsar - Milvus Lite style experience"
-authors = [{name = "Pulsar Lite Team", email = "pulsar-lite@example.com"}]
+authors = [{name = "Pulsar Lite Team"}]
 license = {text = "Apache-2.0"}
-readme = "README.md"
+readme = {text = "Pulsar Lite Python helper package for starting and connecting to a local Pulsar Lite broker.", content-type = "text/markdown"}
 requires-python = ">=3.8"
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -28,14 +28,13 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
-    "black>=23.0",
     "ruff>=0.1.0",
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/pulsar-lite"
-Documentation = "https://github.com/yourusername/pulsar-lite#readme"
-Repository = "https://github.com/yourusername/pulsar-lite"
+Homepage = "https://github.com/ascentstream/pulsar-lite"
+Documentation = "https://github.com/ascentstream/pulsar-lite#readme"
+Repository = "https://github.com/ascentstream/pulsar-lite"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -43,11 +42,15 @@ where = ["src"]
 [tool.setuptools.package-data]
 pulsar_lite = ["bin/pulsar-lite", "bin/pulsar-lite.exe"]
 
-[tool.black]
-line-length = 100
-target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
-
 [tool.ruff]
 line-length = 100
 target-version = "py38"
+
+[tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]
+ignore = [
+    "E402", # Some perf tests adjust sys.path before importing local helpers.
+    "E501", # Perf command and parser definitions contain intentionally long literals.
+    "E722", # Existing process cleanup paths use broad exception handling.
+    "N801", # setuptools command classes intentionally follow bdist_* naming.
+]

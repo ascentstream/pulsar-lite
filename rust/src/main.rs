@@ -120,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok((s, p)) => (s, p),
             Err(e) => {
                 log::warn!("Error accepting connection: {}", e);
-                continue
+                continue;
             }
         };
 

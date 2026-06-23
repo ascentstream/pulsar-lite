@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import pulsar
-
 from test_support import persistent_topic
 
 

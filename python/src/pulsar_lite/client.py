@@ -6,9 +6,11 @@ Pulsar Lite 客户端
 - 远程 URI → 直接连接远程服务器
 """
 
-import pulsar
 from pathlib import Path
-from typing import Optional, Any
+from typing import Any, Optional
+
+import pulsar
+
 from .process_manager import process_manager
 
 

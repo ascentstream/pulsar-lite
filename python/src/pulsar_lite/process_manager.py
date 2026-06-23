@@ -6,13 +6,14 @@ Pulsar Lite 进程管理器
 """
 
 import os
-import subprocess
-import time
-import threading
 import socket
+import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple
+
 from .binary_finder import find_pulsar_lite_binary
 
 
@@ -63,7 +64,9 @@ class ProcessManager:
             return
 
         self._initialized = True
-        self._processes: Dict[str, Tuple[subprocess.Popen, int, int]] = {}  # db_path -> (process, ref_count, port)
+        self._processes: Dict[
+            str, Tuple[subprocess.Popen, int, int]
+        ] = {}  # db_path -> (process, ref_count, port)
         self._process_lock = threading.Lock()
         self._binary_path = None
 
@@ -128,7 +131,9 @@ class ProcessManager:
             if db_path in self._processes:
                 process, ref_count, port = self._processes[db_path]
                 self._processes[db_path] = (process, ref_count + 1, port)
-                print(f"Reusing Pulsar Lite server for {db_path}, ref_count={ref_count + 1}, port={port}")
+                print(
+                    f"Reusing Pulsar Lite server for {db_path}, ref_count={ref_count + 1}, port={port}"
+                )
                 return f"pulsar://localhost:{port}", port
 
             # 查找二进制文件
@@ -157,17 +162,21 @@ class ProcessManager:
                 env=env,
                 stdout=log_file,
                 stderr=log_file,
-                cwd=str(db_dir)
+                cwd=str(db_dir),
             )
 
             try:
                 self._wait_until_ready(process, port)
             except RuntimeError as error:
-                raise RuntimeError(f"Pulsar Lite server failed to start for {db_path}: {error}") from error
+                raise RuntimeError(
+                    f"Pulsar Lite server failed to start for {db_path}: {error}"
+                ) from error
 
             # 保存进程信息
             self._processes[db_path] = (process, 1, port)
-            print(f"Started Pulsar Lite server for {db_path}, ref_count=1, port={port}, pid={process.pid}")
+            print(
+                f"Started Pulsar Lite server for {db_path}, ref_count=1, port={port}, pid={process.pid}"
+            )
 
             return f"pulsar://localhost:{port}", port
 

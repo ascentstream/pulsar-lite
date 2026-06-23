@@ -35,9 +35,7 @@ def test_non_persist_late_subscriber_sees_no_backlog(broker_url, unique_name):
         client.close()
 
 
-def test_non_persist_send_async_delivers_and_preserves_message_metadata(
-    broker_url, unique_name
-):
+def test_non_persist_send_async_delivers_and_preserves_message_metadata(broker_url, unique_name):
     topic = non_persistent_runtime_topic(unique_name, "np-async-metadata")
     subscription = unique_name("np-sub")
     client = pulsar.Client(broker_url)

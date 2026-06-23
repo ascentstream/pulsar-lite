@@ -24,11 +24,9 @@ wheels/
 .coverage
 htmlcov/
 .venv/
-pyrightconfig.json
 
 # Rust
 target/
-Cargo.lock
 **/*.rs.bk
 
 # IDEs
@@ -48,6 +46,7 @@ Thumbs.db
 *.db
 *.db-lock
 *.sock
+rust/pulsar-lite.rocksdb/
 
 # Temporary files
 tmp/

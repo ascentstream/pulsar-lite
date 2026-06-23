@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-
 DEFAULT_BROKER_URL = "pulsar://localhost:6650"
 DEFAULT_LOG_PATH = Path("/tmp/pulsar-lite.log")
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "rust" / "pulsar-lite.db"

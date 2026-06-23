@@ -216,5 +216,5 @@ if sub_type == SubscriptionType::Exclusive {
 - 消息分配追踪（避免重复消费）
 - Round-robin 批处理（dispatcherMaxRoundRobinBatchSize = 20）
 
-[Unreleased]: https://github.com/your-org/pulsar-lite/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/your-org/pulsar-lite/releases/tag/v0.1.0
+[Unreleased]: https://github.com/ascentstream/pulsar-lite/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/ascentstream/pulsar-lite/releases/tag/v0.1.0

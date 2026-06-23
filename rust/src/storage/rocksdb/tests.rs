@@ -1,5 +1,5 @@
 use super::cursor::{ack_managed_cursor_shared, RocksDBManagedCursor};
-use super::entrylog::{EntryIndex, EntryLogStore};
+use super::entrylog::EntryLogStore;
 use super::factory::RocksDBManagedLedgerFactory;
 use super::keys;
 use super::ledger::RocksDBManagedLedger;
@@ -11,8 +11,7 @@ use crate::storage::{
 };
 use prost::Message;
 use rocksdb::{Options, DB};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -194,7 +193,10 @@ fn entrylog_allows_single_entry_larger_than_configured_limit() {
 
 #[test]
 fn entrylog_default_size_limit_matches_bookkeeper_like_threshold() {
-    assert_eq!(EntryLogStore::default_log_size_limit(), 2 * 1024 * 1024 * 1024);
+    assert_eq!(
+        EntryLogStore::default_log_size_limit(),
+        2 * 1024 * 1024 * 1024
+    );
 }
 
 #[test]

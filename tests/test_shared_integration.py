@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import pulsar
 import pytest
-
 from test_support import persistent_topic, receive_from_any
 
 
@@ -19,9 +18,7 @@ def _shared_semantics_topic(unique_name, broker_timing, prefix: str) -> str:
     return persistent_topic(unique_name(prefix))
 
 
-def test_shared_pending_acks_disconnect_triggers_redelivery(
-    broker_url, broker_timing, unique_name
-):
+def test_shared_pending_acks_disconnect_triggers_redelivery(broker_url, broker_timing, unique_name):
     topic = _shared_semantics_topic(unique_name, broker_timing, "shared-redelivery")
     subscription = unique_name("shared-sub")
     client = pulsar.Client(broker_url)
@@ -148,9 +145,7 @@ def test_shared_recovery_does_not_replay_already_acked_messages(
         seen_later = set()
         while seen_later != expected_later:
             producer.send(next(iter(expected_later - seen_later)))
-            later_owner, later_message = receive_from_any(
-                [consumer_1, consumer_2], timeout_secs=10
-            )
+            later_owner, later_message = receive_from_any([consumer_1, consumer_2], timeout_secs=10)
             seen_later.add(later_message.data())
             later_owner.acknowledge(later_message)
 

@@ -242,7 +242,7 @@ where
         .get(&ack_cmd.consumer_id)
         .ok_or_else(|| format!("Unknown consumer ID: {}", ack_cmd.consumer_id))?;
 
-    let ack_type = AckCommandType::from_proto(ack_cmd.ack_type as i32);
+    let ack_type = AckCommandType::from_proto(ack_cmd.ack_type);
     let message_ids: Vec<MessageId> = ack_cmd
         .message_id
         .iter()

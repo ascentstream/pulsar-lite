@@ -7,7 +7,6 @@ import threading
 from collections import defaultdict
 
 import pulsar
-
 from test_support import persistent_topic
 
 
@@ -75,7 +74,15 @@ def test_shared_round_robin_distribution(broker_url, unique_name):
         for index, consumer in enumerate(consumers):
             thread = threading.Thread(
                 target=_consume_messages_until_done,
-                args=(consumer, f"consumer-{index}", len(payloads), received, errors, lock, done),
+                args=(
+                    consumer,
+                    f"consumer-{index}",
+                    len(payloads),
+                    received,
+                    errors,
+                    lock,
+                    done,
+                ),
                 daemon=True,
             )
             thread.start()
@@ -90,7 +97,7 @@ def test_shared_round_robin_distribution(broker_url, unique_name):
         assert total_received == len(payloads)
 
         all_payloads = [payload for messages in received.values() for payload in messages]
-        assert len(set(all_payloads)) == len(payloads),f"message duplication"
+        assert len(set(all_payloads)) == len(payloads), "message duplication"
 
         distribution = [len(received[f"consumer-{index}"]) for index in range(3)]
         assert min(distribution) >= 5
@@ -146,7 +153,9 @@ def test_shared_multiple_consumers_concurrent(broker_url, unique_name):
             except Exception as exc:  # pragma: no cover - surfaced in assertions below
                 errors.append(exc)
 
-        threads = [threading.Thread(target=worker, args=(consumer,), daemon=True) for consumer in consumers]
+        threads = [
+            threading.Thread(target=worker, args=(consumer,), daemon=True) for consumer in consumers
+        ]
         for thread in threads:
             thread.start()
         for thread in threads:

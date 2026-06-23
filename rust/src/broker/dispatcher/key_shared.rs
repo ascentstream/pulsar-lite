@@ -18,6 +18,12 @@ use std::sync::{Arc, RwLock};
 
 const DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE: u32 = 20;
 
+type DispatchableRedelivery = Option<(
+    RedeliveryEntry,
+    crate::storage::StoredMessage,
+    Arc<Consumer>,
+)>;
+
 pub struct KeySharedDispatcher {
     consumers_by_id: HashMap<u64, Arc<Consumer>>,
     auto_split_assignments: Vec<(KeySharedHashRange, Arc<Consumer>)>,
@@ -151,14 +157,7 @@ impl KeySharedDispatcher {
         storage: &crate::storage::Storage,
         topic: &str,
         subscription: &str,
-    ) -> Result<
-        Option<(
-            RedeliveryEntry,
-            crate::storage::StoredMessage,
-            Arc<Consumer>,
-        )>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> Result<DispatchableRedelivery, Box<dyn std::error::Error + Send + Sync>> {
         let queued = self.redelivery_controller.read().unwrap().queued_entries();
         for queued_entry in queued {
             if storage.is_acknowledged(topic, subscription, &queued_entry.message_id)? {
@@ -434,9 +433,17 @@ impl Dispatcher for KeySharedDispatcher {
             else {
                 break;
             };
-            
+
             let sticky_key_hash = sticky_key_hash_from_metadata(&candidate.metadata);
-            log::debug!("NORMAL SEND {:?} hash={} blocked={}", candidate.message_id, sticky_key_hash, self.redelivery_controller.read().unwrap().is_hash_blocked(sticky_key_hash));
+            log::debug!(
+                "NORMAL SEND {:?} hash={} blocked={}",
+                candidate.message_id,
+                sticky_key_hash,
+                self.redelivery_controller
+                    .read()
+                    .unwrap()
+                    .is_hash_blocked(sticky_key_hash)
+            );
             if self
                 .redelivery_controller
                 .read()

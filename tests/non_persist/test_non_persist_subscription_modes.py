@@ -48,9 +48,7 @@ def test_non_persist_exclusive_rejects_second_consumer(broker_url, unique_name):
         client.close()
 
 
-def test_non_persist_failover_promotes_standby_after_active_closes(
-    broker_url, unique_name
-):
+def test_non_persist_failover_promotes_standby_after_active_closes(broker_url, unique_name):
     topic = non_persistent_runtime_topic(unique_name, "np-failover")
     subscription = unique_name("np-sub")
     client = pulsar.Client(broker_url)
@@ -91,9 +89,7 @@ def test_non_persist_failover_promotes_standby_after_active_closes(
         client.close()
 
 
-def test_non_persist_shared_distributes_messages_across_consumers(
-    broker_url, unique_name
-):
+def test_non_persist_shared_distributes_messages_across_consumers(broker_url, unique_name):
     topic = non_persistent_runtime_topic(unique_name, "np-shared")
     subscription = unique_name("np-sub")
     client = pulsar.Client(broker_url)
@@ -136,9 +132,7 @@ def test_non_persist_shared_distributes_messages_across_consumers(
         client.close()
 
 
-def test_non_persist_key_shared_routes_same_key_to_same_consumer(
-    broker_url, unique_name
-):
+def test_non_persist_key_shared_routes_same_key_to_same_consumer(broker_url, unique_name):
     topic = non_persistent_runtime_topic(unique_name, "np-key-shared")
     subscription = unique_name("np-sub")
     client = pulsar.Client(broker_url)

@@ -29,3 +29,6 @@ pub use producer::Producer;
 
 // Pending Acknowledgments Map
 pub use pending_acks::{PendingAck, PendingAcksMap};
+
+// Persistent
+pub mod persistent;

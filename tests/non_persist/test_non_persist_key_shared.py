@@ -12,9 +12,7 @@ from non_persist.support import (
 )
 
 
-def test_non_persist_key_shared_sticky_ranges_route_to_expected_consumer(
-    broker_url, unique_name
-):
+def test_non_persist_key_shared_sticky_ranges_route_to_expected_consumer(broker_url, unique_name):
     topic = non_persistent_runtime_topic(unique_name, "np-key-shared-sticky")
     subscription = unique_name("np-sub")
     client = pulsar.Client(broker_url)
@@ -60,15 +58,13 @@ def test_non_persist_key_shared_sticky_ranges_route_to_expected_consumer(
         client.close()
 
 
-def test_non_persist_key_shared_rejects_incompatible_policy_consumer(
-    broker_url, unique_name
-):
+def test_non_persist_key_shared_rejects_incompatible_policy_consumer(broker_url, unique_name):
     topic = non_persistent_runtime_topic(unique_name, "np-key-shared-policy")
     subscription = unique_name("np-sub")
     client = pulsar.Client(broker_url)
 
     try:
-        first = client.subscribe(
+        _first = client.subscribe(
             topic,
             subscription,
             consumer_name="ks-auto",

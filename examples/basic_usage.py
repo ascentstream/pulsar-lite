@@ -8,8 +8,9 @@ Pulsar Lite 基本使用示例
 2. 远程模式 - 连接到独立的 Pulsar 服务器
 """
 
-import tempfile
 import pathlib
+import tempfile
+
 from pulsar_lite import PulsarClient
 
 
@@ -25,7 +26,7 @@ def basic_usage():
         # 2. 创建客户端（自动启动服务器）
         # 使用 with 语句确保资源自动清理
         with PulsarClient(db_path) as client:
-            print(f"✓ 已连接")
+            print("✓ 已连接")
             print(f"  Pulsar URL: {client.pulsar_url}")
             print(f"  嵌入式模式: {client.is_embedded}\n")
 
@@ -35,7 +36,7 @@ def basic_usage():
 
             # 4. 发送消息
             for i in range(5):
-                message = f"Message {i}".encode('utf-8')
+                message = f"Message {i}".encode("utf-8")
                 msg_id = producer.send(message)
                 print(f"  ✓ 发送消息 {i}: {msg_id}")
 

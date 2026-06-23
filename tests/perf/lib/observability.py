@@ -19,17 +19,24 @@ class PerfCollector:
         self._proc: subprocess.Popen | None = None
 
     def start(self) -> None:
-        if not shutil.which('perf'):
+        if not shutil.which("perf"):
             return
         self._proc = subprocess.Popen(
             [
-                'perf', 'record',
-                '-F', self.PERF_FREQUENCY_HZ,
-                '--call-graph', self.PERF_CALL_GRAPH,
-                '--all-user',
-                '-p', str(self.pid),
-                '-o', str(self.perf_data_path),
-                '--', 'sleep', str(self.duration),
+                "perf",
+                "record",
+                "-F",
+                self.PERF_FREQUENCY_HZ,
+                "--call-graph",
+                self.PERF_CALL_GRAPH,
+                "--all-user",
+                "-p",
+                str(self.pid),
+                "-o",
+                str(self.perf_data_path),
+                "--",
+                "sleep",
+                str(self.duration),
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -47,15 +54,15 @@ class PerfCollector:
 
     @staticmethod
     def generate_flamegraph(perf_data_path: Path, svg_output_path: Path) -> bool:
-        collapse = shutil.which('inferno-collapse-perf')
-        flamegraph = shutil.which('inferno-flamegraph')
+        collapse = shutil.which("inferno-collapse-perf")
+        flamegraph = shutil.which("inferno-flamegraph")
         if not collapse or not flamegraph:
             return False
 
         try:
             # Step 1: perf script -> inferno-collapse-perf (folded format)
             script_proc = subprocess.Popen(
-                ['perf', 'script', '--demangle', '-i', str(perf_data_path)],
+                ["perf", "script", "--demangle", "-i", str(perf_data_path)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
@@ -68,7 +75,7 @@ class PerfCollector:
             script_proc.stdout.close()
 
             # Step 2: folded format -> inferno-flamegraph (SVG)
-            with svg_output_path.open('w', encoding='utf-8') as svg_fh:
+            with svg_output_path.open("w", encoding="utf-8") as svg_fh:
                 fg_proc = subprocess.Popen(
                     [flamegraph],
                     stdin=collapse_proc.stdout,
@@ -81,7 +88,11 @@ class PerfCollector:
             collapse_proc.wait(timeout=30)
             script_proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            for proc in (locals().get('fg_proc'), locals().get('collapse_proc'), locals().get('script_proc')):
+            for proc in (
+                locals().get("fg_proc"),
+                locals().get("collapse_proc"),
+                locals().get("script_proc"),
+            ):
                 if proc and proc.poll() is None:
                     proc.terminate()
             return False

@@ -5,7 +5,6 @@ import time
 from typing import Iterable
 
 import pulsar
-
 from test_support import receive_from_any
 
 

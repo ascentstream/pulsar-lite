@@ -50,6 +50,12 @@ impl ExclusiveDispatcher {
     }
 }
 
+impl Default for ExclusiveDispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Dispatcher for ExclusiveDispatcher {
     fn get_type(&self) -> SubscriptionType {
         SubscriptionType::Exclusive

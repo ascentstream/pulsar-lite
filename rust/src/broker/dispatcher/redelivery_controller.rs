@@ -96,6 +96,10 @@ impl RedeliveryController {
         self.entries.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn queued_message_ids(&self) -> Vec<MessageId> {
         self.entries.keys().cloned().collect()
     }

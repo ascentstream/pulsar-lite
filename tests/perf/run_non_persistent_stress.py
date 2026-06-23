@@ -76,7 +76,20 @@ STRESS_SCENARIOS: list[StressScenario] = [
         kind="produce",
         broker="nonpartitioned",
         description="4 producers 1M msg/s aggregate offered load 并发吞吐 ceiling",
-        producer_args=["-time", "60", "-r", "999999", "-s", "1024", "-n", "4", "-threads", "4", "-c", "4"],
+        producer_args=[
+            "-time",
+            "60",
+            "-r",
+            "999999",
+            "-s",
+            "1024",
+            "-n",
+            "4",
+            "-threads",
+            "4",
+            "-c",
+            "4",
+        ],
         estimated_duration=60,
     ),
     StressScenario(
@@ -112,7 +125,18 @@ STRESS_SCENARIOS: list[StressScenario] = [
         broker="nonpartitioned",
         description="Shared 16 consumers 1M msg/s offered load 高 fanout",
         producer_args=[],
-        consumer_args=["-time", "60", "-q", "10000", "-st", "Shared", "-n", "16", "-c", "4"],
+        consumer_args=[
+            "-time",
+            "60",
+            "-q",
+            "10000",
+            "-st",
+            "Shared",
+            "-n",
+            "16",
+            "-c",
+            "4",
+        ],
         feed_producer_args=["-time", "60", "-r", "999999", "-s", "1024", "-c", "4"],
         estimated_duration=60,
     ),
@@ -122,15 +146,33 @@ STRESS_SCENARIOS: list[StressScenario] = [
         broker="nonpartitioned",
         description="8 subscriptions 1M msg/s offered load 高 fanout",
         producer_args=[],
-        consumer_args=["-time", "60", "-q", "10000", "-st", "Shared", "-ns", "8", "-c", "4"],
+        consumer_args=[
+            "-time",
+            "60",
+            "-q",
+            "10000",
+            "-st",
+            "Shared",
+            "-ns",
+            "8",
+            "-c",
+            "4",
+        ],
         feed_producer_args=[
-            "-time", "60",
-            "-r", "999999",
-            "-s", "1024",
-            "-c", "4",
-            "--memory-limit", "268435456",
-            "--max-outstanding", "4096",
-            "--max-outstanding-across-partitions", "16384",
+            "-time",
+            "60",
+            "-r",
+            "999999",
+            "-s",
+            "1024",
+            "-c",
+            "4",
+            "--memory-limit",
+            "268435456",
+            "--max-outstanding",
+            "4096",
+            "--max-outstanding-across-partitions",
+            "16384",
         ],
         estimated_duration=60,
     ),
@@ -150,7 +192,18 @@ STRESS_SCENARIOS: list[StressScenario] = [
         broker="nonpersistent_partitioned",
         description="Partitioned 4 partitions Shared 4 consumers 1M msg/s offered load",
         producer_args=[],
-        consumer_args=["-time", "60", "-q", "10000", "-st", "Shared", "-n", "4", "-c", "4"],
+        consumer_args=[
+            "-time",
+            "60",
+            "-q",
+            "10000",
+            "-st",
+            "Shared",
+            "-n",
+            "4",
+            "-c",
+            "4",
+        ],
         feed_producer_args=["-time", "60", "-r", "999999", "-s", "1024", "-c", "4"],
         estimated_duration=60,
     ),
@@ -209,6 +262,7 @@ def select_scenarios(requested_names: list[str]) -> list[StressScenario]:
             + ", ".join(sorted(by_name))
         )
     return [by_name[name] for name in requested_names]
+
 
 # ---------------------------------------------------------------------------
 # Runner helpers
@@ -303,7 +357,12 @@ def _run_consume_e2e_scenario(
     started_at = datetime.now(timezone.utc).isoformat()
     t0 = time.monotonic()
     consumer_out, producer_out, consumer_rc, producer_rc = run_consumer_then_feed(
-        consumer_cmd, producer_cmd, consumer_log, producer_log, consumer_timeout=timeout, producer_timeout=timeout,
+        consumer_cmd,
+        producer_cmd,
+        consumer_log,
+        producer_log,
+        consumer_timeout=timeout,
+        producer_timeout=timeout,
     )
     duration_secs = round(time.monotonic() - t0, 3)
 
@@ -313,8 +372,10 @@ def _run_consume_e2e_scenario(
 
     broker_metrics = broker_proc.metrics()
 
-    status = "ok" if consumer_rc == 0 and producer_rc == 0 else (
-        f"consumer_exit:{consumer_rc},producer_exit:{producer_rc}"
+    status = (
+        "ok"
+        if consumer_rc == 0 and producer_rc == 0
+        else (f"consumer_exit:{consumer_rc},producer_exit:{producer_rc}")
     )
     result: dict = {
         "name": scenario.name,
@@ -373,7 +434,10 @@ def main(argv: list[str] | None = None) -> None:
         docker_image_metadata = build_broker_image(
             skip_docker_build=args.skip_docker_build,
         )
-        print(f"  Docker image: {docker_image_metadata['docker_image_tag']}", file=sys.stderr)
+        print(
+            f"  Docker image: {docker_image_metadata['docker_image_tag']}",
+            file=sys.stderr,
+        )
 
     run_metadata = collect_run_metadata(args)
     if docker_image_metadata is not None:
@@ -437,11 +501,19 @@ def main(argv: list[str] | None = None) -> None:
             try:
                 if scenario.kind == "produce":
                     result = _run_produce_scenario(
-                        scenario, run_id, scenario_dir, broker_proc, perf_collector,
+                        scenario,
+                        run_id,
+                        scenario_dir,
+                        broker_proc,
+                        perf_collector,
                     )
                 elif scenario.kind == "consume_e2e":
                     result = _run_consume_e2e_scenario(
-                        scenario, run_id, scenario_dir, broker_proc, perf_collector,
+                        scenario,
+                        run_id,
+                        scenario_dir,
+                        broker_proc,
+                        perf_collector,
                     )
                 else:
                     print(f"  UNKNOWN kind: {scenario.kind}, skipping", file=sys.stderr)
@@ -474,6 +546,7 @@ def main(argv: list[str] | None = None) -> None:
             # Save broker log (contains dispatch metrics and other diagnostics)
             if broker_proc.log_path and broker_proc.log_path.exists():
                 import shutil
+
                 broker_log_dest = scenario_dir / "broker.log"
                 shutil.copy2(broker_proc.log_path, broker_log_dest)
                 print(f"  broker log -> {broker_log_dest}", file=sys.stderr)
@@ -489,14 +562,20 @@ def main(argv: list[str] | None = None) -> None:
                     print(f"  flamegraph -> {svg_path}", file=sys.stderr)
                 else:
                     result["flamegraph_file"] = None
-                    print(f"  flamegraph skipped for {perf_data_path.name}", file=sys.stderr)
+                    print(
+                        f"  flamegraph skipped for {perf_data_path.name}",
+                        file=sys.stderr,
+                    )
             else:
                 result["perf_data_file"] = None
                 result["flamegraph_file"] = None
                 print("  perf data not captured", file=sys.stderr)
 
             scenario_results.append(result)
-            print(f"  status={result['status']}  duration={result['duration_secs']}s", file=sys.stderr)
+            print(
+                f"  status={result['status']}  duration={result['duration_secs']}s",
+                file=sys.stderr,
+            )
 
     finally:
         # Stop all brokers
@@ -505,7 +584,10 @@ def main(argv: list[str] | None = None) -> None:
         for name, bp in broker_procs.items():
             metrics = bp.stop()
             broker_stop_metrics[name] = metrics
-            print(f"  Broker [{name}] stopped: avg_cpu={metrics['broker_avg_cpu_pct']}%", file=sys.stderr)
+            print(
+                f"  Broker [{name}] stopped: avg_cpu={metrics['broker_avg_cpu_pct']}%",
+                file=sys.stderr,
+            )
 
     # Write results JSON
     output = {

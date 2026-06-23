@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import time
 
-import pulsar 
-
+import pulsar
 from non_persist.test_non_persist_dynamic_consumers import _find_key_in_range
+
 from persist.support import (
     PersistentBroker,
     assert_no_message,
@@ -28,9 +28,7 @@ def _subscribe(client: pulsar.Client, topic: str, subscription: str, **kwargs):
     return client.subscribe(topic, subscription, **options)
 
 
-def test_persistent_unacked_message_redelivers_after_consumer_close(
-    tmp_path, unique_name
-):
+def test_persistent_unacked_message_redelivers_after_consumer_close(tmp_path, unique_name):
     db_path = tmp_path / "persistent.db"
     topic = persistent_topic(unique_name, "persist-close-redelivery")
     subscription = unique_name("persist-sub")
@@ -54,9 +52,7 @@ def test_persistent_unacked_message_redelivers_after_consumer_close(
             client.close()
 
 
-def test_persistent_unacked_message_redelivers_after_broker_restart(
-    tmp_path, unique_name
-):
+def test_persistent_unacked_message_redelivers_after_broker_restart(tmp_path, unique_name):
     db_path = tmp_path / "persistent.db"
     topic = persistent_topic(unique_name, "persist-restart-redelivery")
     subscription = unique_name("persist-sub")
@@ -84,9 +80,7 @@ def test_persistent_unacked_message_redelivers_after_broker_restart(
             client.close()
 
 
-def test_persistent_acked_message_does_not_redeliver_after_consumer_close(
-    tmp_path, unique_name
-):
+def test_persistent_acked_message_does_not_redeliver_after_consumer_close(tmp_path, unique_name):
     db_path = tmp_path / "persistent.db"
     topic = persistent_topic(unique_name, "persist-close-no-redelivery")
     subscription = unique_name("persist-sub")
@@ -109,9 +103,7 @@ def test_persistent_acked_message_does_not_redeliver_after_consumer_close(
             client.close()
 
 
-def test_persistent_shared_ack_hole_redelivery_increments_count(
-    tmp_path, unique_name
-):
+def test_persistent_shared_ack_hole_redelivery_increments_count(tmp_path, unique_name):
     db_path = tmp_path / "persistent.db"
     topic = persistent_topic(unique_name, "persist-shared-ack-hole-redelivery-count")
     subscription = unique_name("persist-sub")
@@ -221,9 +213,7 @@ def test_persistent_shared_ack_timeout_redelivers_message(tmp_path, unique_name)
             client.close()
 
 
-def test_persistent_shared_explicit_redelivery_command_redelivers_message(
-    tmp_path, unique_name
-):
+def test_persistent_shared_explicit_redelivery_command_redelivers_message(tmp_path, unique_name):
     db_path = tmp_path / "persistent.db"
     topic = persistent_topic(unique_name, "persist-explicit-redelivery")
     subscription = unique_name("persist-sub")
@@ -253,9 +243,7 @@ def test_persistent_shared_explicit_redelivery_command_redelivers_message(
             client.close()
 
 
-def test_persistent_key_shared_redelivery_blocks_same_key_but_not_other_key(
-    tmp_path, unique_name
-):
+def test_persistent_key_shared_redelivery_blocks_same_key_but_not_other_key(tmp_path, unique_name):
     db_path = tmp_path / "persistent.db"
     topic = persistent_topic(unique_name, "persist-key-shared-redelivery-blocking")
     subscription = unique_name("persist-sub")

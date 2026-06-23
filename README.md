@@ -1,71 +1,118 @@
 # Pulsar Lite
 
-**本地嵌入式 Apache Pulsar 协议兼容 Broker，用于开发、测试、Agent 原型和轻量 demo。**
+[![CI](https://github.com/ascentstream/pulsar-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/ascentstream/pulsar-lite/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+English | [Simplified Chinese](README.zh-CN.md)
 
-> 当前定位：Pulsar Lite 面向本地开发和测试验证，不是生产级 Apache Pulsar 集群替代品。生产环境请使用完整 Apache Pulsar 集群。
+Pulsar Lite is a lightweight local broker that implements the core Apache Pulsar
+binary protocol for development, integration testing, and small local prototypes.
 
-## 为什么需要 Pulsar Lite
+It is designed for fast local feedback, not as a production replacement for an
+Apache Pulsar cluster. Use Apache Pulsar for production workloads that require
+multi-broker scheduling, replication, capacity management, tenant isolation, or
+operational SLAs.
 
-很多应用只想快速验证一段消息链路：生产者写入、消费者订阅、Shared 分摊、Failover 接管、KeyShared 保序。真正耗时的往往不是 API，而是先准备一套可用的消息队列环境。
+## Why Pulsar Lite
 
-Pulsar Lite 的目标是把这段前置成本降下来：
+Many applications only need a local broker to validate the messaging path:
+producers, consumers, subscriptions, flow control, failover, and key-based
+routing. Setting up a full Pulsar deployment can be more expensive than the
+test or prototype itself.
 
-- 本地文件路径即可启动嵌入式 Broker。
-- 官方 Pulsar 客户端可以直接连接。
-- 本地开发和生产集群使用同一套 Pulsar API。
-- 测试可以使用独立本地路径，减少 topic / subscription 状态污染。
-- Agent 或脚本可以直接创建可用消息环境，继续完成原型验证。
+Pulsar Lite keeps the client-facing API close to Pulsar while reducing the
+local setup cost:
 
-![Pulsar Lite 快速连接流程](docs/assets/readme/quick-start-connection-flow.png)
+- Run a single local broker process.
+- Connect with the official Pulsar Python client.
+- Use Pulsar topic names such as `persistent://...` and `non-persistent://...`.
+- Exercise Shared, Failover, Exclusive, and KeyShared subscription behavior.
+- Use RocksDB-backed persistent storage when built with `rocksdb-storage`.
 
-## 当前能力
+## Current Capabilities
 
-| 能力 | 状态 | 说明 |
-| --- | --- | --- |
-| Pulsar 二进制协议 | 已支持核心命令 | Connect、Lookup、PartitionMetadata、Producer、Send、Subscribe、Flow、Ack、Close、Ping/Pong |
-| 官方 Python 客户端 | 可直连 | `pulsar.Client("pulsar://localhost:6650")` |
-| Pulsar Lite Python SDK | 可用 | `PulsarClient("./demo.db")` 自动启动本地 Broker |
-| Topic 命名 | 兼容 Pulsar URI | 支持 `persistent://...` 与 `non-persistent://...` 命名 |
-| 分区 Topic | 已支持 | `default_partitions > 0` 时自动使用分区 topic |
-| 订阅模式 | 已覆盖主要模式 | Shared、Failover、Exclusive，non-persistent 路径覆盖 KeyShared |
-| Non-persistent 实时语义 | 覆盖较完整 | 动态 consumer、顺序、flow control、断连重连、KeyShared 策略等测试已沉淀 |
-| Metadata / resources | 本地路径持久化 | tenant、namespace、topic、subscription 等资源语义逐步拆分中 |
-| 消息存储 | 当前为内存运行时 | managed-ledger 风格骨架已存在，生产级持久化仍在演进 |
+| Area | Status |
+| --- | --- |
+| Binary protocol | Core commands are implemented: Connect, Lookup, PartitionMetadata, Producer, Send, Subscribe, Flow, Ack, Close, Ping/Pong, redelivery paths. |
+| Official client compatibility | The official Pulsar Python client can connect to `pulsar://localhost:6650`. |
+| Topic names | Supports `persistent://...` and `non-persistent://...` topic URIs. |
+| Non-persistent topics | Dispatch-or-drop runtime semantics with coverage for flow control, disconnect/reconnect, ordering, dynamic consumers, and KeyShared routing. |
+| Persistent topics | RocksDB-backed managed-ledger style storage is available behind the `rocksdb-storage` feature. |
+| Subscription modes | Shared, Failover, Exclusive, and KeyShared are covered by Rust and Python integration tests. |
+| Partitioned topics | Default partition metadata and partition topic routing are supported for local testing. |
+| Python package | Provides a small helper SDK that can start and manage a local broker process. |
 
-## 快速开始
+## Requirements
 
-### 1. 构建 Broker
+- Rust stable with `rustfmt` and `clippy`.
+- Python 3.10 or newer for the tested development workflow.
+- `protobuf-compiler` / `protoc`.
+- RocksDB build dependencies for `rocksdb-storage`.
 
-```bash
-make build
-```
-
-等价于：
-
-```bash
-cd rust && cargo build --release
-```
-
-生成的 Broker 二进制位于：
-
-```text
-rust/target/release/pulsar-lite
-```
-
-### 2. 安装 Python SDK
+On Ubuntu:
 
 ```bash
-cd python
-pip install -e .
+sudo apt-get update
+sudo apt-get install -y protobuf-compiler clang libclang-dev
 ```
 
-Python SDK 依赖官方 `pulsar-client>=3.0.0`。
+On macOS:
 
-### 3. 嵌入式模式
+```bash
+brew install protobuf llvm
+```
 
-适合测试、demo、Notebook 和 Agent 原型。传入本地路径后，SDK 会自动启动本地 Broker。
+## Quick Start
+
+Build the broker with persistent storage support:
+
+```bash
+cd rust
+cargo build --release --features rocksdb-storage
+```
+
+Install the Python package in editable mode:
+
+```bash
+cd ../python
+pip install -e ".[dev]"
+```
+
+Start the local broker:
+
+```bash
+../rust/pulsar-lite.sh start
+```
+
+Connect with the official Pulsar client:
+
+```python
+import pulsar
+
+client = pulsar.Client("pulsar://localhost:6650")
+topic = "non-persistent://public/default/events"
+
+consumer = client.subscribe(topic, "demo-sub", consumer_type=pulsar.ConsumerType.Shared)
+producer = client.create_producer(topic)
+
+producer.send(b"event-1")
+message = consumer.receive(timeout_millis=5000)
+consumer.acknowledge(message)
+
+producer.close()
+consumer.close()
+client.close()
+```
+
+Stop the broker:
+
+```bash
+../rust/pulsar-lite.sh stop
+```
+
+## Embedded Python Usage
+
+The Python helper can start a local broker for short-lived tests or examples:
 
 ```python
 import pulsar
@@ -74,162 +121,94 @@ from pulsar_lite import PulsarClient
 topic = "non-persistent://public/default/quick-start"
 
 with PulsarClient("./demo.db") as client:
-    consumer = client.subscribe(
-        topic,
-        "quick-start-sub",
-        consumer_type=pulsar.ConsumerType.Shared,
-    )
+    consumer = client.subscribe(topic, "quick-start-sub", consumer_type=pulsar.ConsumerType.Shared)
     producer = client.create_producer(topic)
 
     producer.send(b"hello from pulsar lite")
-
-    msg = consumer.receive(timeout_millis=5000)
-    print(msg.data().decode("utf-8"))
-    consumer.acknowledge(msg)
-
-    producer.close()
-    consumer.close()
+    message = consumer.receive(timeout_millis=5000)
+    consumer.acknowledge(message)
 ```
 
-### 4. 官方客户端直连
+## Topic and Subscription Behavior
 
-先启动本地 Broker：
-
-```bash
-rust/pulsar-lite.sh start
-```
-
-默认监听：
-
-```text
-pulsar://localhost:6650
-```
-
-然后使用官方 Pulsar 客户端连接：
-
-```python
-import pulsar
-
-client = pulsar.Client("pulsar://localhost:6650")
-topic = "non-persistent://public/default/events"
-
-consumer = client.subscribe(
-    topic,
-    "demo-sub",
-    consumer_type=pulsar.ConsumerType.Shared,
-)
-producer = client.create_producer(topic)
-
-producer.send(b"event-1")
-msg = consumer.receive(timeout_millis=5000)
-consumer.acknowledge(msg)
-
-producer.close()
-consumer.close()
-client.close()
-```
-
-## 两种连接姿势
-
-| 写法 | 含义 | 适用场景 |
-| --- | --- | --- |
-| `PulsarClient("./demo.db")` | 自动启动并连接嵌入式 Broker | 测试、demo、Notebook、Agent 原型 |
-| `PulsarClient("pulsar://localhost:6650")` | 通过 SDK 连接已有 Broker | 本地服务或远程 Pulsar |
-| `pulsar.Client("pulsar://localhost:6650")` | 官方客户端直连 | 协议兼容验证 |
-
-## Topic 和订阅模式
-
-Pulsar Lite 兼容 Pulsar Topic URI：
+Pulsar Lite accepts standard Pulsar topic names:
 
 ```text
 persistent://public/default/my-topic
 non-persistent://public/default/my-topic
 ```
 
-如果要验证实时事件、任务触发、在线 consumer 分发，优先使用 `non-persistent://...`。如果要验证和生产 Pulsar 更接近的 Topic 命名和客户端调用路径，可以使用 `persistent://...`。需要注意，当前消息数据仍是内存运行时，不应把 Pulsar Lite 当成生产级持久化存储。
+Use `non-persistent://...` for live event dispatch where slow or disconnected
+consumers should not create a durable backlog. Use `persistent://...` when a
+test requires stored entries, cursor replay, acknowledgements across restart,
+or redelivery behavior. Persistent behavior requires a broker binary built with
+`--features rocksdb-storage`.
 
-订阅模式选择：
+Supported subscription modes:
 
-![Pulsar Lite 订阅模式](docs/assets/readme/subscription-modes.png)
+| Mode | Summary |
+| --- | --- |
+| Exclusive | One active consumer; additional consumers are rejected. |
+| Failover | One active consumer with standby takeover. |
+| Shared | Messages are distributed across available consumers. |
+| KeyShared | Messages with the same key are routed to the same consumer. |
 
-| 目标 | 推荐模式 | 说明 |
-| --- | --- | --- |
-| 单消费者独占处理 | `Exclusive` | 第二个 consumer 会被拒绝 |
-| 主备切换 | `Failover` | active 消费，standby 等待接管 |
-| 多消费者分摊任务 | `Shared` | 适合并发 worker |
-| 同 key 保序 | `KeyShared` | non-persistent 路径覆盖 Sticky / AutoSplit 相关语义 |
+## Development Commands
 
-## 配置
-
-默认配置文件：
-
-```text
-rust/pulsar-lite.toml
+```bash
+make build        # Build the Rust broker with rocksdb-storage
+make install      # Install the Python package in editable mode
+make test         # Run Rust and Python tests
+make test-rust    # Run Rust tests with rocksdb-storage
+make test-python  # Run Python integration tests with a local broker
+make fmt          # Format Rust and Python code
+make lint         # Run Rust clippy and Python ruff checks
 ```
 
-常用配置：
+The Python integration suite expects a broker binary with RocksDB support:
 
-| 配置项 | 默认值 | 说明 |
-| --- | --- | --- |
-| `addr` | `0.0.0.0:6650` | Broker 监听地址 |
-| `db_path` | `./pulsar-lite.db` | 本地 metadata / resource 路径 |
-| `default_partitions` | `0` | 新 topic 默认分区数，`0` 表示非分区 |
-| `log_level` | `info` | 日志级别 |
-| `keep_alive_interval_secs` | `30` | 心跳间隔 |
-| `max_connections` | `0` | 最大连接数，`0` 表示不限制 |
-| `max_connections_per_ip` | `0` | 单 IP 最大连接数，`0` 表示不限制 |
-| `max_message_size_bytes` | `5242880` | 单条消息大小上限 |
+```bash
+cd rust
+cargo build --release --features rocksdb-storage
+cd ../python
+PULSAR_LITE_BINARY=../rust/target/release/pulsar-lite pytest ../tests/ -q
+```
 
-## 架构概览
-
-![Pulsar Lite 架构](docs/assets/readme/pulsar-lite-architecture.png)
-
-## 主要目录
+## Repository Layout
 
 ```text
 pulsar-lite/
-├── rust/                    # Rust Broker
-│   ├── src/broker/          # 连接、服务、dispatcher、non-persistent runtime
-│   ├── src/protocol/        # Pulsar 二进制协议编解码
-│   ├── src/storage/         # metadata/resources/managed-ledger 相关模块
-│   └── proto/PulsarApi.proto
-├── python/                  # Python SDK 与进程管理
-├── examples/                # 基础示例
-├── tests/                   # Python 集成测试、non-persistent 语义测试、perf 脚本
-└── docs/                    # 设计、差异、协议、性能和测试覆盖文档
+├── rust/                  # Rust broker implementation
+│   ├── src/broker/        # Broker service, connection handling, dispatchers
+│   ├── src/protocol/      # Pulsar binary protocol codec and commands
+│   ├── src/storage/       # Metadata, resources, managed ledger, RocksDB storage
+│   └── proto/             # Pulsar protobuf definitions
+├── python/                # Python helper package and broker process manager
+├── tests/                 # Python integration and behavior tests
+├── examples/              # Small Python usage examples
+└── docs/                  # Protocol, design, comparison, test, and perf notes
 ```
 
-## 开发命令
+## Documentation
 
-```bash
-make build        # 构建 Rust Broker
-make install      # 安装 Python SDK（开发模式）
-make test         # 运行 Rust + Python 测试
-make test-rust    # 运行 Rust 测试
-make test-python  # 运行 Python 集成测试
-make fmt          # 格式化 Rust / Python
-make lint         # cargo clippy + ruff
-```
+- [Documentation index](docs/README.md)
+- [Contributing guide](docs/CONTRIBUTING.md)
+- [Pulsar binary protocol notes](docs/PULSAR_BINARY_PROTOCOL.md)
+- [Changelog](docs/CHANGELOG.md)
 
+## Project Boundaries
 
-## 与 Apache Pulsar 的关系
+Pulsar Lite intentionally does not provide:
 
-| 维度 | Pulsar Lite | Apache Pulsar |
-| --- | --- | --- |
-| 定位 | 本地开发、测试、demo、Agent 原型 | 生产级云原生消息平台 |
-| 部署 | 单进程本地 Broker / 嵌入式启动 | 多组件分布式集群 |
-| 客户端 | 官方 Pulsar 客户端 | 官方 Pulsar 客户端 |
-| 协议 | 实现核心 Pulsar 二进制协议命令 | 完整协议与生态 |
-| 存储 | 当前消息状态为内存运行时 | BookKeeper / Managed Ledger |
-| 运维 | 本地进程和文件路径 | 集群容量、高可用、复制、治理 |
+- Multi-broker coordination or load balancing.
+- Cross-cluster replication.
+- Production-grade authorization or tenant governance.
+- BookKeeper compatibility.
+- Production durability or availability guarantees.
 
-## 当前边界
+The project is useful for local development and compatibility testing, but
+production deployments should use Apache Pulsar.
 
-- 不提供生产集群级别的多 Broker 调度、跨节点复制和容量治理。
-- 当前消息数据仍是内存运行时；managed-ledger 风格持久化仍在演进。
-- non-persistent 路径已沉淀较完整语义覆盖，但 redelivery、negative ack、ack timeout 等行为仍有明确边界。
-- 如果业务依赖生产级消息保留、跨节点高可用、多租户治理或 SLA，应直接使用 Apache Pulsar。
+## License
 
-## 许可证
-
-Apache License 2.0
+Pulsar Lite is licensed under the [Apache License 2.0](LICENSE).

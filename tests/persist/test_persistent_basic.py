@@ -249,9 +249,7 @@ def test_persistent_cumulative_ack_survives_restart(tmp_path, unique_name):
             client.close()
 
 
-def test_persistent_send_async_returns_ids_and_payloads_survive_restart(
-    tmp_path, unique_name
-):
+def test_persistent_send_async_returns_ids_and_payloads_survive_restart(tmp_path, unique_name):
     db_path = tmp_path / "persistent.db"
     topic = persistent_topic(unique_name, "persist-async-send")
     subscription = unique_name("persist-sub")
@@ -323,9 +321,7 @@ def test_persistent_unsubscribe_deletes_subscription_cursor(tmp_path, unique_nam
             client.close()
 
 
-def test_persistent_consumer_seek_to_message_id_redelivers_from_target(
-    tmp_path, unique_name
-):
+def test_persistent_consumer_seek_to_message_id_redelivers_from_target(tmp_path, unique_name):
     db_path = tmp_path / "persistent.db"
     topic = persistent_topic(unique_name, "persist-seek-message-id")
     subscription = unique_name("persist-sub")

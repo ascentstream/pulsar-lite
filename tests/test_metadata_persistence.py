@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pulsar
 import pytest
-
 from test_support import persistent_topic
 
 
@@ -19,9 +18,7 @@ def _load_metadata_document(metadata_path: Path) -> dict:
 
 
 def _resource_file_key(document: dict) -> str:
-    candidates = [
-        key for key in document.keys() if key not in {"version", "partitioned_topics"}
-    ]
+    candidates = [key for key in document.keys() if key not in {"version", "partitioned_topics"}]
     assert candidates, f"No metadata resource file key found in document: {document}"
     assert len(candidates) == 1, f"Expected one metadata resource file key, got: {candidates}"
     return candidates[0]
@@ -151,9 +148,7 @@ def test_partitioned_topic_metadata_is_recorded_in_shared_metadata_file(
     persistent_topics = _persistent_topics(document)
     assert partition_count > 0
     assert topic_name not in persistent_topics
-    assert any(
-        name.startswith(f"{topic_name}-partition-") for name in persistent_topics
-    )
+    assert any(name.startswith(f"{topic_name}-partition-") for name in persistent_topics)
 
 
 def test_partition_subscription_is_persisted_under_concrete_partition_topic(

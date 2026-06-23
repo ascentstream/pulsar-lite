@@ -6,8 +6,8 @@ from __future__ import annotations
 import time
 
 import pulsar
-
 from test_support import persistent_topic
+
 
 # 测试 Shared 订阅模式下，receiver_queue_size=1 时的 flow-control 行为
 def test_shared_flow_control_with_small_receiver_queue(broker_url, unique_name):
@@ -39,6 +39,7 @@ def test_shared_flow_control_with_small_receiver_queue(broker_url, unique_name):
         assert received == payloads
     finally:
         client.close()
+
 
 # 测试 Shared 订阅模式下，receiver_queue_size=1 时，当一个 consumer 满了之后，不应该继续收到新消息
 def test_shared_flow_full_consumer_stops_receiving_new_messages(broker_url, unique_name):
@@ -88,6 +89,7 @@ def test_shared_flow_full_consumer_stops_receiving_new_messages(broker_url, uniq
     finally:
         client.close()
 
+
 # 满掉的 consumer，在自己缓冲被消费掉之后，应该还能恢复接收。
 def test_shared_flow_consumer_resumes_after_buffer_is_drained(broker_url, unique_name):
     client = pulsar.Client(broker_url)
@@ -130,10 +132,9 @@ def test_shared_flow_consumer_resumes_after_buffer_is_drained(broker_url, unique
     finally:
         client.close()
 
+
 # Shared 分发时，应优先发给当前还有可用接收能力的 consumer。
-def test_shared_flow_prefers_consumers_with_available_receive_capacity(
-    broker_url, unique_name
-):
+def test_shared_flow_prefers_consumers_with_available_receive_capacity(broker_url, unique_name):
     client = pulsar.Client(broker_url)
     topic = persistent_topic(unique_name("shared-flow-capacity"))
     subscription = unique_name("shared-sub")

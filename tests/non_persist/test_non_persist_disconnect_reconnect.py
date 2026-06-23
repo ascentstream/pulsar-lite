@@ -16,7 +16,6 @@ from non_persist.support import (
     wait_for_delivery_ready,
 )
 
-
 CLIENT_PROCESS = Path(__file__).resolve().parents[1] / "pulsar_client_process.py"
 READY_SENTINEL = "__PULSAR_LITE_READY__"
 

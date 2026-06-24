@@ -106,10 +106,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends protobuf-compiler
 
-      - name: Install macOS system dependencies
+      - name: Install protoc (macOS)
         if: steps.should-run.outputs.skip != 'true' && runner.os == 'macOS'
-        shell: bash
-        run: brew install protobuf
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install protoc (Windows)
         if: steps.should-run.outputs.skip != 'true' && runner.os == 'Windows'

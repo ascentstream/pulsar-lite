@@ -50,6 +50,7 @@ jobs:
   build:
     name: Build wheel (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
+    # version-check 只在 tag push 时需要，手动触发时可以跳过
     needs: [version-check]
     if: |
       always() &&
@@ -255,10 +256,13 @@ jobs:
 
   publish:
     name: Publish to ${{ github.event.inputs.target || 'pypi' }}
-    needs: [version-check, build]
+    needs: [build]
     runs-on: ubuntu-latest
     # 跳过 artifacts-only 模式
-    if: github.event.inputs.target != 'artifacts-only'
+    if: |
+      always() &&
+      (needs.build.result == 'success') &&
+      (github.event.inputs.target != 'artifacts-only')
     environment:
       name: ${{ (github.event.inputs.target == 'pypi' || startsWith(github.ref, 'refs/tags/v')) && 'pypi' || 'testpypi' }}
 

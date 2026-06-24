@@ -53,8 +53,7 @@ jobs:
     needs: [version-check]
     if: |
       always() &&
-      (needs.version-check.result == 'success' || needs.version-check.result == 'skipped') &&
-      (github.event.inputs.target != 'artifacts-only' || !matrix.skip-in-fast-mode)
+      (needs.version-check.result == 'success' || needs.version-check.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
@@ -63,24 +62,32 @@ jobs:
             os: ubuntu-latest
             artifact-name: pulsar-lite-linux-x86_64-wheel
             binary-name: pulsar-lite
-            skip-in-fast-mode: false
           - label: macos-arm64
             os: macos-latest
             artifact-name: pulsar-lite-macos-arm64-wheel
             binary-name: pulsar-lite
-            skip-in-fast-mode: false
           - label: macos-x86_64
             os: macos-13
             artifact-name: pulsar-lite-macos-x86_64-wheel
             binary-name: pulsar-lite
+            # 仅在非 artifacts-only 模式构建
             skip-in-fast-mode: true
           - label: windows-x86_64
             os: windows-latest
             artifact-name: pulsar-lite-windows-x86_64-wheel
             binary-name: pulsar-lite.exe
+            # 仅在非 artifacts-only 模式构建
             skip-in-fast-mode: true
 
     steps:
+      - name: Check if should skip (artifacts-only mode)
+        run: |
+          if [ "${{ github.event.inputs.target }}" = "artifacts-only" ] && [ "${{ matrix.skip-in-fast-mode }}" = "true" ]; then
+            echo "⏭️ Skipping ${{ matrix.label }} in artifacts-only mode"
+            exit 0
+          fi
+          echo "✅ Building ${{ matrix.label }}"
+
       - name: Checkout
         uses: actions/checkout@v6
 

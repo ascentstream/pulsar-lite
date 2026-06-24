@@ -165,45 +165,19 @@ jobs:
         run: uv build --sdist --python 3.10 --managed-python --out-dir dist
         # sdist 是平台无关的，只需要在一个平台上构建一次
 
-      - name: Install wheel repair tools (Linux)
-        if: steps.should-run.outputs.skip != 'true' && runner.os == 'Linux' && github.event.inputs.target != 'artifacts-only'
+      - name: Show Linux wheel policy (auditwheel)
+        if: steps.should-run.outputs.skip != 'true' && runner.os == 'Linux'
+        working-directory: python
         shell: bash
         run: |
           uv tool install auditwheel
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-
-      - name: Install wheel repair tools (macOS)
-        if: steps.should-run.outputs.skip != 'true' && runner.os == 'macOS' && github.event.inputs.target != 'artifacts-only'
-        shell: bash
-        run: uv tool install delocate
-
-      - name: Repair wheel (Linux - manylinux)
-        if: steps.should-run.outputs.skip != 'true' && runner.os == 'Linux' && github.event.inputs.target != 'artifacts-only'
-        working-directory: python
-        shell: bash
-        run: |
-          mkdir -p dist-repaired
+          export PATH="$HOME/.local/bin:$PATH"
+          # setup.py already tags the wheel manylinux_2_17_x86_64 directly,
+          # because the bundled Rust broker is a static binary with no glibc
+          # coupling. auditwheel is kept only as a diagnostic; we do not let
+          # it rewrite the wheel (it cannot analyze a static Rust binary and
+          # would silently fail).
           auditwheel show dist/*.whl || true
-          if auditwheel repair dist/*.whl -w dist-repaired --plat manylinux_2_17_x86_64; then
-            echo "Wheel repaired with manylinux tag"
-          else
-            echo "WARNING: auditwheel failed, keeping original wheel (may not be manylinux-compliant)"
-            cp dist/*.whl dist-repaired/
-          fi
-          rm -rf dist
-          mv dist-repaired dist
-
-      - name: Repair wheel (macOS - delocate)
-        if: steps.should-run.outputs.skip != 'true' && runner.os == 'macOS' && github.event.inputs.target != 'artifacts-only'
-        working-directory: python
-        shell: bash
-        run: |
-          mkdir -p dist-repaired
-          for wheel in dist/*.whl; do
-            delocate-wheel -w dist-repaired "$wheel"
-          done
-          rm -rf dist
-          mv dist-repaired dist
 
       - name: Inspect wheel contents
         if: steps.should-run.outputs.skip != 'true'
@@ -296,7 +270,6 @@ jobs:
         run: |
           mkdir -p checksums
           cd dist
-          # 只对真正的发行物计算校验和，避免把非发行物文件也写进 SHA256SUMS
           shopt -s nullglob
           artifacts=(*.whl *.tar.gz)
           shopt -u nullglob

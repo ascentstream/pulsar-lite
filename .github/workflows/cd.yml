@@ -68,11 +68,6 @@ jobs:
             artifact-name: pulsar-lite-macos-arm64-wheel
             binary-name: pulsar-lite
             fast-mode: true
-          - label: macos-x86_64
-            os: macos-13
-            artifact-name: pulsar-lite-macos-x86_64-wheel
-            binary-name: pulsar-lite
-            fast-mode: false
           - label: windows-x86_64
             os: windows-latest
             artifact-name: pulsar-lite-windows-x86_64-wheel

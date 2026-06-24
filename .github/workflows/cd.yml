@@ -53,41 +53,36 @@ jobs:
     needs: [version-check]
     if: |
       always() &&
-      (needs.version-check.result == 'success' || needs.version-check.result == 'skipped')
+      (needs.version-check.result == 'success' || needs.version-check.result == 'skipped') &&
+      (github.event.inputs.target != 'artifacts-only' || matrix.include-in-fast-mode == true)
     strategy:
       fail-fast: false
       matrix:
         include:
+          # 这两个平台在所有模式下都构建
           - label: linux-x86_64
             os: ubuntu-latest
             artifact-name: pulsar-lite-linux-x86_64-wheel
             binary-name: pulsar-lite
+            include-in-fast-mode: true
           - label: macos-arm64
             os: macos-latest
             artifact-name: pulsar-lite-macos-arm64-wheel
             binary-name: pulsar-lite
+            include-in-fast-mode: true
+          # 这两个平台仅在完整模式下构建
           - label: macos-x86_64
             os: macos-13
             artifact-name: pulsar-lite-macos-x86_64-wheel
             binary-name: pulsar-lite
-            # 仅在非 artifacts-only 模式构建
-            skip-in-fast-mode: true
+            include-in-fast-mode: false
           - label: windows-x86_64
             os: windows-latest
             artifact-name: pulsar-lite-windows-x86_64-wheel
             binary-name: pulsar-lite.exe
-            # 仅在非 artifacts-only 模式构建
-            skip-in-fast-mode: true
+            include-in-fast-mode: false
 
     steps:
-      - name: Check if should skip (artifacts-only mode)
-        run: |
-          if [ "${{ github.event.inputs.target }}" = "artifacts-only" ] && [ "${{ matrix.skip-in-fast-mode }}" = "true" ]; then
-            echo "⏭️ Skipping ${{ matrix.label }} in artifacts-only mode"
-            exit 0
-          fi
-          echo "✅ Building ${{ matrix.label }}"
-
       - name: Checkout
         uses: actions/checkout@v6
 
@@ -203,7 +198,7 @@ jobs:
           python -c "import pulsar_lite; print('✅ Package imported successfully')"
 
           # 验证二进制文件存在且可执行
-          python -c "from pulsar_lite.binary_finder import find_binary; binary = find_binary(); print(f'✅ Binary found at: {binary}')"
+          python -c "from pulsar_lite.binary_finder import find_pulsar_lite_binary; binary = find_pulsar_lite_binary(); print(f'✅ Binary found at: {binary}')"
 
           # 清理
           deactivate 2>/dev/null || true

@@ -50,6 +50,7 @@ jobs:
   build:
     name: Build wheel (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
+    # version-check 只在 tag push 时需要，手动触发时可以跳过
     needs: [version-check]
     if: |
       always() &&
@@ -62,154 +63,164 @@ jobs:
             os: ubuntu-latest
             artifact-name: pulsar-lite-linux-x86_64-wheel
             binary-name: pulsar-lite
+            fast-mode: true
           - label: macos-arm64
             os: macos-latest
             artifact-name: pulsar-lite-macos-arm64-wheel
             binary-name: pulsar-lite
-          - label: macos-x86_64
-            os: macos-13
-            artifact-name: pulsar-lite-macos-x86_64-wheel
-            binary-name: pulsar-lite
-            # 仅在非 artifacts-only 模式构建
-            skip-in-fast-mode: true
+            fast-mode: true
           - label: windows-x86_64
             os: windows-latest
             artifact-name: pulsar-lite-windows-x86_64-wheel
             binary-name: pulsar-lite.exe
-            # 仅在非 artifacts-only 模式构建
-            skip-in-fast-mode: true
+            fast-mode: false
 
     steps:
-      - name: Check if should skip (artifacts-only mode)
+      # 在 artifacts-only 模式下跳过 fast-mode=false 的平台
+      - name: Check if should run
+        id: should-run
+        shell: bash
         run: |
-          if [ "${{ github.event.inputs.target }}" = "artifacts-only" ] && [ "${{ matrix.skip-in-fast-mode }}" = "true" ]; then
-            echo "⏭️ Skipping ${{ matrix.label }} in artifacts-only mode"
-            exit 0
+          target="${{ github.event.inputs.target }}"
+          fast_mode="${{ matrix.fast-mode }}"
+          if [[ "$target" == "artifacts-only" && "$fast_mode" == "false" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping ${{ matrix.label }} in artifacts-only mode"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Building ${{ matrix.label }}"
           fi
-          echo "✅ Building ${{ matrix.label }}"
 
       - name: Checkout
+        if: steps.should-run.outputs.skip != 'true'
         uses: actions/checkout@v6
 
       - name: Install Linux system dependencies
-        if: runner.os == 'Linux'
+        if: steps.should-run.outputs.skip != 'true' && runner.os == 'Linux'
+        shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends protobuf-compiler
 
-      - name: Install macOS system dependencies
-        if: runner.os == 'macOS'
-        run: brew install protobuf
+      - name: Install protoc (macOS)
+        if: steps.should-run.outputs.skip != 'true' && runner.os == 'macOS'
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Windows system dependencies
-        if: runner.os == 'Windows'
-        run: |
-          choco install protoc -y
-          refreshenv
+      - name: Install protoc (Windows)
+        if: steps.should-run.outputs.skip != 'true' && runner.os == 'Windows'
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust
+        if: steps.should-run.outputs.skip != 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install uv
+        if: steps.should-run.outputs.skip != 'true'
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           enable-cache: false
 
       - name: Build Rust broker
+        if: steps.should-run.outputs.skip != 'true'
+        shell: bash
         run: cargo build --manifest-path rust/Cargo.toml --release
 
       - name: Copy broker binary into Python package
+        if: steps.should-run.outputs.skip != 'true'
+        shell: bash
         run: |
           mkdir -p python/src/pulsar_lite/bin
           cp rust/target/release/${{ matrix.binary-name }} python/src/pulsar_lite/bin/${{ matrix.binary-name }}
 
       - name: Set executable permission (Unix only)
-        if: runner.os != 'Windows'
+        if: steps.should-run.outputs.skip != 'true' && runner.os != 'Windows'
+        shell: bash
         run: chmod +x python/src/pulsar_lite/bin/${{ matrix.binary-name }}
 
       - name: Inspect broker binary architecture
-        if: runner.os != 'Windows'
+        if: steps.should-run.outputs.skip != 'true' && runner.os != 'Windows'
+        shell: bash
         run: file python/src/pulsar_lite/bin/${{ matrix.binary-name }}
 
       - name: Inspect broker binary (Windows)
-        if: runner.os == 'Windows'
+        if: steps.should-run.outputs.skip != 'true' && runner.os == 'Windows'
         shell: pwsh
         run: |
           Get-Item python/src/pulsar_lite/bin/${{ matrix.binary-name }} | Format-List
 
       - name: Build Python wheel
+        if: steps.should-run.outputs.skip != 'true'
         working-directory: python
         run: uv build --wheel --python 3.10 --managed-python --out-dir dist
 
       - name: Build source distribution (linux only)
-        if: runner.os == 'Linux'
+        if: steps.should-run.outputs.skip != 'true' && runner.os == 'Linux'
         working-directory: python
         run: uv build --sdist --python 3.10 --managed-python --out-dir dist
         # sdist 是平台无关的，只需要在一个平台上构建一次
 
-      - name: Install wheel repair tools (Linux)
-        if: runner.os == 'Linux' && github.event.inputs.target != 'artifacts-only'
+      - name: Show Linux wheel policy (auditwheel)
+        if: steps.should-run.outputs.skip != 'true' && runner.os == 'Linux'
+        working-directory: python
+        shell: bash
         run: |
           uv tool install auditwheel
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-
-      - name: Install wheel repair tools (macOS)
-        if: runner.os == 'macOS' && github.event.inputs.target != 'artifacts-only'
-        run: uv tool install delocate
-
-      - name: Repair wheel (Linux - manylinux)
-        if: runner.os == 'Linux' && github.event.inputs.target != 'artifacts-only'
-        working-directory: python
-        run: |
-          mkdir -p dist-repaired
+          export PATH="$HOME/.local/bin:$PATH"
+          # setup.py already tags the wheel manylinux_2_17_x86_64 directly,
+          # because the bundled Rust broker is a static binary with no glibc
+          # coupling. auditwheel is kept only as a diagnostic; we do not let
+          # it rewrite the wheel (it cannot analyze a static Rust binary and
+          # would silently fail).
           auditwheel show dist/*.whl || true
-          auditwheel repair dist/*.whl -w dist-repaired --plat manylinux_2_17_x86_64 || cp dist/*.whl dist-repaired/
-          rm -rf dist
-          mv dist-repaired dist
-
-      - name: Repair wheel (macOS - delocate)
-        if: runner.os == 'macOS' && github.event.inputs.target != 'artifacts-only'
-        working-directory: python
-        run: |
-          mkdir -p dist-repaired
-          for wheel in dist/*.whl; do
-            delocate-wheel -w dist-repaired "$wheel"
-          done
-          rm -rf dist
-          mv dist-repaired dist
 
       - name: Inspect wheel contents
+        if: steps.should-run.outputs.skip != 'true'
         working-directory: python
         shell: bash
         run: |
           uv run --python 3.10 --managed-python --no-project python -m zipfile -l dist/*.whl | grep "pulsar_lite/bin/${{ matrix.binary-name }}"
 
       - name: Inspect built artifacts
+        if: steps.should-run.outputs.skip != 'true'
         working-directory: python
+        shell: bash
         run: ls -lh dist/
 
       - name: Test wheel installation
+        if: steps.should-run.outputs.skip != 'true'
         working-directory: python
         shell: bash
         run: |
-          # 创建临时虚拟环境测试安装
+          # 创建临时虚拟环境测试安装（不激活，直接用 uv 指定 python 路径）
           uv venv --python 3.10 .test-venv
-          source .test-venv/bin/activate 2>/dev/null || .test-venv/Scripts/activate
 
-          # 安装构建的 wheel
-          uv pip install dist/*.whl
+          # Unix 用 .test-venv/bin/python，Windows 用 .test-venv/Scripts/python.exe
+          if [ -f ".test-venv/bin/python" ]; then
+            VENV_PY=".test-venv/bin/python"
+          else
+            VENV_PY=".test-venv/Scripts/python.exe"
+          fi
+
+          # 安装构建的 wheel 到该 venv
+          uv pip install --python "$VENV_PY" dist/*.whl
 
           # 验证包可导入
-          python -c "import pulsar_lite; print('✅ Package imported successfully')"
+          "$VENV_PY" -c "import pulsar_lite; print('Package imported successfully')"
 
-          # 验证二进制文件存在且可执行
-          python -c "from pulsar_lite.binary_finder import find_binary; binary = find_binary(); print(f'✅ Binary found at: {binary}')"
+          # 验证二进制查找逻辑能定位到打包的二进制
+          "$VENV_PY" -c "from pulsar_lite.binary_finder import find_pulsar_lite_binary; b = find_pulsar_lite_binary(); print(f'Binary found at: {b}')"
 
           # 清理
-          deactivate 2>/dev/null || true
           rm -rf .test-venv
 
       - name: Upload wheel artifact
+        if: steps.should-run.outputs.skip != 'true'
         uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.artifact-name }}
@@ -219,10 +230,13 @@ jobs:
 
   publish:
     name: Publish to ${{ github.event.inputs.target || 'pypi' }}
-    needs: [version-check, build]
+    needs: [build]
     runs-on: ubuntu-latest
     # 跳过 artifacts-only 模式
-    if: github.event.inputs.target != 'artifacts-only'
+    if: |
+      always() &&
+      (needs.build.result == 'success') &&
+      (github.event.inputs.target != 'artifacts-only')
     environment:
       name: ${{ (github.event.inputs.target == 'pypi' || startsWith(github.ref, 'refs/tags/v')) && 'pypi' || 'testpypi' }}
 
@@ -237,6 +251,7 @@ jobs:
           merge-multiple: true
 
       - name: Inspect collected artifacts
+        shell: bash
         run: |
           echo "=== Collected distributions ==="
           ls -lh dist/
@@ -251,13 +266,31 @@ jobs:
           echo "Source distributions: $(ls -1 dist/*.tar.gz 2>/dev/null | wc -l)"
 
       - name: Generate checksums
+        shell: bash
         run: |
+          mkdir -p checksums
           cd dist
-          sha256sum * > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+          shopt -s nullglob
+          artifacts=(*.whl *.tar.gz)
+          shopt -u nullglob
+          if [ ${#artifacts[@]} -eq 0 ]; then
+            echo "No wheels or sdists found in dist/"
+            exit 1
+          fi
+          sha256sum "${artifacts[@]}" > "../checksums/SHA256SUMS.txt"
+          cat "../checksums/SHA256SUMS.txt"
+
+      - name: Upload checksums artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: pulsar-lite-checksums
+          path: checksums/SHA256SUMS.txt
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Determine target repository
         id: target
+        shell: bash
         run: |
           if [ "${{ github.event_name }}" = "push" ]; then
             echo "repository=pypi" >> "$GITHUB_OUTPUT"

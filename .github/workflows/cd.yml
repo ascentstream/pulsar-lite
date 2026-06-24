@@ -294,9 +294,25 @@ jobs:
       - name: Generate checksums
         shell: bash
         run: |
+          mkdir -p checksums
           cd dist
-          sha256sum * > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+          shopt -s nullglob
+          artifacts=(*.whl *.tar.gz)
+          shopt -u nullglob
+          if [ ${#artifacts[@]} -eq 0 ]; then
+            echo "No wheels or sdists found in dist/"
+            exit 1
+          fi
+          sha256sum "${artifacts[@]}" > "../checksums/SHA256SUMS.txt"
+          cat "../checksums/SHA256SUMS.txt"
+
+      - name: Upload checksums artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: pulsar-lite-checksums
+          path: checksums/SHA256SUMS.txt
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Determine target repository
         id: target

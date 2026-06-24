@@ -1,0 +1,276 @@
+name: CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Build target
+        required: true
+        default: artifacts-only
+        type: choice
+        options:
+          - artifacts-only
+          - testpypi
+          - pypi
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  version-check:
+    name: Verify version consistency
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Check tag and pyproject.toml version match
+        run: |
+          TAG_VERSION=${GITHUB_REF#refs/tags/v}
+          PKG_VERSION=$(grep '^version = ' python/pyproject.toml | cut -d'"' -f2)
+
+          echo "Git tag version: v$TAG_VERSION"
+          echo "pyproject.toml version: $PKG_VERSION"
+
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "❌ Version mismatch detected!"
+            echo "   Git tag: v$TAG_VERSION"
+            echo "   pyproject.toml: $PKG_VERSION"
+            echo ""
+            echo "Please update python/pyproject.toml to match the tag version."
+            exit 1
+          fi
+
+          echo "✅ Version consistency verified: $PKG_VERSION"
+
+  build:
+    name: Build wheel (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    needs: [version-check]
+    if: |
+      always() &&
+      (needs.version-check.result == 'success' || needs.version-check.result == 'skipped') &&
+      (github.event.inputs.target != 'artifacts-only' || !matrix.skip-in-fast-mode)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            os: ubuntu-latest
+            artifact-name: pulsar-lite-linux-x86_64-wheel
+            binary-name: pulsar-lite
+            skip-in-fast-mode: false
+          - label: macos-arm64
+            os: macos-latest
+            artifact-name: pulsar-lite-macos-arm64-wheel
+            binary-name: pulsar-lite
+            skip-in-fast-mode: false
+          - label: macos-x86_64
+            os: macos-13
+            artifact-name: pulsar-lite-macos-x86_64-wheel
+            binary-name: pulsar-lite
+            skip-in-fast-mode: true
+          - label: windows-x86_64
+            os: windows-latest
+            artifact-name: pulsar-lite-windows-x86_64-wheel
+            binary-name: pulsar-lite.exe
+            skip-in-fast-mode: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install macOS system dependencies
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install Windows system dependencies
+        if: runner.os == 'Windows'
+        run: |
+          choco install protoc -y
+          refreshenv
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: false
+
+      - name: Build Rust broker
+        run: cargo build --manifest-path rust/Cargo.toml --release
+
+      - name: Copy broker binary into Python package
+        run: |
+          mkdir -p python/src/pulsar_lite/bin
+          cp rust/target/release/${{ matrix.binary-name }} python/src/pulsar_lite/bin/${{ matrix.binary-name }}
+
+      - name: Set executable permission (Unix only)
+        if: runner.os != 'Windows'
+        run: chmod +x python/src/pulsar_lite/bin/${{ matrix.binary-name }}
+
+      - name: Inspect broker binary architecture
+        if: runner.os != 'Windows'
+        run: file python/src/pulsar_lite/bin/${{ matrix.binary-name }}
+
+      - name: Inspect broker binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-Item python/src/pulsar_lite/bin/${{ matrix.binary-name }} | Format-List
+
+      - name: Build Python wheel
+        working-directory: python
+        run: uv build --wheel --python 3.10 --managed-python --out-dir dist
+
+      - name: Build source distribution (linux only)
+        if: runner.os == 'Linux'
+        working-directory: python
+        run: uv build --sdist --python 3.10 --managed-python --out-dir dist
+        # sdist 是平台无关的，只需要在一个平台上构建一次
+
+      - name: Install wheel repair tools (Linux)
+        if: runner.os == 'Linux' && github.event.inputs.target != 'artifacts-only'
+        run: |
+          uv tool install auditwheel
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install wheel repair tools (macOS)
+        if: runner.os == 'macOS' && github.event.inputs.target != 'artifacts-only'
+        run: uv tool install delocate
+
+      - name: Repair wheel (Linux - manylinux)
+        if: runner.os == 'Linux' && github.event.inputs.target != 'artifacts-only'
+        working-directory: python
+        run: |
+          mkdir -p dist-repaired
+          auditwheel show dist/*.whl || true
+          auditwheel repair dist/*.whl -w dist-repaired --plat manylinux_2_17_x86_64 || cp dist/*.whl dist-repaired/
+          rm -rf dist
+          mv dist-repaired dist
+
+      - name: Repair wheel (macOS - delocate)
+        if: runner.os == 'macOS' && github.event.inputs.target != 'artifacts-only'
+        working-directory: python
+        run: |
+          mkdir -p dist-repaired
+          for wheel in dist/*.whl; do
+            delocate-wheel -w dist-repaired "$wheel"
+          done
+          rm -rf dist
+          mv dist-repaired dist
+
+      - name: Inspect wheel contents
+        working-directory: python
+        shell: bash
+        run: |
+          uv run --python 3.10 --managed-python --no-project python -m zipfile -l dist/*.whl | grep "pulsar_lite/bin/${{ matrix.binary-name }}"
+
+      - name: Inspect built artifacts
+        working-directory: python
+        run: ls -lh dist/
+
+      - name: Test wheel installation
+        working-directory: python
+        shell: bash
+        run: |
+          # 创建临时虚拟环境测试安装
+          uv venv --python 3.10 .test-venv
+          source .test-venv/bin/activate 2>/dev/null || .test-venv/Scripts/activate
+
+          # 安装构建的 wheel
+          uv pip install dist/*.whl
+
+          # 验证包可导入
+          python -c "import pulsar_lite; print('✅ Package imported successfully')"
+
+          # 验证二进制文件存在且可执行
+          python -c "from pulsar_lite.binary_finder import find_binary; binary = find_binary(); print(f'✅ Binary found at: {binary}')"
+
+          # 清理
+          deactivate 2>/dev/null || true
+          rm -rf .test-venv
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact-name }}
+          path: python/dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish to ${{ github.event.inputs.target || 'pypi' }}
+    needs: [version-check, build]
+    runs-on: ubuntu-latest
+    # 跳过 artifacts-only 模式
+    if: github.event.inputs.target != 'artifacts-only'
+    environment:
+      name: ${{ (github.event.inputs.target == 'pypi' || startsWith(github.ref, 'refs/tags/v')) && 'pypi' || 'testpypi' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Inspect collected artifacts
+        run: |
+          echo "=== Collected distributions ==="
+          ls -lh dist/
+          echo ""
+          echo "=== Wheel platform tags ==="
+          for f in dist/*.whl; do
+            basename "$f"
+          done
+          echo ""
+          echo "=== Total artifacts ==="
+          echo "Wheels: $(ls -1 dist/*.whl 2>/dev/null | wc -l)"
+          echo "Source distributions: $(ls -1 dist/*.tar.gz 2>/dev/null | wc -l)"
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Determine target repository
+        id: target
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "repository=pypi" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.inputs.target }}" = "pypi" ]; then
+            echo "repository=pypi" >> "$GITHUB_OUTPUT"
+          else
+            echo "repository=testpypi" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to TestPyPI
+        if: steps.target.outputs.repository == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          password: ${{ secrets.TESTPYPI_API_TOKEN }}
+          skip-existing: true
+
+      - name: Publish to PyPI
+        if: steps.target.outputs.repository == 'pypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true

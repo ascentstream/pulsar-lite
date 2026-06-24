@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "pulsar-lite"
 version = "0.1.0"
 description = "Embedded Apache Pulsar-compatible broker for local development"
-authors = [{name = "Pulsar Lite Team", email = "pulsar-lite@example.com"}]
+authors = [{name = "Ascentstream", email = "community@ascentstream.com"}]
 license = {text = "Apache-2.0"}
 readme = "README.md"
 requires-python = ">=3.8"

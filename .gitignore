@@ -66,3 +66,12 @@ docs/perf/data/non_persistent_e2e_matrix_results.json
 
 # Cache
 /.cache/
+
+# Python virtualenv
+.venv/
+venv/
+env/
+
+# Rust broker binary copied into Python package for wheel build
+python/src/pulsar_lite/bin/
+

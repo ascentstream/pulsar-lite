@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pulsar-lite"
 version = "0.1.0"
-description = "Embedded lightweight message queue compatible with Apache Pulsar - Milvus Lite style experience"
+description = "Embedded Apache Pulsar-compatible broker for local development"
 authors = [{name = "Pulsar Lite Team", email = "pulsar-lite@example.com"}]
 license = {text = "Apache-2.0"}
 readme = "README.md"
@@ -33,9 +33,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/pulsar-lite"
-Documentation = "https://github.com/yourusername/pulsar-lite#readme"
-Repository = "https://github.com/yourusername/pulsar-lite"
+Homepage = "https://github.com/ascentstream/pulsar-lite"
+Documentation = "https://github.com/ascentstream/pulsar-lite#readme"
+Repository = "https://github.com/ascentstream/pulsar-lite"
 
 [tool.setuptools.packages.find]
 where = ["src"]

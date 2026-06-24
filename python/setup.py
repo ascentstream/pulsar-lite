@@ -29,10 +29,24 @@ class bdist_platform_wheel(bdist_wheel):
             plat_name = sysconfig.get_platform()
             plat_name = _native_macos_platform(plat_name)
 
-        if plat_name in ("linux-x86_64", "linux_x86_64") and sys.maxsize == 2147483647:
-            plat_name = "linux_i686"
-
+        # Normalize to PEP 425 form (lowercase, underscores, no dots).
         plat_name = plat_name.lower().replace("-", "_").replace(".", "_")
+
+        # PyPI rejects bare "linux_*" platform tags (PEP 513/599/600). The
+        # bundled Rust broker is a static binary with no glibc/ELIB coupling,
+        # so we relabel Linux wheels to manylinux_2_17 which is accepted by
+        # PyPI and works on any glibc >= 2.17 (CentOS 7+) distribution.
+        if plat_name == "linux_x86_64":
+            plat_name = "manylinux_2_17_x86_64"
+        elif plat_name == "linux_i686":
+            plat_name = "manylinux_2_17_i686"
+        elif plat_name == "linux_aarch64":
+            plat_name = "manylinux_2_17_aarch64"
+
+        # 32-bit x86 fallback for legacy i686 detection.
+        if plat_name in ("linux-x86_64", "linux_x86_64") and sys.maxsize == 2147483647:
+            plat_name = "manylinux_2_17_i686"
+
         return self.python_tag, "none", plat_name
 
 

@@ -206,7 +206,7 @@ if sub_type == SubscriptionType::Exclusive {
 - Pulsar 二进制协议支持
 - 模块化 Broker 架构
 - 生产者功能
-- Python SDK (Milvus Lite 风格)
+- Python SDK（嵌入式设计，自动管理进程）
 - 消费者订阅（Subscribe 命令）
 - 消息推送（Flow 控制，permit-based 流控）
 - 消息确认（Ack 命令）

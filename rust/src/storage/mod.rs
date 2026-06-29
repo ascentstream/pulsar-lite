@@ -28,6 +28,17 @@ pub use resources::{
     BaseResources, NamespaceResources, PulsarResources, TenantResources, TopicResources,
 };
 
+pub(crate) fn decode_publish_time(metadata: &[u8]) -> Option<u64> {
+    use crate::protocol::codec::proto::pulsar::MessageMetadata;
+    use prost::Message;
+    if metadata.is_empty() {
+        return None;
+    }
+    MessageMetadata::decode(metadata)
+        .ok()
+        .map(|m| m.publish_time)
+}
+
 /// Broker storage facade.
 ///
 /// Topic runtime selection happens above this layer from the topic URL domain.
@@ -160,6 +171,15 @@ impl Storage {
         self.managed_ledger
             .seek_cursor(topic, subscription, message_id, shared)
             .await
+    }
+
+    pub fn find_message_id_by_publish_time(
+        &self,
+        topic: &str,
+        publish_time: u64,
+    ) -> Result<Option<MessageId>> {
+        self.managed_ledger
+            .find_message_id_by_publish_time(topic, publish_time)
     }
 
     pub fn first_unacked_position(

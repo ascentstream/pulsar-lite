@@ -204,6 +204,42 @@ impl RocksDBManagedLedger {
         })
     }
 
+    /// Find the position of the first entry whose publish_time >= `publish_time`,
+    /// (predicate `publish_time < timestamp`, find largest matched, then next position).
+    ///
+    /// Returns None when all entries have publish_time < `publish_time` (seek past end).
+    /// Assumes publish_time is monotonically non-decreasing along `self.entries` order.
+    pub(super) fn find_position_by_publish_time(
+        &self,
+        publish_time: u64,
+    ) -> Option<ManagedLedgerPosition> {
+        let n = self.entries.len();
+        if n == 0 {
+            return None;
+        }
+        let mut lo = 0usize;
+        let mut hi = n;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let pt = self.entry_publish_time(mid);
+            if pt < publish_time {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        self.entries.get(lo).map(|(position, _)| position.clone())
+    }
+
+    fn entry_publish_time(&self, i: usize) -> u64 {
+        let (_, index) = &self.entries[i];
+        self.entry_log
+            .read(index)
+            .ok()
+            .and_then(|entry| crate::storage::decode_publish_time(&entry.metadata))
+            .unwrap_or(u64::MAX)
+    }
+
     pub(super) fn get_message_by_id(&self, message_id: &MessageId) -> Option<(MessageId, Vec<u8>)> {
         self.get_message_entry_by_id(message_id)
             .map(|entry| (entry.message_id, entry.payload))

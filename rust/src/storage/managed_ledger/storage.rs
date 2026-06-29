@@ -146,4 +146,28 @@ pub trait ManagedLedgerStorage: Send + Sync {
     ) -> bool;
 
     fn get_mark_delete_position(&self, topic: &str, subscription: &str) -> Option<u64>;
+
+    fn find_message_id_by_publish_time(
+        &self,
+        topic: &str,
+        publish_time: u64,
+    ) -> Result<Option<MessageId>> {
+        let entries = self.get_message_entries(topic);
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let mut last_earlier: Option<usize> = None;
+        for (i, entry) in entries.iter().enumerate() {
+            match super::super::decode_publish_time(&entry.metadata) {
+                Some(pt) if pt < publish_time => last_earlier = Some(i),
+                Some(_) => break,
+                None => {}
+            }
+        }
+        let target = match last_earlier {
+            None => Some(entries[0].message_id.clone()),
+            Some(i) => entries.get(i + 1).map(|e| e.message_id.clone()),
+        };
+        Ok(target)
+    }
 }

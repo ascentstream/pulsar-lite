@@ -895,3 +895,62 @@ async fn seek_cursor_reposition_first_unacked_to_target() {
     let first = storage.first_unacked_position(topic, sub).unwrap();
     assert_eq!(first, Some(ManagedLedgerPosition::from(&m1)));
 }
+
+fn metadata_with_publish_time(publish_time: u64) -> Vec<u8> {
+    use crate::protocol::codec::proto::pulsar::MessageMetadata;
+    use prost::Message;
+    MessageMetadata {
+        publish_time,
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
+#[test]
+fn find_message_id_by_publish_time_return_first_at_or_after_timestamp() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("seek-by-time");
+    let topic = "persistent://public/default/seek-by-time";
+    let mut storage = RocksDbManagedLedgerStorage::open(&db_path).unwrap();
+
+    let m0 = storage
+        .append_message_with_metadata(topic, -1, &metadata_with_publish_time(100), b"m0")
+        .unwrap();
+    let m1 = storage
+        .append_message_with_metadata(topic, -1, &metadata_with_publish_time(200), b"m1")
+        .unwrap();
+    let m2 = storage
+        .append_message_with_metadata(topic, -1, &metadata_with_publish_time(300), b"m2")
+        .unwrap();
+
+    assert_eq!(
+        storage.find_message_id_by_publish_time(topic, 50).unwrap(),
+        Some(m0.clone()),
+        "50: The first condition is >= 50, and it matches m0."
+    );
+    assert_eq!(
+        storage.find_message_id_by_publish_time(topic, 100).unwrap(),
+        Some(m0.clone()),
+        "100: >= 100 Hit m0 (Boundary: Exactly equal)"
+    );
+    assert_eq!(
+        storage.find_message_id_by_publish_time(topic, 150).unwrap(),
+        Some(m1.clone()),
+        "150: The first rule >= 150 indicates m1"
+    );
+    assert_eq!(
+        storage.find_message_id_by_publish_time(topic, 200).unwrap(),
+        Some(m1.clone()),
+        "200: >= 200 Hits m1 (Boundary: Exactly equal)"
+    );
+    assert_eq!(
+        storage.find_message_id_by_publish_time(topic, 300).unwrap(),
+        Some(m2.clone()),
+        "300: >= 300 命中 m2"
+    );
+    assert_eq!(
+        storage.find_message_id_by_publish_time(topic, 350).unwrap(),
+        None,
+        "300: >= 300 Hit M2"
+    );
+}

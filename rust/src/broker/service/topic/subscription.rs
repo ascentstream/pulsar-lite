@@ -389,6 +389,25 @@ impl Subscription {
         Ok(())
     }
 
+    pub async fn seek_by_publish_time(&mut self, publish_time: u64) -> Result<(), String> {
+        if !self.is_persistent() {
+            return Err("seek is not supported for non-persistent subscriptions".to_string());
+        }
+        let message_id = {
+            let guard = self.storage.lock().await;
+            guard
+                .find_message_id_by_publish_time(&self.topic, publish_time)
+                .map_err(|e| e.to_string())?
+        };
+        match message_id {
+            Some(id) => self.seek_to_message_id(&id).await,
+            None => Err(format!(
+                "no message at or after publish_time {} on topic '{}'",
+                publish_time, self.topic
+            )),
+        }
+    }
+
     pub async fn get_last_message_id(&self) -> Result<Option<MessageId>, String> {
         if !self.is_persistent() {
             return Err(

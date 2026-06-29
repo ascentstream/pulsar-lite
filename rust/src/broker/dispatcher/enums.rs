@@ -85,6 +85,15 @@ impl DispatcherEnum {
         }
     }
 
+    pub fn reset_after_seek(&self, pos: Option<ManagedLedgerPosition>) {
+        match self {
+            DispatcherEnum::Exclusive(d) => d.reset_after_seek(pos),
+            DispatcherEnum::Shared(d) => d.reset_after_seek(pos),
+            DispatcherEnum::KeyShared(d) => d.reset_after_seek(pos),
+            DispatcherEnum::Failover(d) => d.reset_after_seek(pos),
+        }
+    }
+
     pub async fn remove_consumer_with_recovery(
         &mut self,
         consumer_id: u64,

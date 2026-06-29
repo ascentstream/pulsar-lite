@@ -30,6 +30,13 @@ pub trait Dispatcher: Send + Sync {
     /// Initialize the persistent read position for this dispatcher.
     fn init_read_position(&self, pos: Option<ManagedLedgerPosition>);
 
+    /// Reset dispatcher state after a seek: reposition read cursor and clear
+    /// redelivery / sticky state so pre-seek messages are not re-dispatched.
+    /// Default impl just repositions; Shared/KeyShared override to clear queues.
+    fn reset_after_seek(&self, pos: Option<ManagedLedgerPosition>) {
+        self.init_read_position(pos);
+    }
+
     // ==================== Flow Control ====================
 
     /// Handle flow command - update permits (Push mode)

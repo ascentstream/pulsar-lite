@@ -149,6 +149,14 @@ impl RedeliveryController {
         };
         self.decrement_hash(Some(hash));
     }
+
+    /// Clear all redelivery state (entries, in-flight hashes, blocked hashes).
+    /// Used after seek to drop pre-seek redelivery backlog and sticky/blocking state.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.in_flight_hashes.clear();
+        self.blocked_hashes.clear();
+    }
 }
 
 #[cfg(test)]
@@ -311,5 +319,27 @@ mod tests {
         assert!(controller.is_hash_blocked(55));
         controller.remove(&msg(9));
         assert!(!controller.is_hash_blocked(55));
+    }
+
+    #[test]
+    fn clear_empties_entries_in_flight_and_blocked_hashes() {
+        let mut controller = RedeliveryController::new(true);
+        controller.add(RedeliveryEntry {
+            message_id: msg(1),
+            redelivery_count: 1,
+            sticky_key_hash: Some(42),
+        });
+
+        controller.take_for_delivery_with_hash(&msg(1), Some(42));
+        assert!(controller.is_hash_blocked(42));
+        assert!(controller.has_in_flight_hash(42));
+        assert_eq!(controller.len(), 0);
+
+        controller.clear();
+
+        assert_eq!(controller.len(), 0);
+        assert!(!controller.is_hash_blocked(42));
+        assert!(!controller.has_in_flight_hash(42));
+        assert!(controller.queued_message_ids().is_empty());
     }
 }

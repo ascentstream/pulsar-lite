@@ -145,7 +145,7 @@ impl ManagedLedgerStorage for InMemoryManagedLedgerStorage {
         Ok(())
     }
 
-    fn seek_cursor(
+    async fn seek_cursor(
         &mut self,
         topic: &str,
         subscription: &str,
@@ -449,6 +449,12 @@ impl ManagedCursor for InMemoryManagedCursor {
 
     fn delete_individual(&mut self, position: ManagedLedgerPosition) -> Result<()> {
         self.state.individually_deleted_entries.insert(position);
+        Ok(())
+    }
+
+    async fn async_reset_cursor(&mut self, position: Option<ManagedLedgerPosition>) -> Result<()> {
+        self.state.mark_delete = position;
+        self.state.individually_deleted_entries.clear();
         Ok(())
     }
 }

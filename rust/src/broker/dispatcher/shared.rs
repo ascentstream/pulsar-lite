@@ -601,6 +601,11 @@ impl Dispatcher for SharedDispatcher {
         *self.read_position.write().unwrap() = pos;
     }
 
+    fn reset_after_seek(&self, pos: Option<ManagedLedgerPosition>) {
+        self.init_read_position(pos);
+        self.redelivery_controller.write().unwrap().clear();
+    }
+
     fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {
         // Consumer-local permit state is updated by the flow handler before it
         // triggers dispatch. The dispatcher only tracks the aggregate count.

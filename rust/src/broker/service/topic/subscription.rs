@@ -363,6 +363,7 @@ impl Subscription {
             let mut guard = self.storage.lock().await;
             guard
                 .seek_cursor(&self.topic, &self.name, message_id, shared_cursor)
+                .await
                 .map_err(|e| e.to_string())?;
             guard
                 .first_unacked_position(&self.topic, &self.name)
@@ -370,7 +371,19 @@ impl Subscription {
         };
 
         if let Some(runtime) = self.persistent_runtime.as_ref() {
-            runtime.init_read_position(first_unacked);
+            runtime.reset_after_seek(first_unacked);
+
+            for consumer in runtime.get_consumers() {
+                let drained = consumer.drain_pending_acks().await;
+                if !drained.is_empty() {
+                    log::debug!(
+                        "Seek cleared {} pending acks for consumer {} on subscription '{}'",
+                        drained.len(),
+                        consumer.consumer_id,
+                        self.name
+                    );
+                }
+            }
         }
 
         Ok(())

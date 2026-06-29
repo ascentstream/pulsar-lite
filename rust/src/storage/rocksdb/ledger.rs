@@ -176,6 +176,34 @@ impl RocksDBManagedLedger {
         Ok(position)
     }
 
+    /// Position immediately before `position` in ledger/entry order.
+    /// - entry_id > 0  -> same ledger, entry_id - 1
+    /// - entry_id == 0 -> last entry of the previous non-empty ledger
+    /// - no previous   -> None ("before first entry", i.e. seek to earliest)
+    pub(super) fn previous_position(
+        &self,
+        position: &ManagedLedgerPosition,
+    ) -> Option<ManagedLedgerPosition> {
+        if position.entry_id > 0 {
+            return Some(ManagedLedgerPosition {
+                ledger_id: position.ledger_id,
+                entry_id: position.entry_id - 1,
+                partition: position.partition,
+            });
+        }
+        let prev = self
+            .info
+            .ledgers
+            .iter()
+            .filter(|l| l.ledger_id < position.ledger_id && l.entries > 0)
+            .max_by_key(|l| l.ledger_id)?;
+        Some(ManagedLedgerPosition {
+            ledger_id: prev.ledger_id,
+            entry_id: prev.entries - 1,
+            partition: position.partition,
+        })
+    }
+
     pub(super) fn get_message_by_id(&self, message_id: &MessageId) -> Option<(MessageId, Vec<u8>)> {
         self.get_message_entry_by_id(message_id)
             .map(|entry| (entry.message_id, entry.payload))

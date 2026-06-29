@@ -1,5 +1,6 @@
 use super::{CursorInitOptions, CursorOpenResult, ManagedLedgerPosition, MessageId, StoredMessage};
 use anyhow::Result;
+use std::future::Future;
 
 /// Storage-level abstraction mirroring the role of Pulsar's managed-ledger
 /// storage integration, while remaining in-memory for now.
@@ -40,9 +41,11 @@ pub trait ManagedLedgerStorage: Send + Sync {
         subscription: &str,
         message_id: &MessageId,
         shared: bool,
-    ) -> Result<()> {
-        let _ = (topic, subscription, message_id, shared);
-        anyhow::bail!("seek_cursor is not implemented for this managed-ledger store")
+    ) -> impl Future<Output = Result<()>> + Send {
+        async move {
+            let _ = (topic, subscription, message_id, shared);
+            anyhow::bail!("seek_cursor is not implemented for this managed-ledger store")
+        }
     }
 
     fn first_unacked_position(

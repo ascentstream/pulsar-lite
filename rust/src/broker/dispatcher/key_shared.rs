@@ -359,6 +359,11 @@ impl Dispatcher for KeySharedDispatcher {
         *self.read_position.write().unwrap() = pos;
     }
 
+    fn reset_after_seek(&self, pos: Option<ManagedLedgerPosition>) {
+        self.init_read_position(pos);
+        self.redelivery_controller.write().unwrap().clear();
+    }
+
     fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {
         if self.consumers_by_id.contains_key(&consumer_id) {
             self.total_available_permits

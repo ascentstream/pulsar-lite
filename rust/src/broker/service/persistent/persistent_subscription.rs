@@ -155,9 +155,9 @@ impl PersistentSubscriptionRuntime {
             .is_some_and(|dispatcher| dispatcher.is_consumer_connected())
     }
 
-    pub(crate) fn init_read_position(&self, first_unacked: Option<ManagedLedgerPosition>) {
+    pub(crate) fn reset_after_seek(&self, first_unacked: Option<ManagedLedgerPosition>) {
         if let Some(dispatcher) = self.dispatcher.as_ref() {
-            dispatcher.init_read_position(first_unacked);
+            dispatcher.reset_after_seek(first_unacked);
         }
     }
 

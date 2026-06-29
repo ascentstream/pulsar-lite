@@ -826,4 +826,50 @@ mod tests {
             pending
         );
     }
+
+    #[tokio::test]
+    async fn reset_after_seek_clears_redelivery_queue_and_repositions_read_cursor() {
+        let dispatcher = SharedDispatcher::new();
+
+        // Send a pre-seek red queue message
+        dispatcher
+            .redelivery_controller
+            .write()
+            .unwrap()
+            .add(RedeliveryEntry {
+                message_id: MessageId {
+                    ledger: 0,
+                    entry: 5,
+                    partition: -1,
+                },
+                redelivery_count: 2,
+                sticky_key_hash: None,
+            });
+        assert!(!dispatcher.redelivery_controller.read().unwrap().is_empty());
+
+        // Set an old "read_position"
+        *dispatcher.read_position.write().unwrap() = Some(ManagedLedgerPosition {
+            ledger_id: 0,
+            entry_id: 10,
+            partition: -1,
+        });
+
+        // seek -> entry 3
+        dispatcher.reset_after_seek(Some(ManagedLedgerPosition {
+            ledger_id: 0,
+            entry_id: 3,
+            partition: -1,
+        }));
+
+        // redelivery queue emptied + read_position reset
+        assert!(dispatcher.redelivery_controller.read().unwrap().is_empty());
+        assert_eq!(
+            *dispatcher.read_position.read().unwrap(),
+            Some(ManagedLedgerPosition {
+                ledger_id: 0,
+                entry_id: 3,
+                partition: -1
+            })
+        );
+    }
 }

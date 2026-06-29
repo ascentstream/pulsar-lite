@@ -708,4 +708,83 @@ mod tests {
         assert_eq!(replayed_same_hash.1.message_id, same_hash_id);
         assert_eq!(replayed_same_hash.1.redelivery_count, 0);
     }
+
+    #[tokio::test]
+    async fn reset_after_seek_clears_redelivery_hashes_and_repositions() {
+        let dispatcher = KeySharedDispatcher::new(None);
+        let hash = 42;
+        let mid = MessageId {
+            ledger: 0,
+            entry: 5,
+            partition: -1,
+        };
+
+        // add messages with sticky hash -> entries + blocked_hashes
+        dispatcher
+            .redelivery_controller
+            .write()
+            .unwrap()
+            .add(RedeliveryEntry {
+                message_id: mid.clone(),
+                redelivery_count: 1,
+                sticky_key_hash: Some(hash),
+            });
+        assert!(dispatcher
+            .redelivery_controller
+            .read()
+            .unwrap()
+            .is_hash_blocked(hash));
+
+        // generate in_flight_hashes (with block_hashes set to true, the in_flight branch is taken)
+        dispatcher
+            .redelivery_controller
+            .write()
+            .unwrap()
+            .take_for_delivery_with_hash(&mid, Some(hash));
+        assert!(dispatcher
+            .redelivery_controller
+            .read()
+            .unwrap()
+            .has_in_flight_hash(hash));
+
+        // add another one to ensure that the "entries" list is not empty.
+        dispatcher
+            .redelivery_controller
+            .write()
+            .unwrap()
+            .add(RedeliveryEntry {
+                message_id: MessageId {
+                    ledger: 0,
+                    entry: 6,
+                    partition: -1,
+                },
+                redelivery_count: 0,
+                sticky_key_hash: Some(hash),
+            });
+
+        dispatcher.reset_after_seek(Some(ManagedLedgerPosition {
+            ledger_id: 0,
+            entry_id: 3,
+            partition: -1,
+        }));
+
+        let rc = dispatcher.redelivery_controller.read().unwrap();
+        assert!(rc.is_empty(), "entries should be cleared");
+        assert!(
+            !rc.is_hash_blocked(hash),
+            "blocked_hashes should be cleared"
+        );
+        assert!(
+            !rc.has_in_flight_hash(hash),
+            "in_flight_hashes should be cleared"
+        );
+        assert_eq!(
+            *dispatcher.read_position.read().unwrap(),
+            Some(ManagedLedgerPosition {
+                ledger_id: 0,
+                entry_id: 3,
+                partition: -1
+            })
+        );
+    }
 }

@@ -6,8 +6,8 @@ use super::ledger::RocksDBManagedLedger;
 use super::metadata::{StoredEntryLocation, StoredManagedLedgerInfo};
 use super::storage::RocksDbManagedLedgerStorage;
 use crate::storage::{
-    ManagedCursor, ManagedLedger, ManagedLedgerConfig, ManagedLedgerFactory, ManagedLedgerPosition,
-    ManagedLedgerStorage,
+    CursorInitOptions, InitialPosition, ManagedCursor, ManagedLedger, ManagedLedgerConfig,
+    ManagedLedgerFactory, ManagedLedgerPosition, ManagedLedgerStorage,
 };
 use prost::Message;
 use rocksdb::{Options, DB};
@@ -833,4 +833,65 @@ fn storage_normalizes_topic_url_and_encodes_cursor_name() {
         .get(keys::managed_cursor_key(ledger_name, subscription))
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn previous_position_handles_same_ledger_cross_ledger_and_before_first() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("previous-position");
+    let db = open_test_db(&db_path);
+    let config = ManagedLedgerConfig {
+        max_entries_per_ledger: Some(2),
+        ..ManagedLedgerConfig::default()
+    };
+    let entry_log = open_test_entry_log(&db_path);
+    let mut factory = RocksDBManagedLedgerFactory::new(Arc::clone(&db), entry_log);
+
+    let mut ledger = factory.open("ledger-a", &config).unwrap();
+    ledger.add_entry(b"first").unwrap();
+    ledger.add_entry(b"second").unwrap();
+    ledger.add_entry(b"third").unwrap();
+
+    // phase 1: entry_id > 0 -> same ledger
+    assert_eq!(
+        ledger.previous_position(&position(0, 1)),
+        Some(position(0, 0))
+    );
+    // phase 2: entry_id == 0 -> The last entry of the previous non-empty ledger
+    assert_eq!(
+        ledger.previous_position(&position(1, 0)),
+        Some(position(0, 1))
+    );
+    // phase 3: The first ledger's entry 0 -> None (before the first)
+    assert_eq!(ledger.previous_position(&position(0, 0)), None);
+}
+
+#[tokio::test]
+async fn seek_cursor_reposition_first_unacked_to_target() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("seek_cursor");
+    let topic = "persisitent://public/default/seek";
+    let sub = "sub";
+
+    let mut storage = RocksDbManagedLedgerStorage::open(&db_path).unwrap();
+    let m0 = storage.append_message(topic, -1, b"m0").unwrap();
+    let m1 = storage.append_message(topic, -1, b"m1").unwrap();
+
+    // init cursor and ack
+    storage
+        .initialize_or_open_cursor(
+            topic,
+            sub,
+            CursorInitOptions {
+                initial_position: InitialPosition::Earliest,
+                start_message_id: None,
+            },
+        )
+        .unwrap();
+    storage.ack_message_shared(topic, sub, m0.clone()).unwrap();
+
+    // seek
+    storage.seek_cursor(topic, sub, &m1, true).await.unwrap();
+    let first = storage.first_unacked_position(topic, sub).unwrap();
+    assert_eq!(first, Some(ManagedLedgerPosition::from(&m1)));
 }

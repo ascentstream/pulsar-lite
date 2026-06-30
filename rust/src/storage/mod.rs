@@ -20,9 +20,9 @@ pub use managed_ledger::{
     StoredMessage, SubscriptionCursor,
 };
 pub use metadata::{
-    DomainNode, JsonFileMetadataStore, MetadataBackend, MetadataDocument, MetadataFileNode,
-    MetadataStore, NamespaceMetadata, NamespaceNode, ParsedTopicName, PartitionedTopicNode,
-    SubscriptionMetadata, SubscriptionNode, TenantMetadata, TenantNode, TopicMetadata, TopicNode,
+    DomainNode, MetadataDocument, MetadataFileNode, MetadataStore, NamespaceMetadata,
+    NamespaceNode, ParsedTopicName, PartitionedTopicNode, SubscriptionMetadata, SubscriptionNode,
+    TenantMetadata, TenantNode, TopicMetadata, TopicNode,
 };
 pub use resources::{
     BaseResources, NamespaceResources, PulsarResources, TenantResources, TopicResources,

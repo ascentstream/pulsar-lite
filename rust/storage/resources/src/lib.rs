@@ -1,0 +1,1 @@
+//! Broker resource API translating tenant/namespace/topic/subscription ops onto a metadata store.

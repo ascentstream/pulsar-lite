@@ -1,0 +1,1 @@
+//! Low-level metadata store: key, document, model, memory/file backend.

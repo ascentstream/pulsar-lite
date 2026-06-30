@@ -1,0 +1,1 @@
+//! Storage composition entry: combines metadata resources and managed-ledger factory.

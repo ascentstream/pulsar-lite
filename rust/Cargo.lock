@@ -795,6 +795,7 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
+ "pulsar-lite-storage-metadata",
  "rocksdb",
  "serde",
  "serde_json",
@@ -806,6 +807,33 @@ dependencies = [
  "toml",
  "uuid",
 ]
+
+[[package]]
+name = "pulsar-lite-storage"
+version = "0.1.0"
+
+[[package]]
+name = "pulsar-lite-storage-managed-ledger"
+version = "0.1.0"
+
+[[package]]
+name = "pulsar-lite-storage-managed-ledger-rocksdb"
+version = "0.1.0"
+
+[[package]]
+name = "pulsar-lite-storage-metadata"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "pulsar-lite-storage-resources"
+version = "0.1.0"
 
 [[package]]
 name = "quote"

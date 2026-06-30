@@ -5,7 +5,6 @@ use crate::model::{
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-
 /// Build a `MetadataDocument` snapshot from in-memory metadata state.
 /// Shared by `FileMetadataStore` and `InMemoryMetadataStore` so both backends
 /// serialize the same shape. T; both backends currently expose
@@ -13,9 +12,9 @@ use std::path::Path;
 /// re-export alias keeps broker/resource call sites untouched.
 pub(crate) fn build_document_from_state(
     metadata_path: &Path,
-    tenants: &HashMap<String,TenantMetadata>,
+    tenants: &HashMap<String, TenantMetadata>,
     namespaces: &HashMap<String, NamespaceMetadata>,
-    topics: &HashMap<String,TopicMetadata>,
+    topics: &HashMap<String, TopicMetadata>,
     subscriptions: &HashMap<String, SubscriptionMetadata>,
     version: u32,
 ) -> MetadataDocument {
@@ -35,7 +34,7 @@ pub(crate) fn build_document_from_state(
             .or_default();
     }
     for topic in topics.values() {
-        if topic.partitioned{
+        if topic.partitioned {
             continue;
         }
 
@@ -109,7 +108,7 @@ pub(crate) fn build_document_from_state(
 
     let mut resource_files = BTreeMap::new();
     resource_files.insert(path_key, file_node);
-    
+
     MetadataDocument {
         version,
         resource_files,

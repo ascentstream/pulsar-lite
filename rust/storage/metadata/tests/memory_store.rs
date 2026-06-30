@@ -19,7 +19,9 @@ fn in_memory_store_inserts_and_queries_metadata() {
         partitioned: false,
         partition_count: 0,
     });
-    assert!(store.get_topic_metadata("persistent://public/default/t").is_some());
+    assert!(store
+        .get_topic_metadata("persistent://public/default/t")
+        .is_some());
 
     assert!(store.insert_subscription_metadata("persistent://public/default/t", "sub"));
     assert!(store.has_subscription_metadata("persistent://public/default/t", "sub"));

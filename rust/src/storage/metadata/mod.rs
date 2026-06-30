@@ -6,12 +6,12 @@
 //! without touching broker/resource code. The `MetadataStore` *trait* and
 //! generic `PulsarResources<S>` are introduced in Phase 4.
 
+pub(crate) use pulsar_lite_storage_metadata::parse_topic_name;
 pub use pulsar_lite_storage_metadata::{
     DomainNode, FileMetadataStore as MetadataStore, MetadataDocument, MetadataFileNode,
-    NamespaceMetadata, NamespaceNode, PartitionedTopicNode, ParsedTopicName, SubscriptionMetadata,
+    NamespaceMetadata, NamespaceNode, ParsedTopicName, PartitionedTopicNode, SubscriptionMetadata,
     SubscriptionNode, TenantMetadata, TenantNode, TopicMetadata, TopicNode,
 };
-pub(crate) use pulsar_lite_storage_metadata::parse_topic_name;
 
 impl super::Storage {
     pub fn parse_topic_name(topic: &str) -> anyhow::Result<ParsedTopicName> {

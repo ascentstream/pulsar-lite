@@ -31,12 +31,12 @@ impl FileMetadataStore {
     }
 
     pub fn load(&mut self) -> Result<()> {
-        if let Some(document) = self.load_document()?{
+        if let Some(document) = self.load_document()? {
             self.apply_metadata_document(document)?;
         }
         Ok(())
     }
-    
+
     pub fn persist_document(&self, version: u32) -> Result<()> {
         let document = self.build_metadata_document(version);
         self.save_document(&document)
@@ -48,15 +48,15 @@ impl FileMetadataStore {
 
     pub fn load_document(&self) -> Result<Option<MetadataDocument>> {
         if !self.metadata_path.exists() {
-            return Ok(None)
+            return Ok(None);
         }
-        let content = fs::read_to_string(&self.metadata_path).map_err(|error|{
+        let content = fs::read_to_string(&self.metadata_path).map_err(|error| {
             anyhow!(
                 "Failed to read metadata file '{}':{error}",
                 self.metadata_path.display()
             )
         })?;
-        let raw: serde_json::Value = serde_json::from_str(&content).map_err(|error|{
+        let raw: serde_json::Value = serde_json::from_str(&content).map_err(|error| {
             anyhow!(
                 "Failed to parse metadata file '{}':{error}",
                 self.metadata_path.display()
@@ -95,8 +95,8 @@ impl FileMetadataStore {
                         name: tenant_name.clone(),
                     },
                 );
-                
-                for (namespace_name,namespace_node) in tenant_node.namespaces {
+
+                for (namespace_name, namespace_node) in tenant_node.namespaces {
                     namespaces.insert(
                         namespace_key(&tenant_name, &namespace_name),
                         NamespaceMetadata {
@@ -106,10 +106,10 @@ impl FileMetadataStore {
                     );
 
                     for (domain_name, domain_node) in namespace_node.domains {
-                        for (topic_name,topic_node) in domain_node.topics {
+                        for (topic_name, topic_node) in domain_node.topics {
                             let full_name = format!(
                                 "{}://{}/{}/{}",
-                                domain_name, tenant_name, namespace_name,topic_name
+                                domain_name, tenant_name, namespace_name, topic_name
                             );
 
                             let parsed = parse_topic_name(&full_name).map_err(|error| {
@@ -124,12 +124,12 @@ impl FileMetadataStore {
                                 full_name.clone(),
                                 TopicMetadata {
                                     full_name: full_name.clone(),
-                                  domain: parsed.domain,
-                                  tenant: parsed.tenant,
-                                  namespace: parsed.namespace,
-                                  local_name: parsed.local_name,
-                                  partitioned: false,
-                                  partition_count: 0,
+                                    domain: parsed.domain,
+                                    tenant: parsed.tenant,
+                                    namespace: parsed.namespace,
+                                    local_name: parsed.local_name,
+                                    partitioned: false,
+                                    partition_count: 0,
                                 },
                             );
 
@@ -143,17 +143,17 @@ impl FileMetadataStore {
                                 );
                             }
                         }
-
                     }
                 }
             }
         }
 
-        for (topic_name,node) in document.partitioned_topics {
-            let parsed = parse_topic_name(&topic_name).map_err(|error|{
+        for (topic_name, node) in document.partitioned_topics {
+            let parsed = parse_topic_name(&topic_name).map_err(|error| {
                 anyhow!(
                     "Invalid partitioned topic metadata '{}':'{}'",
-                    topic_name,error
+                    topic_name,
+                    error
                 )
             })?;
 
@@ -161,12 +161,12 @@ impl FileMetadataStore {
                 topic_name.clone(),
                 TopicMetadata {
                     full_name: topic_name,
-                  domain: parsed.domain,
-                  tenant: parsed.tenant,
-                  namespace: parsed.namespace,
-                  local_name: parsed.local_name,
-                  partitioned: true,
-                  partition_count: node.partitions.max(1),
+                    domain: parsed.domain,
+                    tenant: parsed.tenant,
+                    namespace: parsed.namespace,
+                    local_name: parsed.local_name,
+                    partitioned: true,
+                    partition_count: node.partitions.max(1),
                 },
             );
         }
@@ -182,13 +182,16 @@ impl FileMetadataStore {
     fn save_document(&self, document: &MetadataDocument) -> Result<()> {
         if let Some(parent) = self.metadata_path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
-                anyhow!("Failed to create metadata directory '{}':{error}",parent.display())
+                anyhow!(
+                    "Failed to create metadata directory '{}':{error}",
+                    parent.display()
+                )
             })?;
         }
 
         let serialized = serde_json::to_string_pretty(document)?;
-        let tmp_path = PathBuf::from(format!("{}.tmp",self.metadata_path.display()));
-        fs::write(&tmp_path, serialized).map_err(|error|{
+        let tmp_path = PathBuf::from(format!("{}.tmp", self.metadata_path.display()));
+        fs::write(&tmp_path, serialized).map_err(|error| {
             anyhow!(
                 "Failed to write temporary metadata file '{}':{error}",
                 tmp_path.display()
@@ -210,7 +213,9 @@ impl FileMetadataStore {
         }
         self.tenants.insert(
             tenant.to_string(),
-            TenantMetadata { name: tenant.to_string() },
+            TenantMetadata {
+                name: tenant.to_string(),
+            },
         );
         true
     }
@@ -233,10 +238,10 @@ impl FileMetadataStore {
     pub fn upsert_topic_metadata(&mut self, metadata: TopicMetadata) -> bool {
         let key = metadata.full_name.clone();
         let mut changed = false;
-        let entry = self
-            .topics
-            .entry(key)
-            .or_insert_with(|| { changed = true; metadata.clone() });
+        let entry = self.topics.entry(key).or_insert_with(|| {
+            changed = true;
+            metadata.clone()
+        });
         if metadata.partitioned {
             let desired = metadata.partition_count.max(1);
             if !entry.partitioned || entry.partition_count != desired {
@@ -265,17 +270,19 @@ impl FileMetadataStore {
         );
         true
     }
-   
+
     pub fn has_tenant_metadata(&self, tenant: &str) -> bool {
         self.tenants.contains_key(tenant)
     }
 
     pub fn has_namespace_metadata(&self, tenant: &str, namespace: &str) -> bool {
-        self.namespaces.contains_key(&namespace_key(tenant, namespace))
+        self.namespaces
+            .contains_key(&namespace_key(tenant, namespace))
     }
 
-    pub fn has_subscription_metadata(&self, topic:&str,subscription: &str) -> bool {
-        self.subscriptions.contains_key(&subscription_key(topic, subscription))
+    pub fn has_subscription_metadata(&self, topic: &str, subscription: &str) -> bool {
+        self.subscriptions
+            .contains_key(&subscription_key(topic, subscription))
     }
 
     pub fn get_topic_metadata(&self, topic: &str) -> Option<&TopicMetadata> {
@@ -286,7 +293,9 @@ impl FileMetadataStore {
         self.topics
             .iter()
             .filter_map(|(topic, metadata)| {
-                metadata.partitioned.then_some((topic.clone(), metadata.partition_count))
+                metadata
+                    .partitioned
+                    .then_some((topic.clone(), metadata.partition_count))
             })
             .collect()
     }

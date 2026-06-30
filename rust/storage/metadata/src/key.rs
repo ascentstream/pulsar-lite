@@ -1,7 +1,7 @@
 use std::fmt;
 
 /// Type-safe wrapper around a metadata storage key string.
-#[derive(Debug,Clone,PartialEq,Eq,Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MetadataKey(String);
 
 impl MetadataKey {
@@ -10,14 +10,14 @@ impl MetadataKey {
     }
 
     pub fn namespace(tenant: &str, namespace: &str) -> Self {
-        Self(namespace_key(tenant,namespace))
+        Self(namespace_key(tenant, namespace))
     }
 
     pub fn topic(topic: &str) -> Self {
         Self(topic.to_string())
     }
 
-    pub fn subscription(topic: &str,subscription: &str) -> Self {
+    pub fn subscription(topic: &str, subscription: &str) -> Self {
         Self(subscription_key(topic, subscription))
     }
 

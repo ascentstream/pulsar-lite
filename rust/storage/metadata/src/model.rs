@@ -1,4 +1,4 @@
-use anyhow::{anyhow,Result};
+use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
 
 /// Memory Metadata
@@ -12,18 +12,18 @@ use std::collections::BTreeMap;
 //     partition_count: 0,
 // }
 
-#[derive(Debug,Clone,PartialEq,Eq,serde::Serialize,serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TenantMetadata {
     pub name: String,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,serde::Serialize,serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NamespaceMetadata {
     pub tenant: String,
     pub name: String,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,serde::Serialize,serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TopicMetadata {
     pub full_name: String,
     pub domain: String,
@@ -34,13 +34,13 @@ pub struct TopicMetadata {
     pub partition_count: usize,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,serde::Serialize,serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SubscriptionMetadata {
     pub topic: String,
     pub name: String,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedTopicName {
     pub domain: String,
     pub tenant: String,
@@ -67,57 +67,57 @@ pub struct ParsedTopicName {
 //            }
 //       }
 
-#[derive(Debug,Clone,Default,serde::Serialize,serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MetadataDocument {
     pub version: u32,
     #[serde(flatten)]
-    pub resource_files: BTreeMap<String,MetadataFileNode>,
-    pub partitioned_topics: BTreeMap<String,PartitionedTopicNode>,
+    pub resource_files: BTreeMap<String, MetadataFileNode>,
+    pub partitioned_topics: BTreeMap<String, PartitionedTopicNode>,
 }
 
-#[derive(Debug,Clone,Default,serde::Serialize,serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MetadataFileNode {
     #[serde(flatten)]
     pub tenants: BTreeMap<String, TenantNode>,
 }
 
-#[derive(Debug,Clone,Default,serde::Serialize,serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TenantNode {
     #[serde(flatten)]
-    pub namespaces: BTreeMap<String,NamespaceNode>,
+    pub namespaces: BTreeMap<String, NamespaceNode>,
 }
 
-#[derive(Debug,Clone,Default,serde::Serialize,serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct NamespaceNode {
     #[serde(flatten)]
-    pub domains: BTreeMap<String,DomainNode>,
+    pub domains: BTreeMap<String, DomainNode>,
 }
 
-#[derive(Debug,Clone,Default,serde::Serialize,serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DomainNode {
     #[serde(flatten)]
-    pub topics: BTreeMap<String,TopicNode>,
+    pub topics: BTreeMap<String, TopicNode>,
 }
 
-#[derive(Debug,Clone,Default,serde::Serialize,serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TopicNode {
     #[serde(default)]
     pub subscriptions: BTreeMap<String, SubscriptionNode>,
 }
 
-#[derive(Debug,Clone,Default,serde::Serialize,serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SubscriptionNode {}
 
-#[derive(Debug,Clone,PartialEq,Eq,serde::Serialize,serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PartitionedTopicNode {
     pub partitions: usize,
 }
 
 /// persistent://public/default/my-topic-partition-0 -> ParsedTopicName
 pub fn parse_topic_name(topic: &str) -> Result<ParsedTopicName> {
-    let (domain,rest) = topic
+    let (domain, rest) = topic
         .split_once("://")
-        .ok_or_else(|| anyhow!("Invalid topic name '{}': missing domain",topic))?;
+        .ok_or_else(|| anyhow!("Invalid topic name '{}': missing domain", topic))?;
 
     if domain != "persistent" && domain != "non-persistent" {
         return Err(anyhow!(
@@ -125,25 +125,25 @@ pub fn parse_topic_name(topic: &str) -> Result<ParsedTopicName> {
             topic
         ));
     }
-    
-    let mut parts = rest.splitn(3,'/');
+
+    let mut parts = rest.splitn(3, '/');
     let tenant = parts
         .next()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("Invalid topic name '{}': missing tenant", topic))?;
     let namespace = parts
         .next()
-        .filter(|value|!value.is_empty())
-        .ok_or_else(|| anyhow!("Invalid topic name '{}': missing namespace",topic))?;
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("Invalid topic name '{}': missing namespace", topic))?;
     let local_name = parts
         .next()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("Invalid topic name '{}': missing local name",topic))?;
+        .ok_or_else(|| anyhow!("Invalid topic name '{}': missing local name", topic))?;
 
-    Ok(ParsedTopicName { 
-        domain: domain.to_string(), 
+    Ok(ParsedTopicName {
+        domain: domain.to_string(),
         tenant: tenant.to_string(),
-        namespace: namespace.to_string(), 
+        namespace: namespace.to_string(),
         local_name: local_name.to_string(),
     })
 }

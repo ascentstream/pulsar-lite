@@ -17,10 +17,10 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Default)]
 pub struct InMemoryMetadataStore {
     metadata_path: PathBuf,
-    tenants: HashMap<String,TenantMetadata>,
-    namespaces: HashMap<String,NamespaceMetadata>,
-    topics: HashMap<String,TopicMetadata>,
-    subscriptions: HashMap<String,SubscriptionMetadata>,
+    tenants: HashMap<String, TenantMetadata>,
+    namespaces: HashMap<String, NamespaceMetadata>,
+    topics: HashMap<String, TopicMetadata>,
+    subscriptions: HashMap<String, SubscriptionMetadata>,
 }
 
 impl InMemoryMetadataStore {
@@ -32,7 +32,7 @@ impl InMemoryMetadataStore {
         Ok(())
     }
 
-    pub fn persist_document(&self, _version:u32) -> anyhow::Result<()> {
+    pub fn persist_document(&self, _version: u32) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -46,7 +46,9 @@ impl InMemoryMetadataStore {
         }
         self.tenants.insert(
             tenant.to_string(),
-            TenantMetadata { name: tenant.to_string() },
+            TenantMetadata {
+                name: tenant.to_string(),
+            },
         );
         true
     }
@@ -57,10 +59,10 @@ impl InMemoryMetadataStore {
             return false;
         }
         self.namespaces.insert(
-            key, 
-            NamespaceMetadata { 
-                tenant: tenant.to_string(), 
-                name: namespace.to_string(), 
+            key,
+            NamespaceMetadata {
+                tenant: tenant.to_string(),
+                name: namespace.to_string(),
             },
         );
         true
@@ -69,10 +71,10 @@ impl InMemoryMetadataStore {
     pub fn upsert_topic_metadata(&mut self, metadata: TopicMetadata) -> bool {
         let key = metadata.full_name.clone();
         let mut changed = false;
-        let entry = self
-            .topics
-            .entry(key)
-            .or_insert_with(|| { changed = true;metadata.clone()});
+        let entry = self.topics.entry(key).or_insert_with(|| {
+            changed = true;
+            metadata.clone()
+        });
         if metadata.partitioned {
             let desired = metadata.partition_count.max(1);
             if !entry.partitioned || entry.partition_count != desired {
@@ -88,15 +90,16 @@ impl InMemoryMetadataStore {
     }
 
     pub fn insert_subscription_metadata(&mut self, topic: &str, subscription: &str) -> bool {
-        let key = subscription_key(topic,subscription);
+        let key = subscription_key(topic, subscription);
         if self.subscriptions.contains_key(&key) {
             return false;
         }
         self.subscriptions.insert(
             key,
-            SubscriptionMetadata { 
-                topic: topic.to_string(), 
-                name: subscription.to_string() },
+            SubscriptionMetadata {
+                topic: topic.to_string(),
+                name: subscription.to_string(),
+            },
         );
         true
     }
@@ -106,11 +109,13 @@ impl InMemoryMetadataStore {
     }
 
     pub fn has_namespace_metadata(&self, tenant: &str, namespace: &str) -> bool {
-        self.namespaces.contains_key(&namespace_key(tenant, namespace))
+        self.namespaces
+            .contains_key(&namespace_key(tenant, namespace))
     }
 
-    pub fn has_subscription_metadata(&self, topic:&str,subscription: &str) -> bool {
-        self.subscriptions.contains_key(&subscription_key(topic, subscription))
+    pub fn has_subscription_metadata(&self, topic: &str, subscription: &str) -> bool {
+        self.subscriptions
+            .contains_key(&subscription_key(topic, subscription))
     }
 
     pub fn get_topic_metadata(&self, topic: &str) -> Option<&TopicMetadata> {
@@ -121,7 +126,9 @@ impl InMemoryMetadataStore {
         self.topics
             .iter()
             .filter_map(|(topic, metadata)| {
-                metadata.partitioned.then_some((topic.clone(), metadata.partition_count))
+                metadata
+                    .partitioned
+                    .then_some((topic.clone(), metadata.partition_count))
             })
             .collect()
     }

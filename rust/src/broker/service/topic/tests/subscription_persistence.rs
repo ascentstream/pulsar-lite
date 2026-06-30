@@ -243,3 +243,152 @@ async fn persistent_shared_ack_state_recovers_after_reopen() {
         "shared ack hole should not redeliver after reopen"
     );
 }
+
+#[tokio::test]
+async fn persistent_seek_rewinds_dispatch_to_target_message() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("seek-rewind.db");
+    let topic = "persistent://public/default/seek-rewind";
+    let subscription_name = "sub";
+
+    let m1_id = {
+        let mut storage = Storage::new(&db_path).unwrap();
+        storage.create_topic(topic).unwrap();
+        open_earliest_cursor(&mut storage, topic, subscription_name);
+        storage.append_message(topic, -1, b"m0").unwrap();
+        let m1 = storage.append_message(topic, -1, b"m1").unwrap();
+        storage.append_message(topic, -1, b"m2").unwrap();
+        m1
+    };
+
+    let storage = create_persistent_storage(&db_path);
+    let subscription = create_persistent_subscription(
+        storage.clone(),
+        topic,
+        subscription_name,
+        SubscriptionType::Exclusive,
+    );
+
+    let (consumer, mut rx) = create_test_consumer_with_capacity(1, subscription.clone(), 8);
+    {
+        let mut sub = subscription.write().await;
+        sub.add_consumer(consumer.clone()).unwrap();
+    }
+
+    // flow 2 permits, receive m0, m1 -> generate 2 pending_acks, and advance the read_position to m2
+    add_consumer_and_flow(&subscription, 1, 2).await;
+    let d0 = rx.recv().await.expect("m0 dispatch");
+    assert_eq!(d0.1.payload, b"m0".to_vec());
+    let d1 = rx.recv().await.expect("m1 dispatch");
+    assert_eq!(d1.1.payload, b"m1".to_vec());
+    assert_eq!(
+        consumer.pending_ack_count().await,
+        2,
+        "m0/m1 should be pending before seek"
+    );
+
+    // seek  m1 -> cursor mark_delete = previous(m1) = m0, read_position back m1, pending_acks clear
+    subscription
+        .write()
+        .await
+        .seek_to_message_id(&m1_id)
+        .await
+        .expect("seek should succeed");
+    assert_eq!(
+        consumer.pending_ack_count().await,
+        0,
+        "seek should drain all pending_acks"
+    );
+
+    add_consumer_and_flow(&subscription, 1, 2).await;
+    let r1 = rx.recv().await.expect("m1 re-dispatch after seek");
+    assert_eq!(r1.1.payload, b"m1".to_vec());
+    let r2 = rx.recv().await.expect("m2 dispatch after seek");
+    assert_eq!(r2.1.payload, b"m2".to_vec());
+    // m0 should no longer be allocated (mark_delete = m0 has been overridden)
+    assert!(
+        timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .is_err(),
+        "m0 should not be re-dispatched after seek to m1"
+    );
+}
+
+fn metadata_with_publish_time(publish_time: u64) -> Vec<u8> {
+    use crate::protocol::codec::proto::pulsar::MessageMetadata;
+    use prost::Message;
+    MessageMetadata {
+        publish_time,
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
+#[tokio::test]
+async fn persistent_seek_by_publish_time_rewinds_dispatch() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("seek-pt.db");
+    let topic = "persistent://public/default/seek-pt";
+    let subscription_name = "sub";
+
+    {
+        let mut storage = Storage::new(&db_path).unwrap();
+        storage.create_topic(topic).unwrap();
+        open_earliest_cursor(&mut storage, topic, subscription_name);
+        storage
+            .append_message_with_metadata(topic, -1, &metadata_with_publish_time(100), b"m0")
+            .unwrap();
+        storage
+            .append_message_with_metadata(topic, -1, &metadata_with_publish_time(200), b"m1")
+            .unwrap();
+        storage
+            .append_message_with_metadata(topic, -1, &metadata_with_publish_time(300), b"m2")
+            .unwrap();
+    }
+
+    let storage = create_persistent_storage(&db_path);
+    let subscription = create_persistent_subscription(
+        storage.clone(),
+        topic,
+        subscription_name,
+        SubscriptionType::Exclusive,
+    );
+    let (consumer, mut rx) = create_test_consumer_with_capacity(1, subscription.clone(), 8);
+    {
+        let mut sub = subscription.write().await;
+        sub.add_consumer(consumer.clone()).unwrap();
+    }
+
+    // flow 2 -> 接收 m0(pt=100), m1(pt=200), pending_acks=2, read_position 推进到 m2
+    add_consumer_and_flow(&subscription, 1, 2).await;
+    assert_eq!(rx.recv().await.expect("m0").1.payload, b"m0".to_vec());
+    assert_eq!(rx.recv().await.expect("m1").1.payload, b"m1".to_vec());
+    assert_eq!(consumer.pending_ack_count().await, 2);
+
+    // seek by publish_time=200 -> 命中 m1(第一条 pt>=200)
+    subscription
+        .write()
+        .await
+        .seek_by_publish_time(200)
+        .await
+        .expect("seek should succeed");
+    assert_eq!(
+        consumer.pending_ack_count().await,
+        0,
+        "seek should drain pending_acks"
+    );
+
+    // seek 后从 m1 重新派发
+    add_consumer_and_flow(&subscription, 1, 2).await;
+    assert_eq!(
+        rx.recv().await.expect("m1 re-dispatch").1.payload,
+        b"m1".to_vec()
+    );
+    assert_eq!(rx.recv().await.expect("m2").1.payload, b"m2".to_vec());
+    assert!(
+        timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .is_err(),
+        "m0 should not be re-dispatched after seek to publish_time=200"
+    );
+}

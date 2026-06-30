@@ -601,6 +601,11 @@ impl Dispatcher for SharedDispatcher {
         *self.read_position.write().unwrap() = pos;
     }
 
+    fn reset_after_seek(&self, pos: Option<ManagedLedgerPosition>) {
+        self.init_read_position(pos);
+        self.redelivery_controller.write().unwrap().clear();
+    }
+
     fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {
         // Consumer-local permit state is updated by the flow handler before it
         // triggers dispatch. The dispatcher only tracks the aggregate count.
@@ -819,6 +824,52 @@ mod tests {
         assert_eq!(
             dispatcher.pop_redelivery_message().unwrap().message_id,
             pending
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_after_seek_clears_redelivery_queue_and_repositions_read_cursor() {
+        let dispatcher = SharedDispatcher::new();
+
+        // Send a pre-seek red queue message
+        dispatcher
+            .redelivery_controller
+            .write()
+            .unwrap()
+            .add(RedeliveryEntry {
+                message_id: MessageId {
+                    ledger: 0,
+                    entry: 5,
+                    partition: -1,
+                },
+                redelivery_count: 2,
+                sticky_key_hash: None,
+            });
+        assert!(!dispatcher.redelivery_controller.read().unwrap().is_empty());
+
+        // Set an old "read_position"
+        *dispatcher.read_position.write().unwrap() = Some(ManagedLedgerPosition {
+            ledger_id: 0,
+            entry_id: 10,
+            partition: -1,
+        });
+
+        // seek -> entry 3
+        dispatcher.reset_after_seek(Some(ManagedLedgerPosition {
+            ledger_id: 0,
+            entry_id: 3,
+            partition: -1,
+        }));
+
+        // redelivery queue emptied + read_position reset
+        assert!(dispatcher.redelivery_controller.read().unwrap().is_empty());
+        assert_eq!(
+            *dispatcher.read_position.read().unwrap(),
+            Some(ManagedLedgerPosition {
+                ledger_id: 0,
+                entry_id: 3,
+                partition: -1
+            })
         );
     }
 }

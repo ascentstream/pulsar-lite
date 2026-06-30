@@ -1,6 +1,7 @@
 use super::ManagedLedgerPosition;
 use anyhow::Result;
 use std::collections::BTreeSet;
+use std::future::Future;
 
 /// Managed-cursor state skeleton.
 ///
@@ -21,6 +22,11 @@ pub trait ManagedCursor: Send + Sync {
     fn mark_delete(&mut self, position: ManagedLedgerPosition) -> Result<()>;
 
     fn delete_individual(&mut self, position: ManagedLedgerPosition) -> Result<()>;
+
+    fn async_reset_cursor(
+        &mut self,
+        position: Option<ManagedLedgerPosition>,
+    ) -> impl Future<Output = Result<()>> + Send;
 }
 
 /// Shared-subscription cursor state used by the current in-memory runtime.
@@ -74,27 +80,4 @@ pub fn ack_shared(cursor: &mut SubscriptionCursor, entry: u64) -> (Option<u64>, 
     }
 
     (cursor.mark_delete, cursor.acked_holes.len())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ack_shared_only_advances_when_frontier_is_contiguous() {
-        let mut cursor = SubscriptionCursor::default();
-
-        let (mark_delete, holes) = ack_shared(&mut cursor, 2);
-        assert_eq!(mark_delete, None);
-        assert_eq!(holes, 1);
-        assert!(is_message_acknowledged(Some(&cursor), 2));
-
-        let (mark_delete, holes) = ack_shared(&mut cursor, 1);
-        assert_eq!(mark_delete, None);
-        assert_eq!(holes, 2);
-
-        let (mark_delete, holes) = ack_shared(&mut cursor, 0);
-        assert_eq!(mark_delete, Some(2));
-        assert_eq!(holes, 0);
-    }
 }

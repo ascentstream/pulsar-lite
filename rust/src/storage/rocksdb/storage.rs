@@ -158,7 +158,7 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         self.factory.delete_cursor_state(&ledger_name, &cursor_name)
     }
 
-    fn seek_cursor(
+    async fn seek_cursor(
         &mut self,
         topic: &str,
         subscription: &str,
@@ -167,9 +167,11 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
     ) -> Result<()> {
         let ledger_name = keys::managed_ledger_name(topic);
         let cursor_name = keys::encode_cursor_name(subscription);
-        self.factory
-            .delete_cursor_state(&ledger_name, &cursor_name)?;
-        self.apply_start_message_id_cursor(topic, subscription, message_id)
+        let mut ledger = self.factory.open_ledger(&ledger_name)?;
+        let mut cursor = ledger.open_cursor(&cursor_name)?;
+        let position = ManagedLedgerPosition::from(message_id);
+        let mark_delete_position = ledger.previous_position(&position);
+        cursor.async_reset_cursor(mark_delete_position).await
     }
 
     fn first_unacked_position(
@@ -345,5 +347,17 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
             .mark_delete
             .as_ref()
             .map(|position| position.entry_id)
+    }
+
+    fn find_message_id_by_publish_time(
+        &self,
+        topic: &str,
+        publish_time: u64,
+    ) -> Result<Option<MessageId>> {
+        let ledger_name = keys::managed_ledger_name(topic);
+        let ledger = self.factory.open_ledger(&ledger_name)?;
+        Ok(ledger
+            .find_position_by_publish_time(publish_time)
+            .map(MessageId::from))
     }
 }

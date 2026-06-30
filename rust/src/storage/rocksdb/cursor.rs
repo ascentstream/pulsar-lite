@@ -58,6 +58,12 @@ impl ManagedCursor for RocksDBManagedCursor {
         self.state.individually_deleted_entries.insert(position);
         self.persist_state()
     }
+
+    async fn async_reset_cursor(&mut self, position: Option<ManagedLedgerPosition>) -> Result<()> {
+        self.state.mark_delete = position;
+        self.state.individually_deleted_entries.clear();
+        self.persist_state()
+    }
 }
 
 pub(super) fn is_managed_position_acknowledged(

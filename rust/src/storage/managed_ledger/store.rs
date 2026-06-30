@@ -86,7 +86,7 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         }
     }
 
-    fn seek_cursor(
+    async fn seek_cursor(
         &mut self,
         topic: &str,
         subscription: &str,
@@ -94,9 +94,17 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         shared: bool,
     ) -> Result<()> {
         match self {
-            Self::Memory(inner) => inner.seek_cursor(topic, subscription, message_id, shared),
+            Self::Memory(inner) => {
+                inner
+                    .seek_cursor(topic, subscription, message_id, shared)
+                    .await
+            }
             #[cfg(feature = "rocksdb-storage")]
-            Self::RocksDb(inner) => inner.seek_cursor(topic, subscription, message_id, shared),
+            Self::RocksDb(inner) => {
+                inner
+                    .seek_cursor(topic, subscription, message_id, shared)
+                    .await
+            }
         }
     }
 
@@ -255,6 +263,18 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
             Self::Memory(inner) => inner.get_mark_delete_position(topic, subscription),
             #[cfg(feature = "rocksdb-storage")]
             Self::RocksDb(inner) => inner.get_mark_delete_position(topic, subscription),
+        }
+    }
+
+    fn find_message_id_by_publish_time(
+        &self,
+        topic: &str,
+        publish_time: u64,
+    ) -> Result<Option<MessageId>> {
+        match self {
+            Self::Memory(inner) => inner.find_message_id_by_publish_time(topic, publish_time),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(inner) => inner.find_message_id_by_publish_time(topic, publish_time),
         }
     }
 }

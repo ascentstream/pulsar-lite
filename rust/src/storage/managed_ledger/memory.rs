@@ -145,7 +145,7 @@ impl ManagedLedgerStorage for InMemoryManagedLedgerStorage {
         Ok(())
     }
 
-    fn seek_cursor(
+    async fn seek_cursor(
         &mut self,
         topic: &str,
         subscription: &str,
@@ -451,6 +451,12 @@ impl ManagedCursor for InMemoryManagedCursor {
         self.state.individually_deleted_entries.insert(position);
         Ok(())
     }
+
+    async fn async_reset_cursor(&mut self, position: Option<ManagedLedgerPosition>) -> Result<()> {
+        self.state.mark_delete = position;
+        self.state.individually_deleted_entries.clear();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -477,6 +483,35 @@ mod tests {
         assert_eq!(found.0, msg1);
         assert_eq!(found.1, b"1".to_vec());
         assert_eq!(msg0.entry, 0);
+    }
+
+    #[tokio::test]
+    async fn seek_cursor_reposition_first_unacked_to_target() {
+        let topic = "persisitent://public/default/seek";
+        let sub = "sub";
+        let mut storage = InMemoryManagedLedgerStorage::new();
+
+        let m0 = storage.append_message(topic, -1, b"m0").unwrap();
+        let m1 = storage.append_message(topic, -1, b"m1").unwrap();
+
+        // init cursor and ack
+        storage
+            .initialize_or_open_cursor(
+                topic,
+                sub,
+                CursorInitOptions {
+                    initial_position: InitialPosition::Earliest,
+                    start_message_id: None,
+                },
+            )
+            .unwrap();
+
+        storage.ack_message_shared(topic, sub, m0.clone()).unwrap();
+
+        // seek
+        storage.seek_cursor(topic, sub, &m1, true).await.unwrap();
+        let first = storage.first_unacked_position(topic, sub).unwrap();
+        assert_eq!(first, Some(ManagedLedgerPosition::from(&m1)));
     }
 
     #[test]

@@ -414,18 +414,12 @@ where
         seek_cmd.request_id
     );
 
-    let Some(message_id) = seek_cmd.message_id.as_ref().map(|id| MessageId {
+    let message_id = seek_cmd.message_id.as_ref().map(|id| MessageId {
         ledger: id.ledger_id,
         entry: id.entry_id,
         partition: id.partition.unwrap_or(-1),
-    }) else {
-        let response = ServerCommand::Error {
-            request_id: seek_cmd.request_id,
-            error: "seek by publish time is not implemented".to_string(),
-        };
-        framed.send(response).await?;
-        return Ok(());
-    };
+    });
+    let publish_time = seek_cmd.message_publish_time; // Option<u64>
 
     let Some(consumer) = consumers.get(&seek_cmd.consumer_id) else {
         let response = ServerCommand::Error {
@@ -435,14 +429,21 @@ where
         framed.send(response).await?;
         return Ok(());
     };
-
     let subscription = consumer.get_subscription();
-    subscription
-        .write()
-        .await
-        .seek_to_message_id(&message_id)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    let seek_result = if let Some(id) = message_id {
+        subscription.write().await.seek_to_message_id(&id).await
+    } else if let Some(pt) = publish_time {
+        subscription.write().await.seek_by_publish_time(pt).await
+    } else {
+        let response = ServerCommand::Error {
+            request_id: seek_cmd.request_id,
+            error: "seek requires either message_id or message_publish_time".to_string(),
+        };
+        framed.send(response).await?;
+        return Ok(());
+    };
+    seek_result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     let cleared = consumer.drain_pending_acks().await.len();
     if cleared > 0 {
         log::debug!(

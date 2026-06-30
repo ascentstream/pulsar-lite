@@ -6,8 +6,8 @@ use super::ledger::RocksDBManagedLedger;
 use super::metadata::{StoredEntryLocation, StoredManagedLedgerInfo};
 use super::storage::RocksDbManagedLedgerStorage;
 use crate::storage::{
-    ManagedCursor, ManagedLedger, ManagedLedgerConfig, ManagedLedgerFactory, ManagedLedgerPosition,
-    ManagedLedgerStorage,
+    CursorInitOptions, InitialPosition, ManagedCursor, ManagedLedger, ManagedLedgerConfig,
+    ManagedLedgerFactory, ManagedLedgerPosition, ManagedLedgerStorage,
 };
 use prost::Message;
 use rocksdb::{Options, DB};
@@ -833,4 +833,124 @@ fn storage_normalizes_topic_url_and_encodes_cursor_name() {
         .get(keys::managed_cursor_key(ledger_name, subscription))
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn previous_position_handles_same_ledger_cross_ledger_and_before_first() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("previous-position");
+    let db = open_test_db(&db_path);
+    let config = ManagedLedgerConfig {
+        max_entries_per_ledger: Some(2),
+        ..ManagedLedgerConfig::default()
+    };
+    let entry_log = open_test_entry_log(&db_path);
+    let mut factory = RocksDBManagedLedgerFactory::new(Arc::clone(&db), entry_log);
+
+    let mut ledger = factory.open("ledger-a", &config).unwrap();
+    ledger.add_entry(b"first").unwrap();
+    ledger.add_entry(b"second").unwrap();
+    ledger.add_entry(b"third").unwrap();
+
+    // phase 1: entry_id > 0 -> same ledger
+    assert_eq!(
+        ledger.previous_position(&position(0, 1)),
+        Some(position(0, 0))
+    );
+    // phase 2: entry_id == 0 -> The last entry of the previous non-empty ledger
+    assert_eq!(
+        ledger.previous_position(&position(1, 0)),
+        Some(position(0, 1))
+    );
+    // phase 3: The first ledger's entry 0 -> None (before the first)
+    assert_eq!(ledger.previous_position(&position(0, 0)), None);
+}
+
+#[tokio::test]
+async fn seek_cursor_reposition_first_unacked_to_target() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("seek_cursor");
+    let topic = "persisitent://public/default/seek";
+    let sub = "sub";
+
+    let mut storage = RocksDbManagedLedgerStorage::open(&db_path).unwrap();
+    let m0 = storage.append_message(topic, -1, b"m0").unwrap();
+    let m1 = storage.append_message(topic, -1, b"m1").unwrap();
+
+    // init cursor and ack
+    storage
+        .initialize_or_open_cursor(
+            topic,
+            sub,
+            CursorInitOptions {
+                initial_position: InitialPosition::Earliest,
+                start_message_id: None,
+            },
+        )
+        .unwrap();
+    storage.ack_message_shared(topic, sub, m0.clone()).unwrap();
+
+    // seek
+    storage.seek_cursor(topic, sub, &m1, true).await.unwrap();
+    let first = storage.first_unacked_position(topic, sub).unwrap();
+    assert_eq!(first, Some(ManagedLedgerPosition::from(&m1)));
+}
+
+fn metadata_with_publish_time(publish_time: u64) -> Vec<u8> {
+    use crate::protocol::codec::proto::pulsar::MessageMetadata;
+    use prost::Message;
+    MessageMetadata {
+        publish_time,
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
+#[test]
+fn find_message_id_by_publish_time_return_first_at_or_after_timestamp() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("seek-by-time");
+    let topic = "persistent://public/default/seek-by-time";
+    let mut storage = RocksDbManagedLedgerStorage::open(&db_path).unwrap();
+
+    let m0 = storage
+        .append_message_with_metadata(topic, -1, &metadata_with_publish_time(100), b"m0")
+        .unwrap();
+    let m1 = storage
+        .append_message_with_metadata(topic, -1, &metadata_with_publish_time(200), b"m1")
+        .unwrap();
+    let m2 = storage
+        .append_message_with_metadata(topic, -1, &metadata_with_publish_time(300), b"m2")
+        .unwrap();
+
+    assert_eq!(
+        storage.find_message_id_by_publish_time(topic, 50).unwrap(),
+        Some(m0.clone()),
+        "50: The first condition is >= 50, and it matches m0."
+    );
+    assert_eq!(
+        storage.find_message_id_by_publish_time(topic, 100).unwrap(),
+        Some(m0.clone()),
+        "100: >= 100 Hit m0 (Boundary: Exactly equal)"
+    );
+    assert_eq!(
+        storage.find_message_id_by_publish_time(topic, 150).unwrap(),
+        Some(m1.clone()),
+        "150: The first rule >= 150 indicates m1"
+    );
+    assert_eq!(
+        storage.find_message_id_by_publish_time(topic, 200).unwrap(),
+        Some(m1.clone()),
+        "200: >= 200 Hits m1 (Boundary: Exactly equal)"
+    );
+    assert_eq!(
+        storage.find_message_id_by_publish_time(topic, 300).unwrap(),
+        Some(m2.clone()),
+        "300: >= 300 命中 m2"
+    );
+    assert_eq!(
+        storage.find_message_id_by_publish_time(topic, 350).unwrap(),
+        None,
+        "300: >= 300 Hit M2"
+    );
 }

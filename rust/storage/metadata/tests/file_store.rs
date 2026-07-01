@@ -1,4 +1,4 @@
-use pulsar_lite_storage_metadata::{FileMetadataStore, TopicMetadata};
+use pulsar_lite_storage_metadata::{FileMetadataStore, MetadataStore, TopicMetadata};
 use tempfile::tempdir;
 
 #[test]

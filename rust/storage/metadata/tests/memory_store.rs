@@ -1,4 +1,4 @@
-use pulsar_lite_storage_metadata::{InMemoryMetadataStore, TopicMetadata};
+use pulsar_lite_storage_metadata::{InMemoryMetadataStore, MetadataStore, TopicMetadata};
 
 #[test]
 fn in_memory_store_inserts_and_queries_metadata() {

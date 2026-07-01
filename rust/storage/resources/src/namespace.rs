@@ -10,18 +10,17 @@ impl NamespaceResources {
         Self
     }
 
-    pub fn ensure_namespace<S:MetadataStore>(
+    pub fn ensure_namespace<S: MetadataStore>(
         &self,
         metadata: &mut S,
         tenant: &str,
         namespace: &str,
         version: u32,
     ) -> Result<()> {
-        let mut changed =
-          metadata.state_mut().insert_tenant_metadata(tenant);
-          changed |= metadata
-              .state_mut()
-              .insert_namespace_metadata(tenant, namespace);
+        let mut changed = metadata.state_mut().insert_tenant_metadata(tenant);
+        changed |= metadata
+            .state_mut()
+            .insert_namespace_metadata(tenant, namespace);
         if changed {
             metadata.persist_document(version)?;
         }

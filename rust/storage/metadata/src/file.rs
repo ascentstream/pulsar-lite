@@ -24,7 +24,7 @@ impl FileMetadataStore {
         if !self.state.metadata_path().exists() {
             return Ok(None);
         }
-        let content = fs::read_to_string(&self.state.metadata_path()).map_err(|error| {
+        let content = fs::read_to_string(self.state.metadata_path()).map_err(|error| {
             anyhow!(
                 "Failed to read metadata file '{}':{error}",
                 self.state.metadata_path().display()
@@ -73,7 +73,7 @@ impl FileMetadataStore {
                 tmp_path.display()
             )
         })?;
-        fs::rename(&tmp_path, &self.state.metadata_path()).map_err(|error| {
+        fs::rename(&tmp_path, self.state.metadata_path()).map_err(|error| {
             anyhow!(
                 "Failed to replace metadata file '{}' with '{}': {error}",
                 self.state.metadata_path().display(),

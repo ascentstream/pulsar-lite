@@ -1,7 +1,5 @@
 use anyhow::Result;
-use pulsar_lite_storage_metadata::{
-    parse_topic_name, MetadataStore, TopicMetadata,
-};
+use pulsar_lite_storage_metadata::{parse_topic_name, MetadataStore, TopicMetadata};
 use std::collections::HashMap;
 
 /// Topic resource accessor skeleton.
@@ -23,17 +21,13 @@ impl TopicResources {
     ) -> Result<()> {
         let parsed = parse_topic_name(topic)?;
 
-        let mut changed = metadata
-            .state_mut()
-            .insert_tenant_metadata(&parsed.tenant);
+        let mut changed = metadata.state_mut().insert_tenant_metadata(&parsed.tenant);
 
         changed |= metadata
             .state_mut()
-            .insert_namespace_metadata(&parsed.tenant,
-            &parsed.namespace);
+            .insert_namespace_metadata(&parsed.tenant, &parsed.namespace);
 
-        changed |=
-        metadata.state_mut().upsert_topic_metadata(TopicMetadata {
+        changed |= metadata.state_mut().upsert_topic_metadata(TopicMetadata {
             full_name: topic.to_string(),
             domain: parsed.domain,
             tenant: parsed.tenant,
@@ -63,17 +57,13 @@ impl TopicResources {
     ) -> Result<()> {
         let parsed = parse_topic_name(topic)?;
 
-        let mut changed = metadata
-            .state_mut()
-            .insert_tenant_metadata(&parsed.tenant);
+        let mut changed = metadata.state_mut().insert_tenant_metadata(&parsed.tenant);
 
         changed |= metadata
             .state_mut()
-            .insert_namespace_metadata(&parsed.tenant,
-            &parsed.namespace);
+            .insert_namespace_metadata(&parsed.tenant, &parsed.namespace);
 
-        changed |=
-        metadata.state_mut().upsert_topic_metadata(TopicMetadata {
+        changed |= metadata.state_mut().upsert_topic_metadata(TopicMetadata {
             full_name: topic.to_string(),
             domain: parsed.domain,
             tenant: parsed.tenant,

@@ -1,12 +1,9 @@
 mod managed_ledger;
-mod metadata;
-mod resources;
 #[cfg(feature = "rocksdb-storage")]
 pub(crate) mod rocksdb;
 
 use anyhow::Result;
 use log::{debug, info};
-use pulsar_lite_storage_metadata::InMemoryMetadataStore;
 use std::path::Path;
 
 #[cfg(feature = "rocksdb-storage")]
@@ -20,13 +17,13 @@ pub use managed_ledger::{
     ManagedLedgerPosition, ManagedLedgerStorage, ManagedLedgerStore, MessageId, NonPersistentEntry,
     StoredMessage, SubscriptionCursor,
 };
-pub use metadata::{
-    DomainNode, FileMetadataStore, MetadataDocument, MetadataFileNode, MetadataStore,
-    NamespaceMetadata, NamespaceNode, ParsedTopicName, PartitionedTopicNode, SubscriptionMetadata,
-    SubscriptionNode, TenantMetadata, TenantNode, TopicMetadata, TopicNode,
+pub use pulsar_lite_storage_metadata::{
+    parse_topic_name, DomainNode, FileMetadataStore, MetadataDocument, MetadataFileNode,
+    MetadataStore, NamespaceMetadata, NamespaceNode, ParsedTopicName, PartitionedTopicNode,
+    SubscriptionMetadata, SubscriptionNode, TenantMetadata, TenantNode, TopicMetadata, TopicNode,
 };
-pub use resources::{
-    BaseResources, NamespaceResources, PulsarResources, TenantResources, TopicResources,
+pub use pulsar_lite_storage_resources::{
+    NamespaceResources, PulsarResources, TenantResources, TopicResources,
 };
 
 pub(crate) fn decode_publish_time(metadata: &[u8]) -> Option<u64> {
@@ -72,7 +69,7 @@ impl Storage {
     pub fn new_memory(path: &Path) -> Result<Self> {
         info!("In-memory storage initialized (MVP version)");
         let storage = Self {
-            resources: PulsarResources::new(InMemoryMetadataStore::new( )?),
+            resources: PulsarResources::new(path)?,
             managed_ledger: ManagedLedgerStore::memory(),
         };
         Ok(storage)
@@ -581,7 +578,7 @@ mod tests {
 
     #[test]
     fn parse_topic_name_accepts_standard_pulsar_names() {
-        let parsed = Storage::parse_topic_name("persistent://public/default/test").unwrap();
+        let parsed = parse_topic_name("persistent://public/default/test").unwrap();
         assert_eq!(parsed.domain, "persistent");
         assert_eq!(parsed.tenant, "public");
         assert_eq!(parsed.namespace, "default");
@@ -590,7 +587,7 @@ mod tests {
 
     #[test]
     fn parse_topic_name_accepts_non_persistent_names() {
-        let parsed = Storage::parse_topic_name("non-persistent://public/default/test").unwrap();
+        let parsed = parse_topic_name("non-persistent://public/default/test").unwrap();
         assert_eq!(parsed.domain, "non-persistent");
         assert_eq!(parsed.tenant, "public");
         assert_eq!(parsed.namespace, "default");
@@ -599,9 +596,9 @@ mod tests {
 
     #[test]
     fn parse_topic_name_rejects_invalid_names() {
-        assert!(Storage::parse_topic_name("public/default/test").is_err());
-        assert!(Storage::parse_topic_name("persistent://public/default").is_err());
-        assert!(Storage::parse_topic_name("other://public/default/test").is_err());
+        assert!(parse_topic_name("public/default/test").is_err());
+        assert!(parse_topic_name("persistent://public/default").is_err());
+        assert!(parse_topic_name("other://public/default/test").is_err());
     }
 
     #[test]
@@ -635,8 +632,10 @@ mod tests {
         assert!(metadata.partitioned);
         assert_eq!(metadata.partition_count, 3);
 
-        let document = storage.build_metadata_document();
-        let path_key = storage.metadata_path().display().to_string();
+        let document = storage
+            .resources()
+            .build_metadata_document(Storage::METADATA_VERSION);
+        let path_key = storage.resources().metadata_path().display().to_string();
         let topic_node = &document.resource_files[&path_key].tenants["public"].namespaces
             ["default"]
             .domains["persistent"]
@@ -683,8 +682,10 @@ mod tests {
         assert!(!storage.resources().has_subscription(base_topic, "sub"));
         assert!(storage.resources().has_subscription(partition_topic, "sub"));
 
-        let document = storage.build_metadata_document();
-        let path_key = storage.metadata_path().display().to_string();
+        let document = storage
+            .resources()
+            .build_metadata_document(Storage::METADATA_VERSION);
+        let path_key = storage.resources().metadata_path().display().to_string();
         let topics = &document.resource_files[&path_key].tenants["public"].namespaces["default"]
             .domains["persistent"]
             .topics;

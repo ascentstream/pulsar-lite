@@ -21,7 +21,7 @@ pub struct MetadataState {
 impl MetadataState {
     pub fn new(metadata_path: PathBuf) -> Self {
         Self {
-            metadata_path: metadata_path,
+            metadata_path,
             tenants: HashMap::new(),
             namespaces: HashMap::new(),
             topics: HashMap::new(),
@@ -246,7 +246,6 @@ pub trait MetadataStore: Send + Sync {
     fn metadata_path(&self) -> &Path {
         self.state().metadata_path()
     }
-
 }
 /// Build a `MetadataDocument` snapshot from in-memory metadata state.
 /// Shared by `FileMetadataStore` and `InMemoryMetadataStore` so both backends

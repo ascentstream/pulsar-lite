@@ -1,9 +1,6 @@
-use pulsar_lite_storage_metadata::{
-    FileMetadataStore, InMemoryMetadataStore, MetadataStore,
-};
+use pulsar_lite_storage_metadata::{FileMetadataStore, InMemoryMetadataStore, MetadataStore};
 use pulsar_lite_storage_resources::{
-    NamespaceResources, PulsarResources, TenantResources,
-    TopicResources,
+    NamespaceResources, PulsarResources, TenantResources, TopicResources,
 };
 use tempfile::tempdir;
 
@@ -31,8 +28,7 @@ fn namespace_resource_ensures_tenant_parent_and_namespace() {
         .unwrap();
 
     assert!(store.state().has_tenant_metadata("public"));
-    assert!(store.state().has_namespace_metadata("public",
-    "default"));
+    assert!(store.state().has_namespace_metadata("public", "default"));
 }
 
 #[test]
@@ -46,8 +42,7 @@ fn topic_resource_ensures_topic_with_parents() {
         .unwrap();
 
     assert!(store.state().has_tenant_metadata("public"));
-    assert!(store.state().has_namespace_metadata("public",
-    "default"));
+    assert!(store.state().has_namespace_metadata("public", "default"));
 
     let metadata = store.state().get_topic_metadata(topic).unwrap();
     assert_eq!(metadata.full_name, topic);
@@ -94,9 +89,7 @@ fn pulsar_resources_supports_in_memory_metadata_store() {
     let mut resources = PulsarResources::from_metadata_store(store);
     let topic = "persistent://public/default/t3";
 
-    resources
-        .ensure_topic(topic, true, 3, VERSION)
-        .unwrap();
+    resources.ensure_topic(topic, true, 3, VERSION).unwrap();
     resources
         .ensure_subscription(topic, "sub", VERSION)
         .unwrap();
@@ -121,20 +114,15 @@ fn pulsar_resources_file_store_roundtrips_metadata() {
     let topic = "persistent://public/default/roundtrip";
 
     {
-        let mut resources =
-        PulsarResources::<FileMetadataStore>::new(&db_path).unwrap()
-        ;
+        let mut resources = PulsarResources::<FileMetadataStore>::new(&db_path).unwrap();
 
-        resources
-            .ensure_topic(topic, true, 4, VERSION)
-            .unwrap();
+        resources.ensure_topic(topic, true, 4, VERSION).unwrap();
         resources
             .ensure_subscription(topic, "sub", VERSION)
             .unwrap();
     }
 
-    let reopened =
-    PulsarResources::<FileMetadataStore>::new(&db_path).unwrap();
+    let reopened = PulsarResources::<FileMetadataStore>::new(&db_path).unwrap();
 
     assert!(reopened.has_tenant("public"));
     assert!(reopened.has_namespace("public", "default"));

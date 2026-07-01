@@ -10,7 +10,9 @@ fn file_store_roundtrips_metadata_across_reopen() {
     {
         let mut store = FileMetadataStore::new(&db_path).unwrap();
         store.state_mut().insert_tenant_metadata("public");
-        store.state_mut().insert_namespace_metadata("public", "default");
+        store
+            .state_mut()
+            .insert_namespace_metadata("public", "default");
         store.state_mut().upsert_topic_metadata(TopicMetadata {
             full_name: topic.to_string(),
             domain: "persistent".to_string(),

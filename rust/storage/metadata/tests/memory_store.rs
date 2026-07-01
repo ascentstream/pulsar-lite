@@ -7,7 +7,9 @@ fn in_memory_store_inserts_and_queries_metadata() {
     assert!(!store.state_mut().insert_tenant_metadata("public"));
     assert!(store.state().has_tenant_metadata("public"));
 
-    assert!(store.state_mut().insert_namespace_metadata("public", "default"));
+    assert!(store
+        .state_mut()
+        .insert_namespace_metadata("public", "default"));
     assert!(store.state().has_namespace_metadata("public", "default"));
 
     store.state_mut().upsert_topic_metadata(TopicMetadata {
@@ -19,12 +21,17 @@ fn in_memory_store_inserts_and_queries_metadata() {
         partitioned: false,
         partition_count: 0,
     });
-    assert!(store.state()
+    assert!(store
+        .state()
         .get_topic_metadata("persistent://public/default/t")
         .is_some());
 
-    assert!(store.state_mut().insert_subscription_metadata("persistent://public/default/t", "sub"));
-    assert!(store.state().has_subscription_metadata("persistent://public/default/t", "sub"));
+    assert!(store
+        .state_mut()
+        .insert_subscription_metadata("persistent://public/default/t", "sub"));
+    assert!(store
+        .state()
+        .has_subscription_metadata("persistent://public/default/t", "sub"));
 }
 
 #[test]

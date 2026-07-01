@@ -1,8 +1,7 @@
 use crate::{NamespaceResources, TenantResources, TopicResources};
 use anyhow::Result;
 use pulsar_lite_storage_metadata::{
-    FileMetadataStore,MetadataDocument, MetadataStore,
-    TopicMetadata
+    FileMetadataStore, MetadataDocument, MetadataStore, TopicMetadata,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -55,8 +54,7 @@ impl<S: MetadataStore> PulsarResources<S> {
         &mut self.topic_resources
     }
 
-    pub fn ensure_tenant(&mut self, tenant: &str, version: u32) ->
-    Result<()> {
+    pub fn ensure_tenant(&mut self, tenant: &str, version: u32) -> Result<()> {
         self.tenant_resources
             .ensure_tenant(&mut self.metadata, tenant, version)
     }
@@ -65,15 +63,12 @@ impl<S: MetadataStore> PulsarResources<S> {
         self.tenant_resources.has_tenant(&self.metadata, tenant)
     }
 
-    pub fn ensure_namespace(&mut self, tenant: &str, namespace:
-    &str, version: u32) -> Result<()> {
+    pub fn ensure_namespace(&mut self, tenant: &str, namespace: &str, version: u32) -> Result<()> {
         self.namespace_resources
-            .ensure_namespace(&mut self.metadata, tenant, namespace,
-            version)
+            .ensure_namespace(&mut self.metadata, tenant, namespace, version)
     }
 
-    pub fn has_namespace(&self, tenant: &str, namespace: &str) ->
-    bool {
+    pub fn has_namespace(&self, tenant: &str, namespace: &str) -> bool {
         self.namespace_resources
             .has_namespace(&self.metadata, tenant, namespace)
     }
@@ -101,24 +96,20 @@ impl<S: MetadataStore> PulsarResources<S> {
         version: u32,
     ) -> Result<()> {
         self.topic_resources
-            .ensure_subscription(&mut self.metadata, topic,
-            subscription, version)
+            .ensure_subscription(&mut self.metadata, topic, subscription, version)
     }
 
-    pub fn get_partitioned_topic_metadata(&self) -> HashMap<String,
-    usize> {
+    pub fn get_partitioned_topic_metadata(&self) -> HashMap<String, usize> {
         self.topic_resources
             .get_partitioned_topic_metadata(&self.metadata)
     }
 
-    pub fn get_topic_metadata(&self, topic: &str) ->
-    Option<&TopicMetadata> {
+    pub fn get_topic_metadata(&self, topic: &str) -> Option<&TopicMetadata> {
         self.topic_resources
             .get_topic_metadata(&self.metadata, topic)
     }
 
-    pub fn has_subscription(&self, topic: &str, subscription: &str)
-    -> bool {
+    pub fn has_subscription(&self, topic: &str, subscription: &str) -> bool {
         self.topic_resources
             .has_subscription(&self.metadata, topic, subscription)
     }
@@ -135,8 +126,7 @@ impl<S: MetadataStore> PulsarResources<S> {
         self.metadata.metadata_path()
     }
 
-    pub fn build_metadata_document(&self, version: u32) ->
-    MetadataDocument {
+    pub fn build_metadata_document(&self, version: u32) -> MetadataDocument {
         self.metadata.state().build_metadata_document(version)
     }
 }

@@ -1,6 +1,17 @@
 use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
 
+/// Memory Metadata
+//  Example: topics_meta["persistent://public/default/my-topic-partition-0"] = TopicMetadata {
+//     full_name: "persistent://public/default/my-topic-partition-0",
+//     domain: "persistent",
+//     tenant: "public",
+//     namespace: "default",
+//     local_name: "my-topic-partition-0",
+//     partitioned: false,
+//     partition_count: 0,
+// }
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TenantMetadata {
     pub name: String,
@@ -36,6 +47,25 @@ pub struct ParsedTopicName {
     pub namespace: String,
     pub local_name: String,
 }
+
+/// File json Metadata
+//  Example: {
+//          "version": 2,
+//          "/data/storage.db.metadata.json": {
+//               "public": {
+//                 "default": {
+//                   "persistent": {
+//                     "my-topic-partition-0": { "subscriptions": { "sub": {} } },
+//                     "my-topic-partition-1": { "subscriptions": { "sub": {} } },
+//                     "my-topic-partition-2": { "subscriptions": { "sub": {} } }
+//                   }
+//              }
+//             }
+//            },
+//            "partitioned_topics": {
+//              "persistent://public/default/my-topic": { "partitions": 3 }
+//            }
+//       }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MetadataDocument {
@@ -83,6 +113,7 @@ pub struct PartitionedTopicNode {
     pub partitions: usize,
 }
 
+/// persistent://public/default/my-topic-partition-0 -> ParsedTopicName
 pub fn parse_topic_name(topic: &str) -> Result<ParsedTopicName> {
     let (domain, rest) = topic
         .split_once("://")
@@ -107,7 +138,7 @@ pub fn parse_topic_name(topic: &str) -> Result<ParsedTopicName> {
     let local_name = parts
         .next()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("Invalid topic name '{}': missing local topic name", topic))?;
+        .ok_or_else(|| anyhow!("Invalid topic name '{}': missing local name", topic))?;
 
     Ok(ParsedTopicName {
         domain: domain.to_string(),
@@ -117,14 +148,11 @@ pub fn parse_topic_name(topic: &str) -> Result<ParsedTopicName> {
     })
 }
 
-pub fn namespace_key(tenant: &str, namespace: &str) -> String {
-    format!("{tenant}/{namespace}")
-}
-
-pub fn subscription_key(topic: &str, subscription: &str) -> String {
-    format!("{topic}:{subscription}")
-}
-
+/// restore the "physical full name of the partitioned topic" to its "logical topic name".
+/// Examples:
+///     persistent://public/default/my-topic -> persistent://public/default/my-topic
+///     persistent://public/default/my-topic-partition-0 -> persistent://public/default/my-topic
+///     persistent://public/default/my-topic-partition-2 -> persistent://public/default/my-topic
 pub fn logical_topic_name(topic: &str) -> String {
     let Ok(parsed) = parse_topic_name(topic) else {
         return topic.to_string();

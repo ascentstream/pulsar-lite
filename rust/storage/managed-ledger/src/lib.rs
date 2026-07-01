@@ -1,0 +1,1 @@
+//! Managed-ledger core: traits, positions, messages, and in-memory backend.

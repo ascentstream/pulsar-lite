@@ -1,3 +1,27 @@
+[workspace]
+members = [
+    ".",
+    "storage/core",
+    "storage/metadata",
+    "storage/resources",
+    "storage/managed-ledger",
+    "storage/managed-ledger-rocksdb",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = { version = "1.35", features = ["full"] }
+anyhow = "1.0"
+log = "0.4"
+
 [package]
 name = "pulsar-lite"
 version = "0.1.0"
@@ -6,11 +30,15 @@ authors = ["Pulsar Lite Team"]
 license = "Apache-2.0"
 description = "Embedded lightweight message queue compatible with Apache Pulsar"
 
+
 [features]
 default = []
 rocksdb-storage = ["dep:rocksdb"]
 
 [dependencies]
+# Workspace storage crates
+pulsar-lite-storage-metadata = { path = "storage/metadata" }
+
 # 异步运行时
 tokio = { version = "1.35", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }

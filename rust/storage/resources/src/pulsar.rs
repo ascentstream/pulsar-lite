@@ -1,28 +1,34 @@
-use super::{NamespaceResources, TenantResources, TopicResources};
-#[cfg(test)]
-use crate::storage::MetadataDocument;
-use crate::storage::{FileMetadataStore,MetadataStore, TopicMetadata};
+use crate::{NamespaceResources, TenantResources, TopicResources};
 use anyhow::Result;
+use pulsar_lite_storage_metadata::{
+    FileMetadataStore,MetadataDocument, MetadataStore,
+    TopicMetadata
+};
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Aggregated broker resource entrypoint, similar in shape to PulsarResources.
 #[derive(Debug)]
-pub struct PulsarResources {
-    metadata: FileMetadataStore,
+pub struct PulsarResources<S: MetadataStore = FileMetadataStore> {
+    metadata: S,
     tenant_resources: TenantResources,
     namespace_resources: NamespaceResources,
     topic_resources: TopicResources,
 }
 
-impl PulsarResources {
+impl PulsarResources<FileMetadataStore> {
     pub fn new(path: &Path) -> Result<Self> {
-        Ok(Self {
-            metadata: FileMetadataStore::new(path)?,
+        Ok(Self::from_metadata_store(FileMetadataStore::new(path)?))
+    }
+}
+
+impl<S: MetadataStore> PulsarResources<S> {
+    pub fn from_metadata_store(metadata: S) -> Self {
+        Self {
+            metadata,
             tenant_resources: TenantResources::new(),
             namespace_resources: NamespaceResources::new(),
             topic_resources: TopicResources::new(),
-        })
+        }
     }
 
     pub fn tenant(&self) -> &TenantResources {
@@ -49,7 +55,8 @@ impl PulsarResources {
         &mut self.topic_resources
     }
 
-    pub fn ensure_tenant(&mut self, tenant: &str, version: u32) -> Result<()> {
+    pub fn ensure_tenant(&mut self, tenant: &str, version: u32) ->
+    Result<()> {
         self.tenant_resources
             .ensure_tenant(&mut self.metadata, tenant, version)
     }
@@ -58,12 +65,15 @@ impl PulsarResources {
         self.tenant_resources.has_tenant(&self.metadata, tenant)
     }
 
-    pub fn ensure_namespace(&mut self, tenant: &str, namespace: &str, version: u32) -> Result<()> {
+    pub fn ensure_namespace(&mut self, tenant: &str, namespace:
+    &str, version: u32) -> Result<()> {
         self.namespace_resources
-            .ensure_namespace(&mut self.metadata, tenant, namespace, version)
+            .ensure_namespace(&mut self.metadata, tenant, namespace,
+            version)
     }
 
-    pub fn has_namespace(&self, tenant: &str, namespace: &str) -> bool {
+    pub fn has_namespace(&self, tenant: &str, namespace: &str) ->
+    bool {
         self.namespace_resources
             .has_namespace(&self.metadata, tenant, namespace)
     }
@@ -91,35 +101,42 @@ impl PulsarResources {
         version: u32,
     ) -> Result<()> {
         self.topic_resources
-            .ensure_subscription(&mut self.metadata, topic, subscription, version)
+            .ensure_subscription(&mut self.metadata, topic,
+            subscription, version)
     }
 
-    pub fn get_partitioned_topic_metadata(&self) -> HashMap<String, usize> {
+    pub fn get_partitioned_topic_metadata(&self) -> HashMap<String,
+    usize> {
         self.topic_resources
             .get_partitioned_topic_metadata(&self.metadata)
     }
 
-    pub fn get_topic_metadata(&self, topic: &str) -> Option<&TopicMetadata> {
+    pub fn get_topic_metadata(&self, topic: &str) ->
+    Option<&TopicMetadata> {
         self.topic_resources
             .get_topic_metadata(&self.metadata, topic)
     }
 
-    pub fn has_subscription(&self, topic: &str, subscription: &str) -> bool {
+    pub fn has_subscription(&self, topic: &str, subscription: &str)
+    -> bool {
         self.topic_resources
             .has_subscription(&self.metadata, topic, subscription)
     }
 
-    pub fn metadata(&self) -> &FileMetadataStore {
+    pub fn metadata(&self) -> &S {
         &self.metadata
     }
 
-    #[cfg(test)]
-    pub(crate) fn metadata_path(&self) -> &Path {
+    pub fn metadata_mut(&mut self) -> &mut S {
+        &mut self.metadata
+    }
+
+    pub fn metadata_path(&self) -> &Path {
         self.metadata.metadata_path()
     }
 
-    #[cfg(test)]
-    pub(crate) fn build_metadata_document(&self, version: u32) -> MetadataDocument {
-        self.metadata.build_metadata_document(version)
+    pub fn build_metadata_document(&self, version: u32) ->
+    MetadataDocument {
+        self.metadata.state().build_metadata_document(version)
     }
 }

@@ -9,9 +9,9 @@ fn file_store_roundtrips_metadata_across_reopen() {
 
     {
         let mut store = FileMetadataStore::new(&db_path).unwrap();
-        store.insert_tenant_metadata("public");
-        store.insert_namespace_metadata("public", "default");
-        store.upsert_topic_metadata(TopicMetadata {
+        store.state_mut().insert_tenant_metadata("public");
+        store.state_mut().insert_namespace_metadata("public", "default");
+        store.state_mut().upsert_topic_metadata(TopicMetadata {
             full_name: topic.to_string(),
             domain: "persistent".to_string(),
             tenant: "public".to_string(),
@@ -20,13 +20,13 @@ fn file_store_roundtrips_metadata_across_reopen() {
             partitioned: false,
             partition_count: 0,
         });
-        store.insert_subscription_metadata(topic, "sub");
+        store.state_mut().insert_subscription_metadata(topic, "sub");
         store.persist_document(2).unwrap();
     }
 
     let reopened = FileMetadataStore::new(&db_path).unwrap();
-    assert!(reopened.has_tenant_metadata("public"));
-    assert!(reopened.has_namespace_metadata("public", "default"));
-    assert!(reopened.get_topic_metadata(topic).is_some());
-    assert!(reopened.has_subscription_metadata(topic, "sub"));
+    assert!(reopened.state().has_tenant_metadata("public"));
+    assert!(reopened.state().has_namespace_metadata("public", "default"));
+    assert!(reopened.state().get_topic_metadata(topic).is_some());
+    assert!(reopened.state().has_subscription_metadata(topic, "sub"));
 }

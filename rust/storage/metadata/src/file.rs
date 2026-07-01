@@ -1,11 +1,6 @@
-use crate::key::{namespace_key, subscription_key};
-use crate::model::{
-    parse_topic_name, MetadataDocument, NamespaceMetadata, SubscriptionMetadata, TenantMetadata,
-    TopicMetadata,
-};
+use crate::model::MetadataDocument;
 use crate::store::{MetadataState, MetadataStore};
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 

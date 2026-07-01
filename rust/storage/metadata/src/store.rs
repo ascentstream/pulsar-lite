@@ -247,47 +247,6 @@ pub trait MetadataStore: Send + Sync {
         self.state().metadata_path()
     }
 
-    fn insert_tenant_metadata(&mut self, tenant: &str) -> bool {
-        self.state_mut().insert_tenant_metadata(tenant)
-    }
-
-    fn insert_namespace_metadata(&mut self, tenant: &str, namespace: &str) -> bool {
-        self.state_mut()
-            .insert_namespace_metadata(tenant, namespace)
-    }
-
-    fn upsert_topic_metadata(&mut self, metadata: TopicMetadata) -> bool {
-        self.state_mut().upsert_topic_metadata(metadata)
-    }
-
-    fn insert_subscription_metadata(&mut self, topic: &str, subscription: &str) -> bool {
-        self.state_mut()
-            .insert_subscription_metadata(topic, subscription)
-    }
-
-    fn has_tenant_metadata(&self, tenant: &str) -> bool {
-        self.state().has_tenant_metadata(tenant)
-    }
-
-    fn has_namespace_metadata(&self, tenant: &str, namespace: &str) -> bool {
-        self.state().has_namespace_metadata(tenant, namespace)
-    }
-
-    fn has_subscription_metadata(&self, topic: &str, subscription: &str) -> bool {
-        self.state().has_subscription_metadata(topic, subscription)
-    }
-
-    fn get_topic_metadata(&self, topic: &str) -> Option<&TopicMetadata> {
-        self.state().get_topic_metadata(topic)
-    }
-
-    fn get_partitioned_topic_metadata(&self) -> HashMap<String, usize> {
-        self.state().get_partitioned_topic_metadata()
-    }
-
-    fn build_metadata_document(&self, version: u32) -> MetadataDocument {
-        self.state().build_metadata_document(version)
-    }
 }
 /// Build a `MetadataDocument` snapshot from in-memory metadata state.
 /// Shared by `FileMetadataStore` and `InMemoryMetadataStore` so both backends

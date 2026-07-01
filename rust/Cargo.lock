@@ -796,6 +796,7 @@ dependencies = [
  "prost-build",
  "prost-types",
  "pulsar-lite-storage-metadata",
+ "pulsar-lite-storage-resources",
  "rocksdb",
  "serde",
  "serde_json",
@@ -834,6 +835,14 @@ dependencies = [
 [[package]]
 name = "pulsar-lite-storage-resources"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "pulsar-lite-storage-metadata",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "quote"

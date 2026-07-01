@@ -1,11 +1,6 @@
-use crate::key::{namespace_key, subscription_key};
-use crate::model::{
-    MetadataDocument, NamespaceMetadata, SubscriptionMetadata, TenantMetadata, TopicMetadata,
-};
 use crate::store::{MetadataState, MetadataStore};
 use anyhow::Result;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// In-memory metadata store: no persistence, used for tests and ephemeral runs.
 ///

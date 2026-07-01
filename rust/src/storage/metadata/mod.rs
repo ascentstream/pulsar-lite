@@ -8,7 +8,7 @@
 
 pub(crate) use pulsar_lite_storage_metadata::parse_topic_name;
 pub use pulsar_lite_storage_metadata::{
-    DomainNode, FileMetadataStore as MetadataStore, MetadataDocument, MetadataFileNode,
+    DomainNode, FileMetadataStore, MetadataDocument, MetadataFileNode, MetadataStore,
     NamespaceMetadata, NamespaceNode, ParsedTopicName, PartitionedTopicNode, SubscriptionMetadata,
     SubscriptionNode, TenantMetadata, TenantNode, TopicMetadata, TopicNode,
 };

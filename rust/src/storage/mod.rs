@@ -6,6 +6,7 @@ pub(crate) mod rocksdb;
 
 use anyhow::Result;
 use log::{debug, info};
+use pulsar_lite_storage_metadata::InMemoryMetadataStore;
 use std::path::Path;
 
 #[cfg(feature = "rocksdb-storage")]
@@ -20,9 +21,9 @@ pub use managed_ledger::{
     StoredMessage, SubscriptionCursor,
 };
 pub use metadata::{
-    DomainNode, MetadataDocument, MetadataFileNode, MetadataStore, NamespaceMetadata,
-    NamespaceNode, ParsedTopicName, PartitionedTopicNode, SubscriptionMetadata, SubscriptionNode,
-    TenantMetadata, TenantNode, TopicMetadata, TopicNode,
+    DomainNode, FileMetadataStore, MetadataDocument, MetadataFileNode, MetadataStore,
+    NamespaceMetadata, NamespaceNode, ParsedTopicName, PartitionedTopicNode, SubscriptionMetadata,
+    SubscriptionNode, TenantMetadata, TenantNode, TopicMetadata, TopicNode,
 };
 pub use resources::{
     BaseResources, NamespaceResources, PulsarResources, TenantResources, TopicResources,
@@ -47,7 +48,7 @@ pub(crate) fn decode_publish_time(metadata: &[u8]) -> Option<u64> {
 #[derive(Debug)]
 pub struct Storage {
     // Aggregated broker resource access aligned with PulsarResources.
-    resources: PulsarResources,
+    resources: PulsarResources<FileMetadataStore>,
     // Persistent-topic managed-ledger state.
     managed_ledger: ManagedLedgerStore,
 }
@@ -71,7 +72,7 @@ impl Storage {
     pub fn new_memory(path: &Path) -> Result<Self> {
         info!("In-memory storage initialized (MVP version)");
         let storage = Self {
-            resources: PulsarResources::new(path)?,
+            resources: PulsarResources::new(InMemoryMetadataStore::new( )?),
             managed_ledger: ManagedLedgerStore::memory(),
         };
         Ok(storage)

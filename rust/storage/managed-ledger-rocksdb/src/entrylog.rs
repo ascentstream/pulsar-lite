@@ -15,7 +15,7 @@ const ENTRY_HEADER_LEN: u16 = 44;
 const DEFAULT_LOG_SIZE_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
-pub(super) struct EntryIndex {
+pub struct EntryIndex {
     pub ledger_id: u64,
     pub entry_id: u64,
     pub file_id: u64,
@@ -26,10 +26,10 @@ pub(super) struct EntryIndex {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct EntryRecord {
-    pub(super) partition: i32,
-    pub(super) metadata: Vec<u8>,
-    pub(super) payload: Vec<u8>,
+pub struct EntryRecord {
+    pub partition: i32,
+    pub metadata: Vec<u8>,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -39,19 +39,19 @@ struct EntryLogState {
 }
 
 #[derive(Debug)]
-pub(super) struct EntryLogStore {
+pub struct EntryLogStore {
     dir: PathBuf,
     log_size_limit: u64,
     state: Mutex<EntryLogState>,
 }
 
 impl EntryLogStore {
-    pub(super) fn open(root: &Path) -> Result<Self> {
+    pub fn open(root: &Path) -> Result<Self> {
         Self::open_with_limit(root, DEFAULT_LOG_SIZE_LIMIT)
     }
 
-    #[cfg(test)]
-    pub(super) fn open_with_log_size_limit(root: &Path, log_size_limit: u64) -> Result<Self> {
+    #[doc(hidden)]
+    pub fn open_with_log_size_limit(root: &Path, log_size_limit: u64) -> Result<Self> {
         Self::open_with_limit(root, log_size_limit)
     }
 
@@ -70,8 +70,8 @@ impl EntryLogStore {
         })
     }
 
-    #[cfg(test)]
-    pub(super) fn default_log_size_limit() -> u64 {
+    #[doc(hidden)]
+    pub fn default_log_size_limit() -> u64 {
         DEFAULT_LOG_SIZE_LIMIT
     }
 
@@ -114,8 +114,8 @@ impl EntryLogStore {
             .fold(0u64, |acc, byte| acc.wrapping_add(*byte as u64))
     }
 
-    #[cfg(test)]
-    pub(super) fn append(
+    #[doc(hidden)]
+    pub fn append(
         &self,
         ledger_id: u64,
         entry_id: u64,
@@ -125,7 +125,7 @@ impl EntryLogStore {
         self.append_with_metadata(ledger_id, entry_id, partition, &[], payload)
     }
 
-    pub(super) fn append_with_metadata(
+    pub fn append_with_metadata(
         &self,
         ledger_id: u64,
         entry_id: u64,
@@ -176,7 +176,7 @@ impl EntryLogStore {
         })
     }
 
-    pub(super) fn read(&self, index: &EntryIndex) -> Result<EntryRecord> {
+    pub fn read(&self, index: &EntryIndex) -> Result<EntryRecord> {
         let path = self.entry_log_path(index.file_id);
         let mut file = OpenOptions::new().read(true).open(&path)?;
 

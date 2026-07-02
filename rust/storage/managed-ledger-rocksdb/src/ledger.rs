@@ -6,28 +6,28 @@ use anyhow::{anyhow, Result};
 use rocksdb::{WriteBatch, DB};
 use std::sync::Arc;
 
-use crate::storage::{
+use pulsar_lite_storage_managed_ledger::{
     ManagedLedger, ManagedLedgerConfig, ManagedLedgerPosition, MessageId, StoredMessage,
 };
 
 const DEFAULT_MAX_ENTRIES_PER_LEDGER: u64 = 50_000;
 
 #[derive(Debug, Clone)]
-pub(super) struct RocksDBManagedLedger {
+pub struct RocksDBManagedLedger {
     name: String,
     db: Arc<DB>,
-    pub(super) info: StoredManagedLedgerInfo,
+    pub info: StoredManagedLedgerInfo,
     entries: Vec<(ManagedLedgerPosition, EntryIndex)>,
     max_entries_per_ledger: u64,
     entry_log: Arc<EntryLogStore>,
 }
 
 impl RocksDBManagedLedger {
-    pub(super) fn open(name: &str, db: Arc<DB>, entry_log: Arc<EntryLogStore>) -> Result<Self> {
+    pub fn open(name: &str, db: Arc<DB>, entry_log: Arc<EntryLogStore>) -> Result<Self> {
         Self::open_with_config(name, db, entry_log, &ManagedLedgerConfig::default())
     }
 
-    pub(super) fn open_with_config(
+    pub fn open_with_config(
         name: &str,
         db: Arc<DB>,
         entry_log: Arc<EntryLogStore>,
@@ -118,7 +118,7 @@ impl RocksDBManagedLedger {
         Ok(entries)
     }
 
-    pub(super) fn add_entry_with_partition(
+    pub fn add_entry_with_partition(
         &mut self,
         partition: i32,
         payload: &[u8],
@@ -126,7 +126,7 @@ impl RocksDBManagedLedger {
         self.add_entry_with_partition_and_metadata(partition, &[], payload)
     }
 
-    pub(super) fn add_entry_with_partition_and_metadata(
+    pub fn add_entry_with_partition_and_metadata(
         &mut self,
         partition: i32,
         metadata: &[u8],
@@ -176,11 +176,16 @@ impl RocksDBManagedLedger {
         Ok(position)
     }
 
+    #[allow(dead_code)]
+    pub fn ledger_info(&self) -> &StoredManagedLedgerInfo {
+        &self.info
+    }
+
     /// Position immediately before `position` in ledger/entry order.
     /// - entry_id > 0  -> same ledger, entry_id - 1
     /// - entry_id == 0 -> last entry of the previous non-empty ledger
     /// - no previous   -> None ("before first entry", i.e. seek to earliest)
-    pub(super) fn previous_position(
+    pub fn previous_position(
         &self,
         position: &ManagedLedgerPosition,
     ) -> Option<ManagedLedgerPosition> {
@@ -204,50 +209,12 @@ impl RocksDBManagedLedger {
         })
     }
 
-    /// Find the position of the first entry whose publish_time >= `publish_time`,
-    #[allow(dead_code)] // re-enabled in Phase 6 when rocksdb backend migrates to its own crate
-    /// (predicate `publish_time < timestamp`, find largest matched, then next position).
-    ///
-    /// Returns None when all entries have publish_time < `publish_time` (seek past end).
-    /// Assumes publish_time is monotonically non-decreasing along `self.entries` order.
-    pub(super) fn find_position_by_publish_time(
-        &self,
-        publish_time: u64,
-    ) -> Option<ManagedLedgerPosition> {
-        let n = self.entries.len();
-        if n == 0 {
-            return None;
-        }
-        let mut lo = 0usize;
-        let mut hi = n;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let pt = self.entry_publish_time(mid);
-            if pt < publish_time {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        self.entries.get(lo).map(|(position, _)| position.clone())
-    }
-
-    #[allow(dead_code)] // re-enabled in Phase 6 when rocksdb backend migrates to its own crate
-    fn entry_publish_time(&self, i: usize) -> u64 {
-        let (_, index) = &self.entries[i];
-        self.entry_log
-            .read(index)
-            .ok()
-            .and_then(|entry| crate::storage::decode_publish_time(&entry.metadata))
-            .unwrap_or(u64::MAX)
-    }
-
-    pub(super) fn get_message_by_id(&self, message_id: &MessageId) -> Option<(MessageId, Vec<u8>)> {
+    pub fn get_message_by_id(&self, message_id: &MessageId) -> Option<(MessageId, Vec<u8>)> {
         self.get_message_entry_by_id(message_id)
             .map(|entry| (entry.message_id, entry.payload))
     }
 
-    pub(super) fn get_message_entry_by_id(&self, message_id: &MessageId) -> Option<StoredMessage> {
+    pub fn get_message_entry_by_id(&self, message_id: &MessageId) -> Option<StoredMessage> {
         self.entries
             .iter()
             .find(|(position, _)| {
@@ -266,14 +233,14 @@ impl RocksDBManagedLedger {
             })
     }
 
-    pub(super) fn messages(&self) -> Vec<(MessageId, Vec<u8>)> {
+    pub fn messages(&self) -> Vec<(MessageId, Vec<u8>)> {
         self.message_entries()
             .into_iter()
             .map(|entry| (entry.message_id, entry.payload))
             .collect()
     }
 
-    pub(super) fn message_entries(&self) -> Vec<StoredMessage> {
+    pub fn message_entries(&self) -> Vec<StoredMessage> {
         self.entries
             .iter()
             .filter_map(|(position, index)| {

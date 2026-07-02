@@ -7,7 +7,7 @@ use rocksdb::{Options, DB};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::storage::{
+use pulsar_lite_storage_managed_ledger::{
     first_unacked_from_messages, last_position_from_messages, read_from_messages,
     CursorInitOptions, CursorOpenResult, InitialPosition, ManagedCursor, ManagedLedger,
     ManagedLedgerPosition, ManagedLedgerStorage, MessageId, StoredMessage,

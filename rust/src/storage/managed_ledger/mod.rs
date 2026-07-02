@@ -11,8 +11,3 @@ pub use pulsar_lite_storage_managed_ledger::{
     SubscriptionCursor,
 };
 pub use store::ManagedLedgerStore;
-
-#[cfg(feature = "rocksdb-storage")]
-pub(crate) use pulsar_lite_storage_managed_ledger::{
-    first_unacked_from_messages, last_position_from_messages, read_from_messages,
-};

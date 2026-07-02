@@ -1,24 +1,24 @@
 use super::entrylog::EntryIndex;
-use crate::storage::{ManagedCursorState, ManagedLedgerPosition};
+use pulsar_lite_storage_managed_ledger::{ManagedCursorState, ManagedLedgerPosition};
 use anyhow::{anyhow, Result};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(super) mod proto {
+pub mod proto {
     #![allow(dead_code)]
 
     include!(concat!(env!("OUT_DIR"), "/mledger.proto.rs"));
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct StoredEntryLocation {
-    pub(super) file_id: u64,
-    pub(super) offset: u64,
-    pub(super) len: u64,
-    pub(super) checksum: u64,
-    pub(super) partition: i32,
+pub struct StoredEntryLocation {
+    pub file_id: u64,
+    pub offset: u64,
+    pub len: u64,
+    pub checksum: u64,
+    pub partition: i32,
 }
 
 impl From<EntryIndex> for StoredEntryLocation {
@@ -34,9 +34,9 @@ impl From<EntryIndex> for StoredEntryLocation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct StoredManagedCursorState {
-    pub(super) mark_delete: Option<ManagedLedgerPosition>,
-    pub(super) individually_deleted_entries: BTreeSet<ManagedLedgerPosition>,
+pub struct StoredManagedCursorState {
+    pub mark_delete: Option<ManagedLedgerPosition>,
+    pub individually_deleted_entries: BTreeSet<ManagedLedgerPosition>,
 }
 
 impl From<ManagedCursorState> for StoredManagedCursorState {
@@ -58,7 +58,7 @@ impl From<StoredManagedCursorState> for ManagedCursorState {
 }
 
 impl StoredManagedCursorState {
-    pub(super) fn encode_to_vec(&self) -> Vec<u8> {
+    pub fn encode_to_vec(&self) -> Vec<u8> {
         let mark_delete = self.mark_delete.as_ref();
         #[allow(deprecated)]
         let info = proto::ManagedCursorInfo {
@@ -78,7 +78,7 @@ impl StoredManagedCursorState {
         info.encode_to_vec()
     }
 
-    pub(super) fn decode(bytes: &[u8]) -> Result<Self> {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
         let info = proto::ManagedCursorInfo::decode(bytes)?;
         let mark_delete = match (info.mark_delete_ledger_id, info.mark_delete_entry_id) {
             (Some(ledger_id), Some(entry_id)) => Some(ManagedLedgerPosition {
@@ -113,17 +113,17 @@ impl StoredManagedCursorState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct StoredLedgerInfo {
-    pub(super) ledger_id: u64,
-    pub(super) entries: u64,
-    pub(super) size: u64,
-    pub(super) timestamp: u64,
-    pub(super) is_offloaded: bool,
-    pub(super) offloaded_context_uuid: Option<String>,
+pub struct StoredLedgerInfo {
+    pub ledger_id: u64,
+    pub entries: u64,
+    pub size: u64,
+    pub timestamp: u64,
+    pub is_offloaded: bool,
+    pub offloaded_context_uuid: Option<String>,
 }
 
 impl StoredLedgerInfo {
-    pub(super) fn new(ledger_id: u64) -> Self {
+    pub fn new(ledger_id: u64) -> Self {
         Self {
             ledger_id,
             entries: 0,
@@ -136,38 +136,38 @@ impl StoredLedgerInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct StoredManagedLedgerInfo {
-    pub(super) ledgers: Vec<StoredLedgerInfo>,
+pub struct StoredManagedLedgerInfo {
+    pub ledgers: Vec<StoredLedgerInfo>,
 }
 
 impl StoredManagedLedgerInfo {
-    pub(super) fn new(ledger_id: u64) -> Self {
+    pub fn new(ledger_id: u64) -> Self {
         Self {
             ledgers: vec![StoredLedgerInfo::new(ledger_id)],
         }
     }
 
-    pub(super) fn current_ledger_mut(&mut self) -> &mut StoredLedgerInfo {
+    pub fn current_ledger_mut(&mut self) -> &mut StoredLedgerInfo {
         self.ledgers.last_mut().expect("ledger info is initialized")
     }
 
-    pub(super) fn ensure_initialized(&mut self, ledger_id: u64) {
+    pub fn ensure_initialized(&mut self, ledger_id: u64) {
         if self.ledgers.is_empty() {
             self.ledgers.push(StoredLedgerInfo::new(ledger_id));
         }
     }
 
-    pub(super) fn current_ledger_is_full(&mut self, max_entries_per_ledger: u64) -> bool {
+    pub fn current_ledger_is_full(&mut self, max_entries_per_ledger: u64) -> bool {
         self.current_ledger_mut().entries >= max_entries_per_ledger
     }
 
-    pub(super) fn roll_over_current_ledger(&mut self, next_ledger_id: u64) {
+    pub fn roll_over_current_ledger(&mut self, next_ledger_id: u64) {
         let current_ledger = self.current_ledger_mut();
         current_ledger.timestamp = current_time_millis();
         self.ledgers.push(StoredLedgerInfo::new(next_ledger_id));
     }
 
-    pub(super) fn encode_to_vec(&self) -> Vec<u8> {
+    pub fn encode_to_vec(&self) -> Vec<u8> {
         let info = proto::ManagedLedgerInfo {
             ledger_info: self
                 .ledgers
@@ -186,7 +186,7 @@ impl StoredManagedLedgerInfo {
         info.encode_to_vec()
     }
 
-    pub(super) fn decode(bytes: &[u8]) -> Result<Self> {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
         let info = proto::ManagedLedgerInfo::decode(bytes)?;
         let ledgers = info
             .ledger_info

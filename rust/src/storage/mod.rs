@@ -1,15 +1,9 @@
 mod managed_ledger;
-#[cfg(feature = "rocksdb-storage")]
-pub(crate) mod rocksdb;
 
 use anyhow::Result;
 use log::{debug, info};
 use std::path::Path;
 
-#[cfg(feature = "rocksdb-storage")]
-pub(crate) use managed_ledger::{
-    first_unacked_from_messages, last_position_from_messages, read_from_messages,
-};
 pub use managed_ledger::{
     CursorInitOptions, CursorOpenResult, InMemoryManagedCursor, InMemoryManagedLedger,
     InMemoryManagedLedgerFactory, InMemoryManagedLedgerStorage, InitialPosition, ManagedCursor,

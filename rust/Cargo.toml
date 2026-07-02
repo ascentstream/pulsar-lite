@@ -33,13 +33,14 @@ description = "Embedded lightweight message queue compatible with Apache Pulsar"
 
 [features]
 default = []
-rocksdb-storage = ["dep:rocksdb"]
+rocksdb-storage = ["dep:pulsar-lite-storage-managed-ledger-rocksdb"]
 
 [dependencies]
 # Workspace storage crates
 pulsar-lite-storage-metadata = { path = "storage/metadata" }
 pulsar-lite-storage-resources = { path ="storage/resources" }
 pulsar-lite-storage-managed-ledger = { path = "storage/managed-ledger" }
+pulsar-lite-storage-managed-ledger-rocksdb = { path = "storage/managed-ledger-rocksdb", optional = true }
 
 # 异步运行时
 tokio = { version = "1.35", features = ["full"] }
@@ -63,7 +64,6 @@ env_logger = "0.11"
 # 错误处理
 thiserror = "1.0"
 anyhow = "1.0"
-rocksdb = { version = "0.24", default-features = false, optional = true }
 
 # Async trait support
 async-trait = "0.1"

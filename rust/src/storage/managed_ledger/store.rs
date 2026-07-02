@@ -3,7 +3,7 @@ use pulsar_lite_storage_managed_ledger::{
     ManagedLedgerStorage, MessageId, StoredMessage,
 };
 #[cfg(feature = "rocksdb-storage")]
-use crate::storage::rocksdb::RocksDbManagedLedgerStorage;
+use pulsar_lite_storage_managed_ledger_rocksdb::RocksDbManagedLedgerStorage;
 use anyhow::Result;
 #[cfg(feature = "rocksdb-storage")]
 use std::path::Path;

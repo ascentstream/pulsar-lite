@@ -176,8 +176,23 @@ impl Storage {
         topic: &str,
         publish_time: u64,
     ) -> Result<Option<MessageId>> {
-        self.managed_ledger
-            .find_message_id_by_publish_time(topic, publish_time)
+        let entries = self.managed_ledger.get_message_entries(topic);
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let mut last_earlier: Option<usize> = None;
+        for (i, entry) in entries.iter().enumerate() {
+            match decode_publish_time(&entry.metadata) {
+                Some(pt) if pt < publish_time => last_earlier = Some(i),
+                Some(_) => break,
+                None => {}
+            }
+        }
+        let target = match last_earlier {
+            None => Some(entries[0].message_id.clone()),
+            Some(i) => entries.get(i + 1).map(|e| e.message_id.clone()),
+        };
+        Ok(target)
     }
 
     pub fn first_unacked_position(

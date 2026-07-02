@@ -1,4 +1,4 @@
-use super::types::{ManagedLedgerPosition, MessageId};
+use crate::position::{ManagedLedgerPosition, MessageId};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum InitialPosition {

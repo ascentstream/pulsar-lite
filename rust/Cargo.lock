@@ -795,6 +795,7 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
+ "pulsar-lite-storage-managed-ledger",
  "pulsar-lite-storage-metadata",
  "pulsar-lite-storage-resources",
  "rocksdb",
@@ -816,6 +817,14 @@ version = "0.1.0"
 [[package]]
 name = "pulsar-lite-storage-managed-ledger"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "log",
+ "serde",
+ "tempfile",
+ "tokio",
+]
 
 [[package]]
 name = "pulsar-lite-storage-managed-ledger-rocksdb"

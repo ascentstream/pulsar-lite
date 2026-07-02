@@ -1,4 +1,5 @@
-use super::{ManagedLedger, ManagedLedgerConfig};
+use crate::config::ManagedLedgerConfig;
+use crate::ledger::ManagedLedger;
 use anyhow::Result;
 
 /// Factory abstraction for opening managed ledgers.

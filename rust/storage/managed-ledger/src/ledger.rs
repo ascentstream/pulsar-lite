@@ -1,4 +1,5 @@
-use super::{ManagedCursor, ManagedLedgerPosition};
+use crate::cursor::ManagedCursor;
+use crate::position::ManagedLedgerPosition;
 use anyhow::Result;
 
 /// Managed-ledger abstraction for durable append-only message storage.

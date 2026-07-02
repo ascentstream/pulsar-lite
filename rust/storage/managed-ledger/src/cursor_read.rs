@@ -1,4 +1,4 @@
-use super::types::{ManagedLedgerPosition, MessageId};
+use crate::position::{ManagedLedgerPosition, MessageId};
 
 pub fn cursor_subscription_key(topic: &str, subscription: &str) -> String {
     format!("{}:{}", topic, subscription)

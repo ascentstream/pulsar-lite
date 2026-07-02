@@ -1,4 +1,4 @@
-use super::ManagedLedgerPosition;
+use crate::position::ManagedLedgerPosition;
 use anyhow::Result;
 use std::collections::BTreeSet;
 use std::future::Future;

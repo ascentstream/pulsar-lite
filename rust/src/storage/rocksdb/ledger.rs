@@ -205,6 +205,7 @@ impl RocksDBManagedLedger {
     }
 
     /// Find the position of the first entry whose publish_time >= `publish_time`,
+    #[allow(dead_code)] // re-enabled in Phase 6 when rocksdb backend migrates to its own crate
     /// (predicate `publish_time < timestamp`, find largest matched, then next position).
     ///
     /// Returns None when all entries have publish_time < `publish_time` (seek past end).
@@ -231,6 +232,7 @@ impl RocksDBManagedLedger {
         self.entries.get(lo).map(|(position, _)| position.clone())
     }
 
+    #[allow(dead_code)] // re-enabled in Phase 6 when rocksdb backend migrates to its own crate
     fn entry_publish_time(&self, i: usize) -> u64 {
         let (_, index) = &self.entries[i];
         self.entry_log

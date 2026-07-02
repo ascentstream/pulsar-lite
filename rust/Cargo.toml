@@ -39,6 +39,7 @@ rocksdb-storage = ["dep:rocksdb"]
 # Workspace storage crates
 pulsar-lite-storage-metadata = { path = "storage/metadata" }
 pulsar-lite-storage-resources = { path ="storage/resources" }
+pulsar-lite-storage-managed-ledger = { path = "storage/managed-ledger" }
 
 # 异步运行时
 tokio = { version = "1.35", features = ["full"] }

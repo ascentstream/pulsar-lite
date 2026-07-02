@@ -4,10 +4,10 @@ use anyhow::Result;
 use rocksdb::DB;
 use std::sync::Arc;
 
-use crate::storage::{ManagedCursor, ManagedCursorState, ManagedLedgerPosition};
+use pulsar_lite_storage_managed_ledger::{ManagedCursor, ManagedCursorState, ManagedLedgerPosition};
 
 #[derive(Debug, Clone)]
-pub(super) struct RocksDBManagedCursor {
+pub struct RocksDBManagedCursor {
     managedledger_name: String,
     name: String,
     db: Arc<DB>,
@@ -15,7 +15,7 @@ pub(super) struct RocksDBManagedCursor {
 }
 
 impl RocksDBManagedCursor {
-    pub(super) fn open(managedledger_name: &str, name: &str, db: Arc<DB>) -> Result<Self> {
+    pub fn open(managedledger_name: &str, name: &str, db: Arc<DB>) -> Result<Self> {
         let key = keys::managed_cursor_key(managedledger_name, name);
         let state = db
             .get(key)?
@@ -32,7 +32,7 @@ impl RocksDBManagedCursor {
         })
     }
 
-    pub(super) fn persist_state(&self) -> Result<()> {
+    pub fn persist_state(&self) -> Result<()> {
         let key = keys::managed_cursor_key(&self.managedledger_name, &self.name);
         let stored = StoredManagedCursorState::from(self.state.clone());
         self.db.put(key, stored.encode_to_vec())?;
@@ -66,7 +66,7 @@ impl ManagedCursor for RocksDBManagedCursor {
     }
 }
 
-pub(super) fn is_managed_position_acknowledged(
+pub fn is_managed_position_acknowledged(
     cursor: &ManagedCursorState,
     position: &ManagedLedgerPosition,
 ) -> bool {
@@ -88,7 +88,7 @@ fn first_position(info: &StoredManagedLedgerInfo, partition: i32) -> Option<Mana
         })
 }
 
-pub(super) fn next_position(
+pub fn next_position(
     position: &ManagedLedgerPosition,
     info: &StoredManagedLedgerInfo,
 ) -> Option<ManagedLedgerPosition> {
@@ -115,7 +115,7 @@ pub(super) fn next_position(
         })
 }
 
-pub(super) fn ack_managed_cursor_shared(
+pub fn ack_managed_cursor_shared(
     cursor: &mut RocksDBManagedCursor,
     position: ManagedLedgerPosition,
     info: &StoredManagedLedgerInfo,

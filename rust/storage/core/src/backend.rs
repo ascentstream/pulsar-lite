@@ -1,10 +1,10 @@
+use crate::error::StorageResult;
 use pulsar_lite_storage_managed_ledger::{
     CursorInitOptions, CursorOpenResult, InMemoryManagedLedgerStorage, ManagedLedgerPosition,
     ManagedLedgerStorage, MessageId, StoredMessage,
 };
 #[cfg(feature = "rocksdb-storage")]
-use crate::storage::rocksdb::RocksDbManagedLedgerStorage;
-use anyhow::Result;
+use pulsar_lite_storage_managed_ledger_rocksdb::RocksDbManagedLedgerStorage;
 #[cfg(feature = "rocksdb-storage")]
 use std::path::Path;
 
@@ -25,13 +25,13 @@ impl ManagedLedgerStore {
     }
 
     #[cfg(feature = "rocksdb-storage")]
-    pub fn rocksdb(path: &Path) -> Result<Self> {
+    pub fn rocksdb(path: &Path) -> StorageResult<Self> {
         Ok(Self::RocksDb(RocksDbManagedLedgerStorage::open(path)?))
     }
 }
 
 impl ManagedLedgerStorage for ManagedLedgerStore {
-    fn create_topic(&mut self, name: &str) -> Result<()> {
+    fn create_topic(&mut self, name: &str) -> StorageResult<()> {
         match self {
             Self::Memory(inner) => inner.create_topic(name),
             #[cfg(feature = "rocksdb-storage")]
@@ -39,7 +39,12 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         }
     }
 
-    fn append_message(&mut self, topic: &str, partition: i32, data: &[u8]) -> Result<MessageId> {
+    fn append_message(
+        &mut self,
+        topic: &str,
+        partition: i32,
+        data: &[u8],
+    ) -> StorageResult<MessageId> {
         match self {
             Self::Memory(inner) => inner.append_message(topic, partition, data),
             #[cfg(feature = "rocksdb-storage")]
@@ -53,7 +58,7 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         partition: i32,
         metadata: &[u8],
         payload: &[u8],
-    ) -> Result<MessageId> {
+    ) -> StorageResult<MessageId> {
         match self {
             Self::Memory(inner) => {
                 inner.append_message_with_metadata(topic, partition, metadata, payload)
@@ -70,7 +75,7 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         topic: &str,
         subscription: &str,
         options: CursorInitOptions,
-    ) -> Result<CursorOpenResult> {
+    ) -> StorageResult<CursorOpenResult> {
         match self {
             Self::Memory(inner) => inner.initialize_or_open_cursor(topic, subscription, options),
             #[cfg(feature = "rocksdb-storage")]
@@ -78,7 +83,7 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         }
     }
 
-    fn delete_cursor(&mut self, topic: &str, subscription: &str) -> Result<()> {
+    fn delete_cursor(&mut self, topic: &str, subscription: &str) -> StorageResult<()> {
         match self {
             Self::Memory(inner) => inner.delete_cursor(topic, subscription),
             #[cfg(feature = "rocksdb-storage")]
@@ -92,7 +97,7 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         subscription: &str,
         message_id: &MessageId,
         shared: bool,
-    ) -> Result<()> {
+    ) -> StorageResult<()> {
         match self {
             Self::Memory(inner) => {
                 inner
@@ -112,7 +117,7 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         &self,
         topic: &str,
         subscription: &str,
-    ) -> Result<Option<ManagedLedgerPosition>> {
+    ) -> StorageResult<Option<ManagedLedgerPosition>> {
         match self {
             Self::Memory(inner) => inner.first_unacked_position(topic, subscription),
             #[cfg(feature = "rocksdb-storage")]
@@ -125,7 +130,7 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         topic: &str,
         from: &ManagedLedgerPosition,
         limit: usize,
-    ) -> Result<Vec<(MessageId, Vec<u8>)>> {
+    ) -> StorageResult<Vec<(MessageId, Vec<u8>)>> {
         match self {
             Self::Memory(inner) => inner.read_from(topic, from, limit),
             #[cfg(feature = "rocksdb-storage")]
@@ -138,7 +143,7 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         topic: &str,
         from: &ManagedLedgerPosition,
         limit: usize,
-    ) -> Result<Vec<StoredMessage>> {
+    ) -> StorageResult<Vec<StoredMessage>> {
         match self {
             Self::Memory(inner) => inner.read_entries_from(topic, from, limit),
             #[cfg(feature = "rocksdb-storage")]
@@ -146,7 +151,7 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         }
     }
 
-    fn get_last_position(&self, topic: &str) -> Result<Option<ManagedLedgerPosition>> {
+    fn get_last_position(&self, topic: &str) -> StorageResult<Option<ManagedLedgerPosition>> {
         match self {
             Self::Memory(inner) => inner.get_last_position(topic),
             #[cfg(feature = "rocksdb-storage")]
@@ -158,7 +163,7 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         &self,
         topic: &str,
         current: &ManagedLedgerPosition,
-    ) -> Result<Option<ManagedLedgerPosition>> {
+    ) -> StorageResult<Option<ManagedLedgerPosition>> {
         match self {
             Self::Memory(inner) => inner.get_next_position(topic, current),
             #[cfg(feature = "rocksdb-storage")]
@@ -171,7 +176,7 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         topic: &str,
         subscription: &str,
         message_id: &MessageId,
-    ) -> Result<bool> {
+    ) -> StorageResult<bool> {
         match self {
             Self::Memory(inner) => inner.is_acknowledged(topic, subscription, message_id),
             #[cfg(feature = "rocksdb-storage")]
@@ -184,7 +189,7 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         topic: &str,
         subscription: &str,
         message_id: MessageId,
-    ) -> Result<()> {
+    ) -> StorageResult<()> {
         match self {
             Self::Memory(inner) => inner.ack_message(topic, subscription, message_id),
             #[cfg(feature = "rocksdb-storage")]
@@ -197,7 +202,7 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         topic: &str,
         subscription: &str,
         message_id: MessageId,
-    ) -> Result<()> {
+    ) -> StorageResult<()> {
         match self {
             Self::Memory(inner) => inner.ack_message_shared(topic, subscription, message_id),
             #[cfg(feature = "rocksdb-storage")]

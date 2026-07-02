@@ -5,6 +5,8 @@ mod cursor_init;
 mod cursor_read;
 mod factory;
 mod ledger;
+mod legacy_storage;
+mod memory;
 mod position;
 
 pub use config::ManagedLedgerConfig;
@@ -19,4 +21,9 @@ pub use cursor_read::{
 };
 pub use factory::ManagedLedgerFactory;
 pub use ledger::ManagedLedger;
+pub use legacy_storage::ManagedLedgerStorage;
+pub use memory::{
+    InMemoryManagedCursor, InMemoryManagedLedger, InMemoryManagedLedgerFactory,
+    InMemoryManagedLedgerStorage,
+};
 pub use position::{ManagedLedgerPosition, MessageId, NonPersistentEntry, StoredMessage};

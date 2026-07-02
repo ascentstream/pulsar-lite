@@ -1,4 +1,4 @@
-use super::{
+use pulsar_lite_storage_managed_ledger::{
     CursorInitOptions, CursorOpenResult, InMemoryManagedLedgerStorage, ManagedLedgerPosition,
     ManagedLedgerStorage, MessageId, StoredMessage,
 };
@@ -263,18 +263,6 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
             Self::Memory(inner) => inner.get_mark_delete_position(topic, subscription),
             #[cfg(feature = "rocksdb-storage")]
             Self::RocksDb(inner) => inner.get_mark_delete_position(topic, subscription),
-        }
-    }
-
-    fn find_message_id_by_publish_time(
-        &self,
-        topic: &str,
-        publish_time: u64,
-    ) -> Result<Option<MessageId>> {
-        match self {
-            Self::Memory(inner) => inner.find_message_id_by_publish_time(topic, publish_time),
-            #[cfg(feature = "rocksdb-storage")]
-            Self::RocksDb(inner) => inner.find_message_id_by_publish_time(topic, publish_time),
         }
     }
 }

@@ -1,9 +1,11 @@
-use super::{CursorInitOptions, CursorOpenResult, ManagedLedgerPosition, MessageId, StoredMessage};
+use crate::cursor_init::{CursorInitOptions, CursorOpenResult};
+use crate::position::{ManagedLedgerPosition, MessageId, StoredMessage};
 use anyhow::Result;
 use std::future::Future;
 
 /// Storage-level abstraction mirroring the role of Pulsar's managed-ledger
-/// storage integration, while remaining in-memory for now.
+/// storage integration. Transitional trait kept during Phase 5-7; Phase 8
+/// retires it once the broker holds `ManagedLedger`/`ManagedCursor` directly.
 pub trait ManagedLedgerStorage: Send + Sync {
     fn create_topic(&mut self, name: &str) -> Result<()>;
 
@@ -147,27 +149,4 @@ pub trait ManagedLedgerStorage: Send + Sync {
 
     fn get_mark_delete_position(&self, topic: &str, subscription: &str) -> Option<u64>;
 
-    fn find_message_id_by_publish_time(
-        &self,
-        topic: &str,
-        publish_time: u64,
-    ) -> Result<Option<MessageId>> {
-        let entries = self.get_message_entries(topic);
-        if entries.is_empty() {
-            return Ok(None);
-        }
-        let mut last_earlier: Option<usize> = None;
-        for (i, entry) in entries.iter().enumerate() {
-            match super::super::decode_publish_time(&entry.metadata) {
-                Some(pt) if pt < publish_time => last_earlier = Some(i),
-                Some(_) => break,
-                None => {}
-            }
-        }
-        let target = match last_earlier {
-            None => Some(entries[0].message_id.clone()),
-            Some(i) => entries.get(i + 1).map(|e| e.message_id.clone()),
-        };
-        Ok(target)
-    }
 }

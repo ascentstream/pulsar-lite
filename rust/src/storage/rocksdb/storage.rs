@@ -348,16 +348,4 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
             .as_ref()
             .map(|position| position.entry_id)
     }
-
-    fn find_message_id_by_publish_time(
-        &self,
-        topic: &str,
-        publish_time: u64,
-    ) -> Result<Option<MessageId>> {
-        let ledger_name = keys::managed_ledger_name(topic);
-        let ledger = self.factory.open_ledger(&ledger_name)?;
-        Ok(ledger
-            .find_position_by_publish_time(publish_time)
-            .map(MessageId::from))
-    }
 }

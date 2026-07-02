@@ -1,28 +1,33 @@
-use super::{NamespaceResources, TenantResources, TopicResources};
-#[cfg(test)]
-use crate::storage::MetadataDocument;
-use crate::storage::{MetadataStore, TopicMetadata};
+use crate::{NamespaceResources, TenantResources, TopicResources};
 use anyhow::Result;
+use pulsar_lite_storage_metadata::{
+    FileMetadataStore, MetadataDocument, MetadataStore, TopicMetadata,
+};
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Aggregated broker resource entrypoint, similar in shape to PulsarResources.
 #[derive(Debug)]
-pub struct PulsarResources {
-    metadata: MetadataStore,
+pub struct PulsarResources<S: MetadataStore = FileMetadataStore> {
+    metadata: S,
     tenant_resources: TenantResources,
     namespace_resources: NamespaceResources,
     topic_resources: TopicResources,
 }
 
-impl PulsarResources {
+impl PulsarResources<FileMetadataStore> {
     pub fn new(path: &Path) -> Result<Self> {
-        Ok(Self {
-            metadata: MetadataStore::new(path)?,
+        Ok(Self::from_metadata_store(FileMetadataStore::new(path)?))
+    }
+}
+
+impl<S: MetadataStore> PulsarResources<S> {
+    pub fn from_metadata_store(metadata: S) -> Self {
+        Self {
+            metadata,
             tenant_resources: TenantResources::new(),
             namespace_resources: NamespaceResources::new(),
             topic_resources: TopicResources::new(),
-        })
+        }
     }
 
     pub fn tenant(&self) -> &TenantResources {
@@ -109,17 +114,19 @@ impl PulsarResources {
             .has_subscription(&self.metadata, topic, subscription)
     }
 
-    pub fn metadata(&self) -> &MetadataStore {
+    pub fn metadata(&self) -> &S {
         &self.metadata
     }
 
-    #[cfg(test)]
-    pub(crate) fn metadata_path(&self) -> &Path {
+    pub fn metadata_mut(&mut self) -> &mut S {
+        &mut self.metadata
+    }
+
+    pub fn metadata_path(&self) -> &Path {
         self.metadata.metadata_path()
     }
 
-    #[cfg(test)]
-    pub(crate) fn build_metadata_document(&self, version: u32) -> MetadataDocument {
-        self.metadata.build_metadata_document(version)
+    pub fn build_metadata_document(&self, version: u32) -> MetadataDocument {
+        self.metadata.state().build_metadata_document(version)
     }
 }

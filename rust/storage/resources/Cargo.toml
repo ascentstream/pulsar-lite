@@ -3,3 +3,13 @@ name = "pulsar-lite-storage-resources"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+log.workspace = true
+serde_json.workspace = true
+pulsar-lite-storage-metadata = { path = "../metadata"}
+
+[dev-dependencies]
+tempfile = "3.9"

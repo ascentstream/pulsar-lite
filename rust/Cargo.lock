@@ -816,6 +816,13 @@ version = "0.1.0"
 [[package]]
 name = "pulsar-lite-storage-managed-ledger"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "log",
+ "serde",
+ "tempfile",
+]
 
 [[package]]
 name = "pulsar-lite-storage-managed-ledger-rocksdb"

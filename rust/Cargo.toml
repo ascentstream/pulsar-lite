@@ -33,10 +33,14 @@ description = "Embedded lightweight message queue compatible with Apache Pulsar"
 
 [features]
 default = []
-rocksdb-storage = ["dep:pulsar-lite-storage-managed-ledger-rocksdb"]
+rocksdb-storage = [
+    "dep:pulsar-lite-storage-managed-ledger-rocksdb",
+    "pulsar-lite-storage/rocksdb-storage",
+]
 
 [dependencies]
 # Workspace storage crates
+pulsar-lite-storage = { path = "storage/core" }
 pulsar-lite-storage-metadata = { path = "storage/metadata" }
 pulsar-lite-storage-resources = { path ="storage/resources" }
 pulsar-lite-storage-managed-ledger = { path = "storage/managed-ledger" }

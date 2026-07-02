@@ -1,8 +1,4 @@
-//! Managed-ledger module: re-exports the new managed-ledger crate + keeps the
-//! transitional `ManagedLedgerStore` enum (store.rs) until Phase 7 moves it to
-//! storage/core.
-mod store;
-
+//! Managed-ledger module: re-exports the managed-ledger crate types.
 pub use pulsar_lite_storage_managed_ledger::{
     CursorInitOptions, CursorOpenResult, InitialPosition, InMemoryManagedCursor,
     InMemoryManagedLedger, InMemoryManagedLedgerFactory, InMemoryManagedLedgerStorage,
@@ -10,4 +6,3 @@ pub use pulsar_lite_storage_managed_ledger::{
     ManagedLedgerPosition, ManagedLedgerStorage, MessageId, NonPersistentEntry, StoredMessage,
     SubscriptionCursor,
 };
-pub use store::ManagedLedgerStore;

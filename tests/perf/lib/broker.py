@@ -157,10 +157,37 @@ class BrokerProcess:
         self.broker_pid = None
         return metrics
 
-    def restart(self) -> None:
-        """Stop and start a fresh broker, clearing all topic/subscription state."""
-        self.stop()
-        self.start()
+    def restart(self, preserve_storage: bool = False) -> None:
+        """Stop and start broker.
+
+        Args:
+            preserve_storage: If True, reuse existing workdir and DB.
+                            If False (default), create fresh workdir and DB.
+        """
+        if preserve_storage:
+            # Keep existing workdir and DB, only stop/start process
+            self.stop()
+            if not self.workdir or not self.log_path:
+                raise RuntimeError("Cannot preserve storage: workdir not initialized")
+
+            # Reopen log file for appending
+            log_file = self.log_path.open("a", encoding="utf-8")
+            self.proc = subprocess.Popen(
+                [str(BROKER_BIN)],
+                cwd=self.workdir,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env={**os.environ, "RUST_BACKTRACE": "1"},
+            )
+            self._wait_for_port()
+            self.broker_pid = self.proc.pid
+            self.sampler = BrokerSampler(self.broker_pid)
+            self.sampler.start()
+        else:
+            # Original behavior: fresh start
+            self.stop()
+            self.start()
 
     def metrics(self) -> dict[str, float]:
         samples = self.sampler.samples if self.sampler else []
@@ -278,3 +305,60 @@ class DockerBrokerProcess(BrokerProcess):
         self.broker_pid = None
         self.container_name = None
         return metrics
+
+    def restart(self, preserve_storage: bool = False) -> None:
+        """Stop and start broker.
+
+        Args:
+            preserve_storage: If True, reuse existing workdir and DB.
+                            If False (default), create fresh workdir and DB.
+        """
+        if preserve_storage:
+            # Keep existing workdir and DB, only stop/start process
+            self.stop()
+            if not self.workdir or not self.log_path:
+                raise RuntimeError("Cannot preserve storage: workdir not initialized")
+
+            # Generate new container name
+            self.container_name = f"pulsar-lite-perf-{self.workdir.name}"
+
+            # Reopen log file for appending
+            log_file = self.log_path.open("a", encoding="utf-8")
+            self.proc = subprocess.Popen(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--name",
+                    self.container_name,
+                    "--network",
+                    "host",
+                    "--cpuset-cpus",
+                    self.cpuset_cpus,
+                    "--memory",
+                    self.memory,
+                    "--memory-swap",
+                    self.memory,
+                    "-v",
+                    f"{self.workdir}:/work",
+                    "-w",
+                    "/work",
+                    "-e",
+                    "RUST_BACKTRACE=1",
+                    self.image_tag,
+                    "/app/pulsar-lite",
+                ],
+                cwd=self.workdir,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env={**os.environ, "RUST_BACKTRACE": "1"},
+            )
+            self._wait_for_port()
+            self.broker_pid = self._container_pid()
+            self.sampler = BrokerSampler(self.broker_pid)
+            self.sampler.start()
+        else:
+            # Original behavior: fresh start
+            self.stop()
+            self.start()

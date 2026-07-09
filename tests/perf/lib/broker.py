@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+import shutil
 
 from . import BASE_CONFIG, BROKER_BIN
 
@@ -96,7 +97,7 @@ class BrokerProcess:
         self.proc: subprocess.Popen[str] | None = None
         self.broker_pid: int | None = None
         self.workdir: Path | None = None
-        self.log_path: Path | None = None
+        self.=: Path | None = None
         self.sampler: BrokerSampler | None = None
 
     def start(self) -> None:
@@ -141,7 +142,7 @@ class BrokerProcess:
             f"broker {self.config.name} did not bind port {self.config.port}"
         )
 
-    def stop(self) -> dict[str, float]:
+    def stop(self, cleanup: bool = False) -> dict[str, float]:
         metrics = self.metrics()
         if self.sampler:
             self.sampler.stop()
@@ -155,6 +156,10 @@ class BrokerProcess:
         if self.sampler:
             self.sampler.join(timeout=2)
         self.broker_pid = None
+        if cleanup and self.workdir:
+            shutil.rmtree(self.workdir, ignore_errors=True)
+            self.workdir = None
+            self.log_path = None
         return metrics
 
     def restart(self, preserve_storage: bool = False) -> None:
@@ -279,7 +284,7 @@ class DockerBrokerProcess(BrokerProcess):
             )
         return int(pid_text)
 
-    def stop(self) -> dict[str, float]:
+    def stop(self,cleanup: bool = False) -> dict[str, float]:
         metrics = self.metrics()
         if self.sampler:
             self.sampler.stop()
@@ -304,6 +309,20 @@ class DockerBrokerProcess(BrokerProcess):
             self.sampler.join(timeout=2)
         self.broker_pid = None
         self.container_name = None
+        if cleanup and self.workdir:
+            # The files written by the Docker container as root cannot be deleted by an ordinary user.
+            # Use a temporary Alpine container with root privileges to clean up the mounted directory.
+            subprocess.run(
+                [
+                    "docker", "run", "--rm", "-v", f"{self.workdir}:/work", "alpine:latest", "sh", "-c", "rm -rf /work/* /work/.[!.]* 2>/dev/null || true",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            shutil.rmtree(self.workdir, ignore_errors=True)
+            self.workdir = None
+            self.log_path = None
         return metrics
 
     def restart(self, preserve_storage: bool = False) -> None:

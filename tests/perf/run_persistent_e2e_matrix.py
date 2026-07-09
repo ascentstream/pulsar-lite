@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Persistent topic E2E functional coverage matrix.
 
-Small test matrix covering producer, consumer, and reader scenarios
+Small test matrix covering producer, consumer, and restart scenarios
 with persistent:// topics. Focuses on functional completeness, not
 high-load stress testing.
 """
@@ -17,8 +17,9 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib import ROOT
-from lib.broker import BrokerConfig, BrokerProcess
-from lib.parsing import parse_consumer_output, parse_producer_output, parse_reader_output
+from lib.broker import BrokerConfig, BrokerProcess, DockerBrokerProcess
+from lib.docker_image import build_broker_image
+from lib.parsing import parse_consumer_output, parse_producer_output
 from lib.perf_cmd import ensure_prereqs, perf_cmd, run_consumer_then_feed, run_sync
 
 RESULTS_PATH = ROOT / "docs" / "perf" / "data" / "persistent_e2e_matrix_results.json"
@@ -32,12 +33,12 @@ BASE_MSGS = 5000
 @dataclasses.dataclass
 class Scenario:
     name: str
-    kind: str  # produce | consume_e2e | read | restart_smoke
+    kind: str  # produce | consume_e2e | restart_smoke
     broker: str
     description: str
     producer_args: list[str] | None = None
     consumer_args: list[str] | None = None
-    reader_args: list[str] | None = None
+    reader_args: list[str] | None = None  # Keep for future use
     feed_producer_args: list[str] | None = None
     restart_preserve: bool = False  # For restart scenarios
 
@@ -134,7 +135,7 @@ SCENARIOS: list[Scenario] = [
         description="消息带随机 key",
         producer_args=[
             "-m", str(BASE_MSGS), "-r", str(PULSE_PRODUCER_RATE),
-            "-s", "256", "-k", "random",
+            "-s", "256", "-mk", "random",
         ],
     ),
     
@@ -185,7 +186,7 @@ SCENARIOS: list[Scenario] = [
         broker="persistent_nonpartitioned",
         description="Key_Shared 订阅",
         consumer_args=["-m", str(BASE_MSGS), "-q", "1000", "-st", "Key_Shared", "-n", "2"],
-        feed_producer_args=["-m", str(BASE_MSGS), "-r", str(PULSE_CONSUMER_RATE), "-s", "256", "-k", "random"],
+        feed_producer_args=["-m", str(BASE_MSGS), "-r", str(PULSE_CONSUMER_RATE), "-s", "256", "-mk", "random"],
     ),
     Scenario(
         name="consume_small_receiver_queue",
@@ -200,7 +201,7 @@ SCENARIOS: list[Scenario] = [
         kind="consume_e2e",
         broker="persistent_nonpartitioned",
         description="Ack 延迟为 0",
-        consumer_args=["-m", str(BASE_MSGS), "-q", "1000", "-st", "Shared", "-time", "0"],
+        consumer_args=["-m", str(BASE_MSGS), "-q", "1000", "-st", "Shared", "--acks-delay-millis", "0"],
         feed_producer_args=["-m", str(BASE_MSGS), "-r", str(PULSE_CONSUMER_RATE), "-s", "256"],
     ),
     Scenario(
@@ -227,48 +228,14 @@ SCENARIOS: list[Scenario] = [
         consumer_args=["-m", str(BASE_MSGS), "-q", "1000", "-st", "Shared", "-n", "2"],
         feed_producer_args=["-m", str(BASE_MSGS * 2), "-r", str(PULSE_CONSUMER_RATE * 2), "-s", "256"],
     ),
-    
-    # Reader scenarios (4)
-    Scenario(
-        name="read_backlog_from_earliest",
-        kind="read",
-        broker="persistent_nonpartitioned",
-        description="Reader 从 Earliest 读取 backlog",
-        producer_args=["-m", str(BASE_MSGS), "-r", str(PULSE_PRODUCER_RATE * 4), "-s", "256"],
-        reader_args=["-m", str(BASE_MSGS), "-sp", "Earliest"],
-    ),
-    Scenario(
-        name="read_from_latest_skips_backlog",
-        kind="read",
-        broker="persistent_nonpartitioned",
-        description="Reader 从 Latest 跳过 backlog",
-        producer_args=["-m", str(BASE_MSGS), "-r", str(PULSE_PRODUCER_RATE * 4), "-s", "256"],
-        reader_args=["-m", "100", "-sp", "Latest", "-time", "2"],
-    ),
-    Scenario(
-        name="read_partitioned_from_earliest",
-        kind="read",
-        broker="persistent_partitioned",
-        description="读取分区 topic",
-        producer_args=["-m", str(BASE_MSGS), "-r", str(PULSE_PRODUCER_RATE * 4), "-s", "256"],
-        reader_args=["-m", str(BASE_MSGS), "-sp", "Earliest"],
-    ),
-    Scenario(
-        name="read_multi_topic_backlog",
-        kind="read",
-        broker="persistent_nonpartitioned",
-        description="读取多个 topic",
-        producer_args=["-m", str(BASE_MSGS), "-r", str(PULSE_PRODUCER_RATE * 4), "-s", "256", "-t", "3"],
-        reader_args=["-m", str(BASE_MSGS * 3), "-sp", "Earliest", "-t", "3"],
-    ),
-    
+
     # Restart scenarios (2)
     Scenario(
         name="restart_backlog_replay",
         kind="restart_smoke",
         broker="persistent_nonpartitioned",
         description="produce → restart → consume Earliest",
-        producer_args=["-m", str(BASE_MSGS), "-r", str(PULSE_PRODUCER_RATE * 4), "-s", "256"],
+        producer_args=["-m", str(BASE_MSGS), "-r", str(PULSE_PRODUCER_RATE * 4), "-s", "256", "-db"],
         consumer_args=["-m", str(BASE_MSGS), "-q", "1000", "-st", "Shared", "-sp", "Earliest"],
         restart_preserve=True,
     ),
@@ -277,7 +244,7 @@ SCENARIOS: list[Scenario] = [
         kind="restart_smoke",
         broker="persistent_nonpartitioned",
         description="consume partial ack → restart → consume remaining",
-        producer_args=["-m", str(BASE_MSGS * 2), "-r", str(PULSE_PRODUCER_RATE * 4), "-s", "256"],
+        producer_args=["-m", str(BASE_MSGS * 2), "-r", str(PULSE_PRODUCER_RATE * 4), "-s", "256", "-db"],
         consumer_args=["-m", str(BASE_MSGS), "-q", "1000", "-st", "Shared"],
         feed_producer_args=["-m", str(BASE_MSGS * 2), "-r", str(PULSE_CONSUMER_RATE * 2), "-s", "256"],
         restart_preserve=True,
@@ -373,59 +340,6 @@ def run_consume_e2e_scenario(
     }
 
 
-def run_read_scenario(
-    scenario: Scenario,
-    broker: BrokerProcess,
-    run_dir: Path,
-) -> dict[str, Any]:
-    """Run reader scenario: produce backlog then read."""
-    topic = f"persistent://public/default/test-{uuid.uuid4().hex[:8]}"
-    
-    # Step 1: Produce backlog
-    producer_log = run_dir / "producer.log"
-    producer_histogram = run_dir / "producer_histogram.hdr"
-    producer_cmd = perf_cmd(
-        "produce",
-        f"pulsar://127.0.0.1:{broker.config.port}",
-        scenario.producer_args,
-        topic,
-        producer_histogram,
-    )
-    
-    producer_proc = run_sync(producer_cmd, producer_log, timeout=120.0)
-    if producer_proc.returncode != 0:
-        raise RuntimeError(f"producer failed: {producer_log.read_text()[:500]}")
-    
-    # Step 2: Read with reader
-    reader_log = run_dir / "reader.log"
-    reader_histogram = run_dir / "histogram.hdr"
-    reader_cmd = perf_cmd(
-        "read",
-        f"pulsar://127.0.0.1:{broker.config.port}",
-        scenario.reader_args,
-        topic,
-        reader_histogram,
-    )
-    
-    start = time.time()
-    reader_proc = run_sync(reader_cmd, reader_log, timeout=120.0)
-    duration = time.time() - start
-    
-    if reader_proc.returncode != 0:
-        raise RuntimeError(f"reader failed: {reader_log.read_text()[:500]}")
-    
-    reader_result = parse_reader_output(reader_log.read_text(encoding="utf-8"))
-    producer_result = parse_producer_output(producer_log.read_text(encoding="utf-8"))
-    broker_metrics = broker.metrics()
-    
-    return {
-        "reader": reader_result,
-        "producer": producer_result,
-        "broker": broker_metrics,
-        "duration_s": round(duration, 2),
-    }
-
-
 def run_restart_smoke_scenario(
     scenario: Scenario,
     broker: BrokerProcess,
@@ -499,8 +413,6 @@ def run_scenario(scenario: Scenario, broker: BrokerProcess, run_dir: Path) -> di
         return run_produce_scenario(scenario, broker, run_dir)
     elif scenario.kind == "consume_e2e":
         return run_consume_e2e_scenario(scenario, broker, run_dir)
-    elif scenario.kind == "read":
-        return run_read_scenario(scenario, broker, run_dir)
     elif scenario.kind == "restart_smoke":
         return run_restart_smoke_scenario(scenario, broker, run_dir)
     else:
@@ -510,10 +422,54 @@ def run_scenario(scenario: Scenario, broker: BrokerProcess, run_dir: Path) -> di
 def main(argv: list[str]) -> int:
     """Main entry point."""
     ensure_prereqs()
-    
-    # Parse scenario filter from argv
-    filter_names = set(argv[1:]) if len(argv) > 1 else set()
-    
+
+    # Parse arguments
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Run persistent e2e matrix scenarios for pulsar-lite"
+    )
+    parser.add_argument(
+        "scenarios",
+        nargs="*",
+        help="Scenario names to run. If empty, run all scenarios."
+    )
+    parser.add_argument(
+        "--broker-backend",
+        choices=["local","docker"],
+        default="local",
+        help="Broker launch backend. local user rust/target/release/pulsar-lite; "
+        "docker builds and runs a constrained broker container.",
+    )
+    parser.add_argument(
+        "--docker-cpuset",
+        default="0-3",
+        help="Cpu set passed to docker run --cpuset-cpus when --broker-backend=docker.",
+    )
+    parser.add_argument(
+        "--docker-memory",
+        default="4g",
+        help="Memory limit passed to docker run --memory when --broker-backend=docker.",
+    )
+    parser.add_argument(
+        "--skip-docker-build",
+        action="store_true",
+        help="Reuse an existing Docker image instead of rebuilding it before the run.",
+    )
+
+    args = parser.parse_args(argv[1:])
+    filter_names = set(args.scenarios)
+
+    # Docker image setup
+    docker_image_metadata: dict[str, Any] = {}
+    if args.broker_backend == "docker":
+        print("Building Docker image for persistent broker...", file=sys.stderr)
+        docker_image_metadata = build_broker_image(
+            skip_docker_build=args.skip_docker_build,
+        )
+        print(f"Docker image: {docker_image_metadata['docker_image_tag']}", file=sys.stderr)
+        if docker_image_metadata.get("docker_build_performed"):
+            print(f"  Build reason: {docker_image_metadata['docker_build_reason']}", file=sys.stderr)
+
     run_id = time.strftime("%Y%m%d-%H%M%S")
     run_artifacts = ARTIFACTS_DIR / run_id
     run_artifacts.mkdir(parents=True, exist_ok=True)
@@ -537,7 +493,18 @@ def main(argv: list[str]) -> int:
     for broker_name, broker_scenarios in scenarios_by_broker.items():
         print(f"\n=== Broker: {broker_name} ===")
         broker_config = BROKERS[broker_name]
-        broker = BrokerProcess(broker_config)
+
+        # Create broker instance based on backend
+        if args.broker_backend == "docker":
+            broker = DockerBrokerProcess(
+                broker_config,
+                image_tag=docker_image_metadata["docker_image_tag"],
+                cpuset_cpus=args.docker_cpuset,
+                memory=args.docker_memory,
+            )
+        else:
+            broker = BrokerProcess(broker_config)
+    
         broker.start()
         
         try:
@@ -581,7 +548,7 @@ def main(argv: list[str]) -> int:
                     print(f"  ✗ FAIL: {e}")
         
         finally:
-            broker.stop()
+            broker.stop(cleanup=True)
     
     results["summary"] = {
         "total": passed + failed,

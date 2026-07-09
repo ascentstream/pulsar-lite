@@ -57,7 +57,7 @@ def perf_cmd(
     classpath = (
         f"{PULSAR_TESTCLIENT_JAR}:{CLASSPATH_FILE.read_text(encoding='utf-8').strip()}"
     )
-    return [
+    cmd = [
         str(JAVA),
         "-cp",
         classpath,
@@ -66,11 +66,11 @@ def perf_cmd(
         subcommand,
         "-u",
         service_url,
-        "--histogram-file",
-        str(histogram_path),
-        *extra_args,
-        topic,
     ]
+    if subcommand in {"produce", "consume"}:
+        cmd.extend(["--histogram-file", str(histogram_path)])
+    cmd.extend([*extra_args, topic])
+    return cmd
 
 
 def run_sync(

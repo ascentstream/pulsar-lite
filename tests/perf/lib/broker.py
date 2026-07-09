@@ -97,7 +97,7 @@ class BrokerProcess:
         self.proc: subprocess.Popen[str] | None = None
         self.broker_pid: int | None = None
         self.workdir: Path | None = None
-        self.=: Path | None = None
+        self.log_path: Path | None = None
         self.sampler: BrokerSampler | None = None
 
     def start(self) -> None:

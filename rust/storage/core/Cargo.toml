@@ -3,3 +3,19 @@ name = "pulsar-lite-storage"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+
+[features]
+default = []
+rocksdb-storage = ["dep:pulsar-lite-storage-managed-ledger-rocksdb"]
+
+[dependencies]
+pulsar-lite-storage-metadata = { path = "../metadata" }
+pulsar-lite-storage-resources = { path = "../resources" }
+pulsar-lite-storage-managed-ledger = { path = "../managed-ledger" }
+pulsar-lite-storage-managed-ledger-rocksdb = { path = "../managed-ledger-rocksdb", optional = true }
+anyhow.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tempfile = "3.9"
+serde_json = "1.0"

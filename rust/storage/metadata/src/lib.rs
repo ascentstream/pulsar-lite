@@ -15,3 +15,4 @@ pub use model::{
     ParsedTopicName, PartitionedTopicNode, SubscriptionMetadata, SubscriptionNode, TenantMetadata,
     TenantNode, TopicMetadata, TopicNode,
 };
+pub use store::{MetadataState, MetadataStore};

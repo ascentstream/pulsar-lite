@@ -12,7 +12,7 @@ use super::super::{Consumer, SharedStorage};
 use crate::broker::dispatcher::redelivery_controller::RedeliveryEntry;
 use crate::broker::non_persistent::NonPersistentSubscriptionRuntime;
 use crate::broker::service::persistent::PersistentSubscriptionRuntime;
-use crate::storage::{ManagedLedgerPosition, MessageId, NonPersistentEntry};
+use crate::storage::{ManagedLedgerPosition, MessageId, NonPersistentEntry, StorageSeekExt};
 
 /// Subscription type (matches Pulsar protocol)
 #[derive(Debug, Clone, Copy, PartialEq, Default)]

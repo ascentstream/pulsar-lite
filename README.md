@@ -3,7 +3,7 @@
 [![CI](https://github.com/ascentstream/pulsar-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/ascentstream/pulsar-lite/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-English | [Simplified Chinese](README.zh-CN.md)
+English | [简体中文](README.zh-CN.md)
 
 Pulsar Lite is a lightweight local broker that implements the core Apache Pulsar
 binary protocol for development, integration testing, and small local prototypes.

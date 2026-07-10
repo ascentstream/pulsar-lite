@@ -9,7 +9,7 @@ use super::{
 
 use crate::broker::service::persistent::PersistentTopicRuntime;
 use crate::broker::service::{Consumer, Producer, SharedStorage};
-use crate::storage::{CursorInitOptions, MessageId, NonPersistentEntry, Storage};
+use crate::storage::{parse_topic_name, CursorInitOptions, MessageId, NonPersistentEntry};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::fmt;
@@ -151,7 +151,7 @@ pub struct Topic {
 
 impl Topic {
     fn runtime_mode_from_topic_name(name: &str) -> TopicRuntimeMode {
-        match Storage::parse_topic_name(name) {
+        match parse_topic_name(name) {
             Ok(parsed) if parsed.domain == "non-persistent" => TopicRuntimeMode::NonPersistent,
             _ => TopicRuntimeMode::Persistent,
         }

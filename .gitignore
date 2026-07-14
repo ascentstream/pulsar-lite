@@ -27,6 +27,7 @@ htmlcov/
 
 # Rust
 target/
+target-*/
 **/*.rs.bk
 
 # IDEs

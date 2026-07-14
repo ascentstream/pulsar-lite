@@ -61,7 +61,7 @@ SCENARIOS: list[Scenario] = [
         kind="produce",
         broker="persistent_stress",
         description="4 producers 并发 60s",
-        producer_args=["-time", "60", "-s", "1024", "-r", "999999", "-n", "4",],
+        producer_args=["-time", "60", "-s", "1024", "-r", "999999", "-n", "4","-threads", "4","-c", "4","-o","1000"],
     ),
     Scenario(
         name="stress_persistent_producer_large_payload",

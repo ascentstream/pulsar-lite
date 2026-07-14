@@ -70,6 +70,8 @@ def test_build_broker_image_reuses_existing_clean_commit_image(
 def test_build_broker_image_builds_missing_clean_commit_image(
     monkeypatch,
 ) -> None:
+    import os
+
     calls: list[list[str]] = []
     inspect_count = 0
 
@@ -111,6 +113,10 @@ def test_build_broker_image_builds_missing_clean_commit_image(
             "tests/perf/docker/Dockerfile.broker",
             "-t",
             "pulsar-lite-perf:349664eafa40",
+            "--build-arg",
+            f"HOST_UID={os.getuid()}",
+            "--build-arg",
+            f"HOST_GID={os.getgid()}",
             ".",
         ],
         [
@@ -150,7 +156,7 @@ def test_build_broker_image_refreshes_dirty_binary_and_reuses_existing_image(
 
     assert calls == [
         ["git", "status", "--short"],
-        ["cargo", "build", "--manifest-path", "rust/Cargo.toml", "--release"],
+        ["cargo", "build", "--manifest-path", "rust/Cargo.toml", "--release", "--features", "rocksdb-storage"],
         [
             "docker",
             "image",

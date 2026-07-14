@@ -28,7 +28,7 @@ def parse_producer_output(text: str) -> dict[str, Any]:
             latency_mean_ms,
             latency_p99_ms,
             latency_max_ms,
-        ) = interval_matches[-1]
+        ) = interval_matches[-1]  # type: ignore[misc]
         return {
             "records": int(records),
             "throughput_msg_s": float(throughput_msg_s),
@@ -79,7 +79,7 @@ def parse_consumer_output(text: str) -> dict[str, Any]:
             latency_mean_ms,
             latency_p99_ms,
             latency_max_ms,
-        ) = interval_matches[-1]
+        ) = interval_matches[-1]  # type: ignore[misc]
         return {
             "records": int(records),
             "throughput_msg_s": float(throughput_msg_s),

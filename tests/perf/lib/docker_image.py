@@ -60,10 +60,17 @@ def _docker_image_exists(image_tag: str) -> bool:
 
 
 def _build_binary() -> None:
-    _run(["cargo", "build", "--manifest-path", "rust/Cargo.toml", "--release"])
+    _run([
+        "cargo", "build",
+        "--manifest-path", "rust/Cargo.toml",
+        "--release",
+        "--features", "rocksdb-storage"
+    ])
 
 
 def _build_image(image_tag: str) -> None:
+    import os
+    
     _run(
         [
             "docker",
@@ -72,6 +79,8 @@ def _build_image(image_tag: str) -> None:
             str(DOCKERFILE_BROKER.relative_to(ROOT)),
             "-t",
             image_tag,
+            "--build-arg", f"HOST_UID={os.getuid()}",
+            "--build-arg", f"HOST_GID={os.getgid()}",
             ".",
         ]
     )

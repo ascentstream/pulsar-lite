@@ -9,7 +9,10 @@ use pulsar_lite_storage_managed_ledger::{
 fn open_ledger() -> InMemoryManagedLedger {
     let mut factory = InMemoryManagedLedgerFactory::new();
     factory
-        .open("persistent://public/default/ledger", &ManagedLedgerConfig::default())
+        .open(
+            "persistent://public/default/ledger",
+            &ManagedLedgerConfig::default(),
+        )
         .unwrap()
 }
 

@@ -3,11 +3,11 @@
 mod common;
 
 use common::*;
+use prost::Message;
 use pulsar_lite_storage_managed_ledger::{ManagedCursor, ManagedLedger};
 use pulsar_lite_storage_managed_ledger_rocksdb::test_support::{
     keys, proto, RocksDBManagedCursor, RocksDBManagedLedger,
 };
-use prost::Message;
 use std::sync::Arc;
 use tempfile::tempdir;
 

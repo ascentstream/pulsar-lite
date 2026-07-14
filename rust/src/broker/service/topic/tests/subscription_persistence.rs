@@ -1,4 +1,4 @@
-use crate::broker::service::topic::{AckCommandType, Subscription, SubscriptionType};
+use crate::broker::service::topic::{Subscription, SubscriptionType};
 use crate::broker::service::{Consumer, PendingMessage, SharedStorage};
 use crate::storage::{CursorInitOptions, InitialPosition, Storage};
 use std::path::Path;

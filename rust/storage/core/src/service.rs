@@ -138,7 +138,7 @@ impl Storage {
         self.managed_ledger.delete_cursor(topic, subscription)
     }
 
-    pub async fn seek_cursor(
+    pub fn seek_cursor(
         &mut self,
         topic: &str,
         subscription: &str,
@@ -147,7 +147,6 @@ impl Storage {
     ) -> StorageResult<()> {
         self.managed_ledger
             .seek_cursor(topic, subscription, message_id, shared)
-            .await
     }
 
     pub fn first_unacked_position(

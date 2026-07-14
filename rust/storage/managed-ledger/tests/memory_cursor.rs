@@ -48,7 +48,7 @@ async fn async_reset_cursor_with_position_sets_mark_delete_and_clears_individual
     cursor.delete_individual(position(1)).unwrap();
 
     let p = position(3);
-    cursor.async_reset_cursor(Some(p.clone())).await.unwrap();
+    cursor.reset_cursor(Some(p.clone())).unwrap();
     assert_eq!(cursor.state().mark_delete, Some(p));
     assert!(cursor.state().individually_deleted_entries.is_empty());
 }
@@ -59,7 +59,7 @@ async fn async_reset_cursor_with_none_clears_everything() {
     cursor.mark_delete(position(5)).unwrap();
     cursor.delete_individual(position(2)).unwrap();
 
-    cursor.async_reset_cursor(None).await.unwrap();
+    cursor.reset_cursor(None).unwrap();
     assert!(cursor.state().mark_delete.is_none());
     assert!(cursor.state().individually_deleted_entries.is_empty());
 }

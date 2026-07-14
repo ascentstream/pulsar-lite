@@ -4,7 +4,9 @@ use anyhow::Result;
 use rocksdb::DB;
 use std::sync::Arc;
 
-use pulsar_lite_storage_managed_ledger::{ManagedCursor, ManagedCursorState, ManagedLedgerPosition};
+use pulsar_lite_storage_managed_ledger::{
+    ManagedCursor, ManagedCursorState, ManagedLedgerPosition,
+};
 
 #[derive(Debug, Clone)]
 pub struct RocksDBManagedCursor {
@@ -59,7 +61,7 @@ impl ManagedCursor for RocksDBManagedCursor {
         self.persist_state()
     }
 
-    async fn async_reset_cursor(&mut self, position: Option<ManagedLedgerPosition>) -> Result<()> {
+    fn reset_cursor(&mut self, position: Option<ManagedLedgerPosition>) -> Result<()> {
         self.state.mark_delete = position;
         self.state.individually_deleted_entries.clear();
         self.persist_state()

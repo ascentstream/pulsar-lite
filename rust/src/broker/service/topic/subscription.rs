@@ -363,7 +363,6 @@ impl Subscription {
             let mut guard = self.storage.lock().await;
             guard
                 .seek_cursor(&self.topic, &self.name, message_id, shared_cursor)
-                .await
                 .map_err(|e| e.to_string())?;
             guard
                 .first_unacked_position(&self.topic, &self.name)

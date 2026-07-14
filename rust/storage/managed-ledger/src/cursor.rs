@@ -1,7 +1,6 @@
 use crate::position::ManagedLedgerPosition;
 use anyhow::Result;
 use std::collections::BTreeSet;
-use std::future::Future;
 
 /// Managed-cursor state skeleton.
 ///
@@ -23,10 +22,7 @@ pub trait ManagedCursor: Send + Sync {
 
     fn delete_individual(&mut self, position: ManagedLedgerPosition) -> Result<()>;
 
-    fn async_reset_cursor(
-        &mut self,
-        position: Option<ManagedLedgerPosition>,
-    ) -> impl Future<Output = Result<()>> + Send;
+    fn reset_cursor(&mut self, position: Option<ManagedLedgerPosition>) -> Result<()>;
 }
 
 /// Shared-subscription cursor state used by the current in-memory runtime.

@@ -193,7 +193,7 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         };
 
         while let Some(position) = candidate {
-            if !is_managed_position_acknowledged(&state, &position) {
+            if !is_managed_position_acknowledged(state, &position) {
                 return Ok(Some(position));
             }
             candidate = next_position(&position, &ledger.info);
@@ -225,11 +225,7 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
     ) -> Result<Vec<StoredMessage>> {
         let shared = self.topic_ledger(topic)?;
         let ledger = Self::lock_ledger(&shared)?;
-        Ok(ledger
-            .read_entries_from(from, limit)?
-            .into_iter()
-            .map(|e| e.into())
-            .collect())
+        ledger.read_entries_from(from, limit)
     }
 
     fn get_last_position(&self, topic: &str) -> Result<Option<ManagedLedgerPosition>> {

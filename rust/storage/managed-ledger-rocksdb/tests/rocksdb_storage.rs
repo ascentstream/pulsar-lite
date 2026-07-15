@@ -4,9 +4,7 @@ mod common;
 
 use common::*;
 use pulsar_lite_storage_managed_ledger::ManagedLedgerStorage;
-use pulsar_lite_storage_managed_ledger_rocksdb::{
-    test_support::keys, RocksDbManagedLedgerStorage,
-};
+use pulsar_lite_storage_managed_ledger_rocksdb::{test_support::keys, RocksDbManagedLedgerStorage};
 use tempfile::tempdir;
 
 #[test]

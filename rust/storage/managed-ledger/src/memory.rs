@@ -148,7 +148,7 @@ impl ManagedLedgerStorage for InMemoryManagedLedgerStorage {
         Ok(())
     }
 
-    async fn seek_cursor(
+    fn seek_cursor(
         &mut self,
         topic: &str,
         subscription: &str,
@@ -455,7 +455,7 @@ impl ManagedCursor for InMemoryManagedCursor {
         Ok(())
     }
 
-    async fn async_reset_cursor(&mut self, position: Option<ManagedLedgerPosition>) -> Result<()> {
+    fn reset_cursor(&mut self, position: Option<ManagedLedgerPosition>) -> Result<()> {
         self.state.mark_delete = position;
         self.state.individually_deleted_entries.clear();
         Ok(())
@@ -512,7 +512,7 @@ mod tests {
         storage.ack_message_shared(topic, sub, m0.clone()).unwrap();
 
         // seek
-        storage.seek_cursor(topic, sub, &m1, true).await.unwrap();
+        storage.seek_cursor(topic, sub, &m1, true).unwrap();
         let first = storage.first_unacked_position(topic, sub).unwrap();
         assert_eq!(first, Some(ManagedLedgerPosition::from(&m1)));
     }

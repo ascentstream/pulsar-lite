@@ -31,7 +31,7 @@ async fn seek_cursor_reposition_first_unacked_to_target() {
     storage.ack_message_shared(topic, sub, m0.clone()).unwrap();
 
     // seek
-    storage.seek_cursor(topic, sub, &m1, true).await.unwrap();
+    storage.seek_cursor(topic, sub, &m1, true).unwrap();
     let first = storage.first_unacked_position(topic, sub).unwrap();
     assert_eq!(first, Some(ManagedLedgerPosition::from(&m1)));
 }

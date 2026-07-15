@@ -91,7 +91,7 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         }
     }
 
-    async fn seek_cursor(
+    fn seek_cursor(
         &mut self,
         topic: &str,
         subscription: &str,
@@ -99,17 +99,9 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
         shared: bool,
     ) -> StorageResult<()> {
         match self {
-            Self::Memory(inner) => {
-                inner
-                    .seek_cursor(topic, subscription, message_id, shared)
-                    .await
-            }
+            Self::Memory(inner) => inner.seek_cursor(topic, subscription, message_id, shared),
             #[cfg(feature = "rocksdb-storage")]
-            Self::RocksDb(inner) => {
-                inner
-                    .seek_cursor(topic, subscription, message_id, shared)
-                    .await
-            }
+            Self::RocksDb(inner) => inner.seek_cursor(topic, subscription, message_id, shared),
         }
     }
 

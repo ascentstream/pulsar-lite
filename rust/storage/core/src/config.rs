@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 pub enum ManagedLedgerBackendConfig {
     Memory,
     #[cfg(feature = "rocksdb-storage")]
-    RocksDb { path: PathBuf },
+    RocksDb {
+        path: PathBuf,
+    },
 }
 
 /// Storage construction config: metadata file path + managed-ledger backend.

@@ -1,8 +1,8 @@
-use super::cursor::RocksDBManagedCursor;
-use super::entrylog::{EntryIndex, EntryLogStore};
+use super::cursor::{next_position, RocksDBManagedCursor};
+use super::entrylog::{EntryIndex, EntryLogStore, EntryRecord};
 use super::keys;
 use super::metadata::{StoredEntryLocation, StoredManagedLedgerInfo};
-use anyhow::{anyhow, Result};
+use anyhow::{Ok, Result};
 use rocksdb::{WriteBatch, DB};
 use std::sync::Arc;
 
@@ -17,7 +17,6 @@ pub struct RocksDBManagedLedger {
     name: String,
     db: Arc<DB>,
     pub info: StoredManagedLedgerInfo,
-    entries: Vec<(ManagedLedgerPosition, EntryIndex)>,
     max_entries_per_ledger: u64,
     entry_log: Arc<EntryLogStore>,
 }
@@ -56,7 +55,6 @@ impl RocksDBManagedLedger {
 
         Ok(Self {
             name: name.to_string(),
-            entries: Self::load_entries(&info, &db)?,
             db,
             entry_log,
             info,
@@ -75,47 +73,97 @@ impl RocksDBManagedLedger {
         Ok(next_ledger_id)
     }
 
-    fn load_entries(
-        info: &StoredManagedLedgerInfo,
-        db: &DB,
-    ) -> Result<Vec<(ManagedLedgerPosition, EntryIndex)>> {
-        let mut entries = Vec::new();
+    fn load_entry_index(&self, ledger_id: u64, entry_id: u64) -> Result<Option<EntryIndex>> {
+        let Some(value) = self.db.get(keys::managed_entry_key(ledger_id, entry_id))? else {
+            return Ok(None);
+        };
+        let location: StoredEntryLocation = bincode::deserialize(&value)?;
+        Ok(Some(EntryIndex {
+            ledger_id,
+            entry_id,
+            file_id: location.file_id,
+            offset: location.offset,
+            len: location.len,
+            checksum: location.checksum,
+            partition: location.partition,
+        }))
+    }
 
-        for ledger in &info.ledgers {
-            for entry_id in 0..ledger.entries {
-                let value = db
-                    .get(keys::managed_entry_key(ledger.ledger_id, entry_id))?
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "missing entry location for ledger {} entry {}",
-                            ledger.ledger_id,
-                            entry_id
-                        )
-                    })?;
-                let stored_entry_location: StoredEntryLocation = bincode::deserialize(&value)?;
-                let position = ManagedLedgerPosition {
-                    ledger_id: ledger.ledger_id,
-                    entry_id,
-                    partition: stored_entry_location.partition,
-                };
-                let entry_index = EntryIndex {
-                    ledger_id: ledger.ledger_id,
-                    entry_id,
-                    file_id: stored_entry_location.file_id,
-                    offset: stored_entry_location.offset,
-                    len: stored_entry_location.len,
-                    checksum: stored_entry_location.checksum,
-                    partition: stored_entry_location.partition,
-                };
+    fn read_entry_record(
+        &self,
+        ledger_id: u64,
+        entry_id: u64,
+    ) -> Result<Option<(ManagedLedgerPosition, EntryRecord)>> {
+        let Some(index) = self.load_entry_index(ledger_id, entry_id)? else {
+            return Ok(None);
+        };
+        let position = ManagedLedgerPosition {
+            ledger_id,
+            entry_id,
+            partition: index.partition,
+        };
+        let record = self.entry_log.read(&index)?;
+        Ok(Some((position, record)))
+    }
 
-                entries.push((position, entry_index));
-            }
+    pub fn last_position(&self) -> Result<Option<ManagedLedgerPosition>> {
+        let Some(ledger) = self.info.ledgers.iter().rev().find(|l| l.entries > 0) else {
+            return Ok(None);
+        };
+        let entry_id = ledger.entries - 1;
+
+        let Some(index) = self.load_entry_index(ledger.ledger_id, entry_id)? else {
+            return Ok(None);
+        };
+        let position = ManagedLedgerPosition {
+            ledger_id: ledger.ledger_id,
+            entry_id,
+            partition: index.partition,
+        };
+        Ok(Some(position))
+    }
+
+    /// Returns true if the given position is visible in the ledger.
+    fn is_visible(&self, pos: &ManagedLedgerPosition) -> bool {
+        self.info
+            .ledgers
+            .iter()
+            .any(|l| l.ledger_id == pos.ledger_id && l.entries > pos.entry_id)
+    }
+
+    /// Reads a batch of entries starting from the given position, up to the specified limit.
+    pub fn read_entries_from(
+        &self,
+        from: &ManagedLedgerPosition,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        if limit == 0 {
+            return Ok(Vec::new());
         }
 
-        entries.sort_by_key(|(position, _)| {
-            (position.ledger_id, position.entry_id, position.partition)
-        });
-        Ok(entries)
+        let mut out = Vec::with_capacity(limit.min(64));
+        let mut current = Some(from.clone());
+
+        while let Some(pos) = current {
+            if out.len() >= limit {
+                break;
+            }
+
+            if self.is_visible(&pos) {
+                if let Some((stored, record)) =
+                    self.read_entry_record(pos.ledger_id, pos.entry_id)?
+                {
+                    out.push(StoredMessage {
+                        message_id: MessageId::from(&stored),
+                        metadata: record.metadata,
+                        payload: record.payload,
+                    });
+                }
+            }
+            current = next_position(&pos, &self.info);
+        }
+
+        Ok(out)
     }
 
     pub fn add_entry_with_partition(
@@ -171,7 +219,6 @@ impl RocksDBManagedLedger {
         self.db.write(batch)?;
 
         self.info = next_info;
-        self.entries.push((position.clone(), entry_index));
 
         Ok(position)
     }
@@ -215,44 +262,52 @@ impl RocksDBManagedLedger {
     }
 
     pub fn get_message_entry_by_id(&self, message_id: &MessageId) -> Option<StoredMessage> {
-        self.entries
-            .iter()
-            .find(|(position, _)| {
-                position.ledger_id == message_id.ledger
-                    && position.entry_id == message_id.entry
-                    && position.partition == message_id.partition
-            })
-            .and_then(|(_, index)| {
-                self.entry_log.read(index).ok().and_then(|entry| {
-                    (entry.partition == message_id.partition).then_some(StoredMessage::new(
-                        message_id.clone(),
-                        entry.metadata,
-                        entry.payload,
-                    ))
-                })
-            })
+        let (position, record) = self
+            .read_entry_record(message_id.ledger, message_id.entry)
+            .ok()
+            .flatten()?;
+        if position.partition != message_id.partition {
+            return None;
+        }
+        Some(StoredMessage::new(
+            message_id.clone(),
+            record.metadata,
+            record.payload,
+        ))
     }
 
-    pub fn messages(&self) -> Vec<(MessageId, Vec<u8>)> {
-        self.message_entries()
+    pub fn messages(&self) -> Result<Vec<(MessageId, Vec<u8>)>> {
+        Ok(self
+            .message_entries()?
             .into_iter()
             .map(|entry| (entry.message_id, entry.payload))
-            .collect()
+            .collect())
     }
 
-    pub fn message_entries(&self) -> Vec<StoredMessage> {
-        self.entries
-            .iter()
-            .filter_map(|(position, index)| {
-                self.entry_log.read(index).ok().and_then(|entry| {
-                    (entry.partition == position.partition).then_some(StoredMessage::new(
-                        MessageId::from(position),
-                        entry.metadata,
-                        entry.payload,
-                    ))
+    /// TODO: A temporary global scanning interface. Subsequently, all related global scanning codes will be gradually migrated.
+    pub fn message_entries(&self) -> Result<Vec<StoredMessage>> {
+        let Some(from) =
+            self.info
+                .ledgers
+                .iter()
+                .find(|l| l.entries > 0)
+                .map(|l| ManagedLedgerPosition {
+                    ledger_id: l.ledger_id,
+                    entry_id: 0,
+                    partition: -1,
                 })
-            })
-            .collect()
+        else {
+            return Ok(vec![]);
+        };
+
+        let total = self
+            .info
+            .ledgers
+            .iter()
+            .map(|l| l.entries as usize)
+            .sum::<usize>();
+
+        self.read_entries_from(&from, total)
     }
 }
 
@@ -272,13 +327,13 @@ impl ManagedLedger for RocksDBManagedLedger {
     }
 
     fn read_entry(&self, position: &ManagedLedgerPosition) -> Option<Vec<u8>> {
-        self.entries
-            .iter()
-            .find(|(stored_position, _)| stored_position == position)
-            .and_then(|(_, index)| {
-                self.entry_log.read(index).ok().and_then(|entry| {
-                    (entry.partition == position.partition).then_some(entry.payload)
-                })
-            })
+        let (stored, record) = self
+            .read_entry_record(position.ledger_id, position.entry_id)
+            .ok()
+            .flatten()?;
+        if stored.partition != position.partition {
+            return None;
+        }
+        Some(record.payload)
     }
 }

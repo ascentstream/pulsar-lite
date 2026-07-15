@@ -4,11 +4,12 @@ use pulsar_lite_storage_metadata::{
     FileMetadataStore, MetadataDocument, MetadataStore, TopicMetadata,
 };
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Debug)]
 pub struct PulsarResources<S: MetadataStore = FileMetadataStore> {
-    metadata: S,
+    metadata: RwLock<S>,
     tenant_resources: TenantResources,
     namespace_resources: NamespaceResources,
     topic_resources: TopicResources,
@@ -23,11 +24,23 @@ impl PulsarResources<FileMetadataStore> {
 impl<S: MetadataStore> PulsarResources<S> {
     pub fn from_metadata_store(metadata: S) -> Self {
         Self {
-            metadata,
+            metadata: RwLock::new(metadata),
             tenant_resources: TenantResources::new(),
             namespace_resources: NamespaceResources::new(),
             topic_resources: TopicResources::new(),
         }
+    }
+
+    fn read_metadata(&self) -> RwLockReadGuard<'_, S> {
+        self.metadata
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn write_metadata(&self) -> RwLockWriteGuard<'_, S> {
+        self.metadata
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn tenant(&self) -> &TenantResources {
@@ -54,79 +67,118 @@ impl<S: MetadataStore> PulsarResources<S> {
         &mut self.topic_resources
     }
 
-    pub fn ensure_tenant(&mut self, tenant: &str, version: u32) -> Result<()> {
+    pub fn ensure_tenant(&self, tenant: &str, version: u32) -> Result<()> {
+        let mut metadata = self.write_metadata();
         self.tenant_resources
-            .ensure_tenant(&mut self.metadata, tenant, version)
+            .ensure_tenant(&mut *metadata, tenant, version)
     }
 
     pub fn has_tenant(&self, tenant: &str) -> bool {
-        self.tenant_resources.has_tenant(&self.metadata, tenant)
+        let metadata = self.read_metadata();
+        self.tenant_resources.has_tenant(&*metadata, tenant)
     }
 
-    pub fn ensure_namespace(&mut self, tenant: &str, namespace: &str, version: u32) -> Result<()> {
+    pub fn ensure_namespace(&self, tenant: &str, namespace: &str, version: u32) -> Result<()> {
+        let mut metadata = self.write_metadata();
         self.namespace_resources
-            .ensure_namespace(&mut self.metadata, tenant, namespace, version)
+            .ensure_namespace(&mut *metadata, tenant, namespace, version)
     }
 
     pub fn has_namespace(&self, tenant: &str, namespace: &str) -> bool {
+        let metadata = self.read_metadata();
         self.namespace_resources
-            .has_namespace(&self.metadata, tenant, namespace)
+            .has_namespace(&*metadata, tenant, namespace)
     }
 
     pub fn ensure_topic(
-        &mut self,
+        &self,
         topic: &str,
         partitioned: bool,
         partition_count: usize,
         version: u32,
     ) -> Result<()> {
-        self.topic_resources.ensure_topic(
-            &mut self.metadata,
-            topic,
-            partitioned,
-            partition_count,
-            version,
-        )
+        let mut metadata = self.write_metadata();
+        let mut topic_resources = self.topic_resources.clone();
+        topic_resources.ensure_topic(&mut *metadata, topic, partitioned, partition_count, version)
     }
 
-    pub fn ensure_subscription(
-        &mut self,
-        topic: &str,
-        subscription: &str,
-        version: u32,
-    ) -> Result<()> {
-        self.topic_resources
-            .ensure_subscription(&mut self.metadata, topic, subscription, version)
+    pub fn ensure_subscription(&self, topic: &str, subscription: &str, version: u32) -> Result<()> {
+        let mut metadata = self.write_metadata();
+        let mut topic_resources = self.topic_resources.clone();
+        topic_resources.ensure_subscription(&mut *metadata, topic, subscription, version)
     }
 
     pub fn get_partitioned_topic_metadata(&self) -> HashMap<String, usize> {
+        let metadata = self.read_metadata();
         self.topic_resources
-            .get_partitioned_topic_metadata(&self.metadata)
+            .get_partitioned_topic_metadata(&*metadata)
     }
 
-    pub fn get_topic_metadata(&self, topic: &str) -> Option<&TopicMetadata> {
+    pub fn get_topic_metadata(&self, topic: &str) -> Option<TopicMetadata> {
+        let metadata = self.read_metadata();
         self.topic_resources
-            .get_topic_metadata(&self.metadata, topic)
+            .get_topic_metadata(&*metadata, topic)
+            .cloned()
     }
 
     pub fn has_subscription(&self, topic: &str, subscription: &str) -> bool {
+        let metadata = self.read_metadata();
         self.topic_resources
-            .has_subscription(&self.metadata, topic, subscription)
+            .has_subscription(&*metadata, topic, subscription)
     }
 
-    pub fn metadata(&self) -> &S {
-        &self.metadata
+    pub fn metadata(&self) -> RwLockReadGuard<'_, S> {
+        self.read_metadata()
     }
 
-    pub fn metadata_mut(&mut self) -> &mut S {
-        &mut self.metadata
+    pub fn metadata_mut(&self) -> RwLockWriteGuard<'_, S> {
+        self.write_metadata()
     }
 
-    pub fn metadata_path(&self) -> &Path {
-        self.metadata.metadata_path()
+    pub fn metadata_path(&self) -> PathBuf {
+        self.read_metadata().metadata_path().to_path_buf()
     }
 
     pub fn build_metadata_document(&self, version: u32) -> MetadataDocument {
-        self.metadata.state().build_metadata_document(version)
+        self.read_metadata()
+            .state()
+            .build_metadata_document(version)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pulsar_lite_storage_metadata::InMemoryMetadataStore;
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn resources_can_be_shared_across_concurrent_readers_and_writers() {
+        let resources = Arc::new(PulsarResources::from_metadata_store(
+            InMemoryMetadataStore::new(),
+        ));
+        let topics: Vec<_> = (0..8)
+            .map(|index| format!("persistent://public/default/topic-{index}"))
+            .collect();
+
+        let handles: Vec<_> = topics
+            .iter()
+            .cloned()
+            .map(|topic| {
+                let resources = Arc::clone(&resources);
+                thread::spawn(move || {
+                    resources.ensure_topic(&topic, false, 0, 2).unwrap();
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        for topic in topics {
+            assert!(resources.get_topic_metadata(&topic).is_some());
+        }
     }
 }

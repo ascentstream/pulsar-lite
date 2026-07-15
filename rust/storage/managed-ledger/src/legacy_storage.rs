@@ -1,7 +1,6 @@
 use crate::cursor_init::{CursorInitOptions, CursorOpenResult};
 use crate::position::{ManagedLedgerPosition, MessageId, StoredMessage};
 use anyhow::Result;
-use std::future::Future;
 
 /// Storage-level abstraction mirroring the role of Pulsar's managed-ledger
 /// storage integration. Transitional trait kept during Phase 5-7; Phase 8
@@ -43,11 +42,9 @@ pub trait ManagedLedgerStorage: Send + Sync {
         subscription: &str,
         message_id: &MessageId,
         shared: bool,
-    ) -> impl Future<Output = Result<()>> + Send {
-        async move {
-            let _ = (topic, subscription, message_id, shared);
-            anyhow::bail!("seek_cursor is not implemented for this managed-ledger store")
-        }
+    ) -> Result<()> {
+        let _ = (topic, subscription, message_id, shared);
+        anyhow::bail!("seek_cursor is not implemented for this managed-ledger store")
     }
 
     fn first_unacked_position(
@@ -148,5 +145,4 @@ pub trait ManagedLedgerStorage: Send + Sync {
     ) -> bool;
 
     fn get_mark_delete_position(&self, topic: &str, subscription: &str) -> Option<u64>;
-
 }

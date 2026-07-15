@@ -1,7 +1,7 @@
 use super::entrylog::EntryIndex;
-use pulsar_lite_storage_managed_ledger::{ManagedCursorState, ManagedLedgerPosition};
 use anyhow::{anyhow, Result};
 use prost::Message;
+use pulsar_lite_storage_managed_ledger::{ManagedCursorState, ManagedLedgerPosition};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -799,19 +799,20 @@ mod tests {
     };
     use crate::storage::Storage;
     use bytes::Bytes;
-    use std::path::Path;
     use std::sync::Arc;
+    use tempfile::TempDir;
     use tokio::io::{duplex, DuplexStream};
     use tokio::sync::{Mutex, RwLock};
 
     fn build_test_connection() -> (
         ServerCnx<DuplexStream>,
         Framed<DuplexStream, PulsarFrameCodec>,
+        TempDir,
     ) {
+        let test_dir = tempfile::tempdir().unwrap();
+        let db_path = test_dir.path().join("test.db");
         let (server, client) = duplex(4096);
-        let storage = Arc::new(Mutex::new(
-            Storage::new_memory(Path::new("./test.db")).unwrap(),
-        ));
+        let storage = Arc::new(Mutex::new(Storage::new_memory(&db_path).unwrap()));
         let broker = Arc::new(RwLock::new(BrokerService::with_config(storage.clone(), 0)));
         let server_cnx = ServerCnx::new(
             server,
@@ -829,7 +830,7 @@ mod tests {
             32 * 1024,
         );
         let client_framed = Framed::new(client, PulsarFrameCodec::new());
-        (server_cnx, client_framed)
+        (server_cnx, client_framed, test_dir)
     }
 
     fn connect_command(protocol_version: i32) -> BaseCommand {
@@ -886,7 +887,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_transitions_to_connected_and_records_protocol_version() {
-        let (mut server_cnx, _client) = build_test_connection();
+        let (mut server_cnx, _client, _test_dir) = build_test_connection();
 
         server_cnx
             .handle_connect(connect_command(ProtocolVersion::V1 as i32))
@@ -904,7 +905,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_timeout_closes_connection_before_connect() {
-        let (mut server_cnx, _client) = build_test_connection();
+        let (mut server_cnx, _client, _test_dir) = build_test_connection();
         server_cnx.last_activity = Instant::now() - Duration::from_secs(31);
 
         let should_close = server_cnx.handle_keep_alive_tick().await.unwrap();
@@ -919,7 +920,7 @@ mod tests {
 
     #[tokio::test]
     async fn keep_alive_ping_is_only_enabled_for_protocol_v1_or_above() {
-        let (mut server_cnx_v0, mut client_v0) = build_test_connection();
+        let (mut server_cnx_v0, mut client_v0, _test_dir_v0) = build_test_connection();
         server_cnx_v0.state = State::Connected;
         server_cnx_v0.handshake_completed = true;
         server_cnx_v0.remote_protocol_version = ProtocolVersion::V0 as i32;
@@ -933,7 +934,7 @@ mod tests {
                 .is_err()
         );
 
-        let (mut server_cnx_v1, mut client_v1) = build_test_connection();
+        let (mut server_cnx_v1, mut client_v1, _test_dir_v1) = build_test_connection();
         server_cnx_v1.state = State::Connected;
         server_cnx_v1.handshake_completed = true;
         server_cnx_v1.remote_protocol_version = ProtocolVersion::V1 as i32;
@@ -953,7 +954,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_activity_clears_waiting_for_pong_and_liveness_check() {
-        let (mut server_cnx, mut client) = build_test_connection();
+        let (mut server_cnx, mut client, _test_dir) = build_test_connection();
         server_cnx.state = State::Connected;
         server_cnx.handshake_completed = true;
         server_cnx.remote_protocol_version = ProtocolVersion::V1 as i32;
@@ -997,7 +998,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_persistent_send_too_large_returns_send_error() {
-        let (mut server_cnx, mut client) = build_test_connection();
+        let (mut server_cnx, mut client, _test_dir) = build_test_connection();
         server_cnx.max_message_size = 4;
         attach_non_persistent_producer(
             &mut server_cnx,
@@ -1034,7 +1035,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_persistent_send_limit_returns_negative_send_receipt() {
-        let (mut server_cnx, mut client) = build_test_connection();
+        let (mut server_cnx, mut client, _test_dir) = build_test_connection();
         server_cnx.max_concurrent_non_persistent = 0;
         server_cnx.pending_send_requests = 0;
         attach_non_persistent_producer(
@@ -1071,7 +1072,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_persistent_publish_rate_limit_returns_send_error_without_closing_connection() {
-        let (mut server_cnx, mut client) = build_test_connection();
+        let (mut server_cnx, mut client, _test_dir) = build_test_connection();
         attach_non_persistent_producer(
             &mut server_cnx,
             "non-persistent://public/default/non-persistent-rate-limit-topic",
@@ -1117,7 +1118,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_persistent_send_completes_without_leaving_pending_backlog() {
-        let (mut server_cnx, _client) = build_test_connection();
+        let (mut server_cnx, _client, _test_dir) = build_test_connection();
         attach_non_persistent_producer(
             &mut server_cnx,
             "non-persistent://public/default/non-persistent-sync-send-topic",

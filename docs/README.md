@@ -13,6 +13,7 @@ walkthroughs are intentionally kept out of the main documentation set.
 ## Design Notes
 
 - [Storage layer design](design/storage/storage.md)
+- [ManagedLedger storage refactoring](design/storage/managed-ledger-storage-refactoring.md)
 
 ## Apache Pulsar Comparison Notes
 

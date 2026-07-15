@@ -384,3 +384,18 @@ fn previous_position_handles_same_ledger_cross_ledger_and_before_first() {
     // phase 3: The first ledger's entry 0 -> None (before the first)
     assert_eq!(ledger.previous_position(&position(0, 0)), None);
 }
+
+#[test]
+fn read_entries_from_respects_limit() {
+    let dir = tempdir().unwrap();
+    let db = open_test_db(dir.path());
+    let entry_log = open_test_entry_log(dir.path());
+    let mut ledger = RocksDBManagedLedger::open("ledger-1", db, entry_log).unwrap();
+    ledger.add_entry(b"first").unwrap();
+    ledger.add_entry(b"second").unwrap();
+    ledger.add_entry(b"third").unwrap();
+    let entries = ledger.read_entries_from(&position(0, 0), 2).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].payload, "first".as_bytes());
+    assert_eq!(entries[1].payload, "second".as_bytes());
+}

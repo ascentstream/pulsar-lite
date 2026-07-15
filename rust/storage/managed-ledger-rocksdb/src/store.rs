@@ -3,13 +3,13 @@ use super::entrylog::EntryLogStore;
 use super::factory::{RocksDBManagedLedgerFactory, SharedLedger};
 use super::keys;
 use super::ledger::RocksDBManagedLedger;
+use crate::cursor::first_position;
 use anyhow::{anyhow, Result};
 use rocksdb::{Options, DB};
 use std::path::Path;
 use std::sync::{Arc, MutexGuard};
 
 use pulsar_lite_storage_managed_ledger::{
-    first_unacked_from_messages, last_position_from_messages, read_from_messages,
     CursorInitOptions, CursorOpenResult, InitialPosition, ManagedCursor, ManagedLedger,
     ManagedLedgerPosition, ManagedLedgerStorage, MessageId, StoredMessage,
 };
@@ -57,30 +57,11 @@ impl RocksDbManagedLedgerStorage {
         cursor.persist_state()
     }
 
-    fn position_before_start_message_id(
-        &self,
-        topic: &str,
-        start: &MessageId,
-    ) -> Option<ManagedLedgerPosition> {
-        let target = ManagedLedgerPosition::from(start);
-        let mut previous = None;
-
-        for (message_id, _) in self.get_messages(topic) {
-            let position = ManagedLedgerPosition::from(&message_id);
-            if position >= target {
-                return previous;
-            }
-            previous = Some(position);
-        }
-
-        previous
-    }
-
     fn apply_latest_cursor(&self, topic: &str, subscription: &str) -> Result<()> {
-        let last = last_position_from_messages(&self.get_messages(topic));
         let cursor_name = keys::encode_cursor_name(subscription);
         let shared = self.topic_ledger(topic)?;
         let mut ledger = Self::lock_ledger(&shared)?;
+        let last = ledger.last_position()?;
         let mut cursor = ledger.open_cursor(&cursor_name)?;
 
         if let Some(last) = last {
@@ -97,11 +78,14 @@ impl RocksDbManagedLedgerStorage {
         start: &MessageId,
     ) -> Result<()> {
         let cursor_name = keys::encode_cursor_name(subscription);
+        let target = ManagedLedgerPosition::from(start);
         let shared = self.topic_ledger(topic)?;
         let mut ledger = Self::lock_ledger(&shared)?;
+
+        let previous = ledger.previous_position(&target);
         let mut cursor = ledger.open_cursor(&cursor_name)?;
 
-        if let Some(previous) = self.position_before_start_message_id(topic, start) {
+        if let Some(previous) = previous {
             cursor.mark_delete(previous)
         } else {
             cursor.persist_state()
@@ -196,15 +180,25 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         topic: &str,
         subscription: &str,
     ) -> Result<Option<ManagedLedgerPosition>> {
-        let messages = self.get_messages(topic);
         let cursor_name = keys::encode_cursor_name(subscription);
         let shared = self.topic_ledger(topic)?;
         let mut ledger = Self::lock_ledger(&shared)?;
-        let cursor = ledger.open_cursor(&cursor_name)?;
 
-        Ok(first_unacked_from_messages(&messages, |id| {
-            is_managed_position_acknowledged(cursor.state(), &ManagedLedgerPosition::from(id))
-        }))
+        let cursor = ledger.open_cursor(&cursor_name)?;
+        let state = cursor.state();
+
+        let mut candidate = match state.mark_delete.as_ref() {
+            Some(mark_delete) => next_position(mark_delete, &ledger.info),
+            None => first_position(&ledger.info, -1),
+        };
+
+        while let Some(position) = candidate {
+            if !is_managed_position_acknowledged(&state, &position) {
+                return Ok(Some(position));
+            }
+            candidate = next_position(&position, &ledger.info);
+        }
+        Ok(None)
     }
 
     fn read_from(
@@ -213,8 +207,14 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         from: &ManagedLedgerPosition,
         limit: usize,
     ) -> Result<Vec<(MessageId, Vec<u8>)>> {
-        let messages = self.get_messages(topic);
-        Ok(read_from_messages(&messages, from, limit))
+        let shared = self.topic_ledger(topic)?;
+        let ledger = Self::lock_ledger(&shared)?;
+
+        Ok(ledger
+            .read_entries_from(from, limit)?
+            .into_iter()
+            .map(|e| (e.message_id, e.payload))
+            .collect())
     }
 
     fn read_entries_from(
@@ -223,23 +223,19 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         from: &ManagedLedgerPosition,
         limit: usize,
     ) -> Result<Vec<StoredMessage>> {
-        let messages = self.get_message_entries(topic);
-        let mut out = Vec::new();
-        for entry in messages {
-            let position = ManagedLedgerPosition::from(&entry.message_id);
-            if (position.ledger_id, position.entry_id) < (from.ledger_id, from.entry_id) {
-                continue;
-            }
-            out.push(entry);
-            if out.len() >= limit {
-                break;
-            }
-        }
-        Ok(out)
+        let shared = self.topic_ledger(topic)?;
+        let ledger = Self::lock_ledger(&shared)?;
+        Ok(ledger
+            .read_entries_from(from, limit)?
+            .into_iter()
+            .map(|e| e.into())
+            .collect())
     }
 
     fn get_last_position(&self, topic: &str) -> Result<Option<ManagedLedgerPosition>> {
-        Ok(last_position_from_messages(&self.get_messages(topic)))
+        let shared = self.topic_ledger(topic)?;
+        let ledger = Self::lock_ledger(&shared)?;
+        ledger.last_position()
     }
 
     fn get_next_position(
@@ -334,7 +330,17 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
                 return Vec::new();
             }
         };
-        ledger.messages()
+        match ledger.messages() {
+            Ok(messages) => messages,
+            Err(error) => {
+                log::error!(
+                    "Failed to read messages from managed ledger for topic '{}': {}",
+                    topic,
+                    error
+                );
+                Vec::new()
+            }
+        }
     }
 
     fn get_message_entries(&self, topic: &str) -> Vec<StoredMessage> {
@@ -360,7 +366,17 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
                 return Vec::new();
             }
         };
-        ledger.message_entries()
+        match ledger.message_entries() {
+            Ok(entries) => entries,
+            Err(error) => {
+                log::error!(
+                    "Failed to read message entries from managed ledger for topic '{}': {}",
+                    topic,
+                    error
+                );
+                Vec::new()
+            }
+        }
     }
 
     fn is_acknowledged_shared(

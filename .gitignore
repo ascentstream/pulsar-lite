@@ -63,6 +63,9 @@ rust/*.metadata.json
 # Perf test data (logs, results, flamegraphs, perf.data)
 docs/perf/data/
 
+# docs storage design
+docs/design/storage
+
 # Cache
 /.cache/
 

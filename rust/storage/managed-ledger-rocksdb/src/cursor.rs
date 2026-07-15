@@ -79,7 +79,10 @@ pub fn is_managed_position_acknowledged(
         || cursor.individually_deleted_entries.contains(position)
 }
 
-fn first_position(info: &StoredManagedLedgerInfo, partition: i32) -> Option<ManagedLedgerPosition> {
+pub(crate) fn first_position(
+    info: &StoredManagedLedgerInfo,
+    partition: i32,
+) -> Option<ManagedLedgerPosition> {
     info.ledgers
         .iter()
         .find(|ledger| ledger.entries > 0)

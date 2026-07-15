@@ -1,8 +1,8 @@
 //! Managed-ledger backend integration tests for `Storage`.
 
 use pulsar_lite_storage::Storage;
-use tempfile::tempdir;
 use pulsar_lite_storage_managed_ledger::{CursorInitOptions, InitialPosition};
+use tempfile::tempdir;
 
 fn open_earliest_cursor(storage: &mut Storage, topic: &str, subscription: &str) {
     storage

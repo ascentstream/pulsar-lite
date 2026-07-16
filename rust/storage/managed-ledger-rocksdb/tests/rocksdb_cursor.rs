@@ -4,10 +4,12 @@ mod common;
 
 use common::*;
 use pulsar_lite_storage_managed_ledger::{ManagedCursor, ManagedLedger};
-use pulsar_lite_storage_managed_ledger::{ManagedLedgerConfig, ManagedLedgerFactory};
+use pulsar_lite_storage_managed_ledger::{
+    ManagedLedgerConfig, ManagedLedgerFactory, ManagedLedgerPosition,
+};
 use pulsar_lite_storage_managed_ledger_rocksdb::test_support::{
-    ack_managed_cursor_shared, RocksDBManagedCursor, RocksDBManagedLedger,
-    RocksDBManagedLedgerFactory,
+    ack_managed_cursor_shared, is_managed_position_acknowledged, RocksDBManagedCursor,
+    RocksDBManagedLedger, RocksDBManagedLedgerFactory,
 };
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -125,4 +127,170 @@ fn managed_ledger_open_cursor_recovers_cursor_state() {
     let cursor = ledger.open_cursor("sub-a").unwrap();
 
     assert_eq!(cursor.state().mark_delete, Some(mark_delete));
+}
+
+#[test]
+fn managed_cursor_mark_delete_normalizes_partition() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("cursor-mark-delete-partition");
+    let message_position = ManagedLedgerPosition {
+        ledger_id: 3,
+        entry_id: 11,
+        partition: 7,
+    };
+
+    let cursor_position = ManagedLedgerPosition {
+        ledger_id: 3,
+        entry_id: 11,
+        partition: -1,
+    };
+
+    {
+        let db = open_test_db(&db_path);
+        let mut cursor = RocksDBManagedCursor::open("ledger-a", "sub-a", db).unwrap();
+        cursor.mark_delete(message_position.clone()).unwrap();
+        assert_eq!(cursor.state().mark_delete, Some(cursor_position.clone()));
+        assert!(is_managed_position_acknowledged(
+            cursor.state(),
+            &message_position,
+        ))
+    }
+    let db = open_test_db(&db_path);
+    let cursor = RocksDBManagedCursor::open("ledger-a", "sub-a", db).unwrap();
+    assert_eq!(cursor.state().mark_delete, Some(cursor_position));
+    assert!(is_managed_position_acknowledged(
+        cursor.state(),
+        &message_position,
+    ));
+}
+
+#[test]
+fn managed_cursor_individual_delete_normalizes_partition() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("cursor-individual-delete-partition");
+
+    let message_position = ManagedLedgerPosition {
+        ledger_id: 3,
+        entry_id: 11,
+        partition: 7,
+    };
+
+    let cursor_position = ManagedLedgerPosition {
+        ledger_id: 3,
+        entry_id: 11,
+        partition: -1,
+    };
+
+    {
+        let db = open_test_db(&db_path);
+        let mut cursor = RocksDBManagedCursor::open("ledger-a", "sub-a", db).unwrap();
+        cursor.delete_individual(message_position.clone()).unwrap();
+        assert_eq!(
+            cursor
+                .state()
+                .individually_deleted_entries
+                .contains(&cursor_position),
+            true
+        );
+        assert!(is_managed_position_acknowledged(
+            cursor.state(),
+            &message_position,
+        ))
+    }
+
+    let db = open_test_db(&db_path);
+    let cursor = RocksDBManagedCursor::open("ledger-a", "sub-a", db).unwrap();
+    assert_eq!(
+        cursor
+            .state()
+            .individually_deleted_entries
+            .contains(&cursor_position),
+        true
+    );
+    assert!(is_managed_position_acknowledged(
+        cursor.state(),
+        &message_position,
+    ))
+}
+
+#[test]
+fn managed_cursor_reset_cursor_normalizes_partition() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("cursor-reset-partition");
+
+    let message_position = ManagedLedgerPosition {
+        ledger_id: 3,
+        entry_id: 11,
+        partition: 7,
+    };
+
+    let cursor_position = ManagedLedgerPosition {
+        ledger_id: 3,
+        entry_id: 11,
+        partition: -1,
+    };
+
+    {
+        let db = open_test_db(&db_path);
+        let mut cursor = RocksDBManagedCursor::open("ledger-a", "sub-a", db).unwrap();
+        cursor.reset_cursor(Some(message_position.clone())).unwrap();
+        assert_eq!(cursor.state().mark_delete, Some(cursor_position.clone()));
+        assert!(cursor.state().individually_deleted_entries.is_empty());
+        assert!(is_managed_position_acknowledged(
+            cursor.state(),
+            &message_position,
+        ))
+    }
+
+    let db = open_test_db(&db_path);
+    let cursor = RocksDBManagedCursor::open("ledger-a", "sub-a", db).unwrap();
+    assert_eq!(cursor.state().mark_delete, Some(cursor_position.clone()));
+    assert!(cursor.state().individually_deleted_entries.is_empty());
+    assert!(is_managed_position_acknowledged(
+        cursor.state(),
+        &message_position,
+    ))
+}
+
+#[test]
+fn shared_ack_normalizes_partition_when_advancing_mark_delete() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("shared-ack-partition");
+    let db = open_test_db(&db_path);
+    let entry_log = open_test_entry_log(&db_path);
+
+    let mut ledger = RocksDBManagedLedger::open("ledger-a", Arc::clone(&db), entry_log).unwrap();
+
+    let first = ledger.add_entry_with_partition(7, b"first").unwrap();
+
+    let second = ledger.add_entry_with_partition(7, b"second").unwrap();
+
+    let mut cursor = ledger.open_cursor("sub-a").unwrap();
+
+    // First, reorder ACK item 'second'. It should enter the individual collection
+    ack_managed_cursor_shared(&mut cursor, second.clone(), ledger.ledger_info()).unwrap();
+
+    assert_eq!(cursor.state().mark_delete, None);
+    assert!(cursor
+        .state()
+        .individually_deleted_entries
+        .contains(&ManagedLedgerPosition {
+            ledger_id: second.ledger_id,
+            entry_id: second.entry_id,
+            partition: -1
+        }));
+
+    // Then move on to the first item, 'mark_delete'proceed forward
+    ack_managed_cursor_shared(&mut cursor, first.clone(), ledger.ledger_info()).unwrap();
+    assert_eq!(
+        cursor.state().mark_delete,
+        Some(ManagedLedgerPosition {
+            ledger_id: second.ledger_id,
+            entry_id: second.entry_id,
+            partition: -1
+        })
+    );
+    assert!(cursor.state().individually_deleted_entries.is_empty());
+    assert!(is_managed_position_acknowledged(cursor.state(), &first));
+    assert!(is_managed_position_acknowledged(cursor.state(), &second));
 }

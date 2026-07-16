@@ -12,7 +12,9 @@ pub use store::RocksDbManagedLedgerStorage;
 /// Internal types exposed for integration tests in `tests/`.
 #[doc(hidden)]
 pub mod test_support {
-    pub use crate::cursor::{ack_managed_cursor_shared, RocksDBManagedCursor};
+    pub use crate::cursor::{
+        ack_managed_cursor_shared, is_managed_position_acknowledged, RocksDBManagedCursor,
+    };
     pub use crate::entrylog::EntryLogStore;
     pub use crate::factory::RocksDBManagedLedgerFactory;
     pub use crate::ledger::RocksDBManagedLedger;

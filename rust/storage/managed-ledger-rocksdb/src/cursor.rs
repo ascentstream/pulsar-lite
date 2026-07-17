@@ -8,6 +8,14 @@ use pulsar_lite_storage_managed_ledger::{
     ManagedCursor, ManagedCursorState, ManagedLedgerPosition,
 };
 
+fn cursor_position(position: &ManagedLedgerPosition) -> ManagedLedgerPosition {
+    ManagedLedgerPosition {
+        ledger_id: position.ledger_id,
+        entry_id: position.entry_id,
+        partition: -1,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RocksDBManagedCursor {
     managedledger_name: String,
@@ -51,18 +59,24 @@ impl ManagedCursor for RocksDBManagedCursor {
         &self.state
     }
 
+    /// Marks a position as deleted in the cursor state.
+    ///
+    /// The cursor does not need to pay attention to the messages regarding partitioning,
+    /// so uniformity has been achieved here.
+    /// ManagedLedgerPosition { ledger_id: 1, entry_id: 10, partition: 0 } -> ManagedLedgerPosition { ledger_id: 1, entry_id: 10, partition: -1 }
     fn mark_delete(&mut self, position: ManagedLedgerPosition) -> Result<()> {
-        self.state.mark_delete = Some(position);
+        self.state.mark_delete = Some(cursor_position(&position));
         self.persist_state()
     }
 
     fn delete_individual(&mut self, position: ManagedLedgerPosition) -> Result<()> {
+        let position = cursor_position(&position);
         self.state.individually_deleted_entries.insert(position);
         self.persist_state()
     }
 
     fn reset_cursor(&mut self, position: Option<ManagedLedgerPosition>) -> Result<()> {
-        self.state.mark_delete = position;
+        self.state.mark_delete = position.as_ref().map(cursor_position);
         self.state.individually_deleted_entries.clear();
         self.persist_state()
     }
@@ -72,11 +86,13 @@ pub fn is_managed_position_acknowledged(
     cursor: &ManagedCursorState,
     position: &ManagedLedgerPosition,
 ) -> bool {
+    let position = cursor_position(position);
+
     cursor
         .mark_delete
         .as_ref()
-        .is_some_and(|mark_delete| position <= mark_delete)
-        || cursor.individually_deleted_entries.contains(position)
+        .is_some_and(|mark_delete| &position <= mark_delete)
+        || cursor.individually_deleted_entries.contains(&position)
 }
 
 pub(crate) fn first_position(
@@ -125,6 +141,7 @@ pub fn ack_managed_cursor_shared(
     position: ManagedLedgerPosition,
     info: &StoredManagedLedgerInfo,
 ) -> Result<()> {
+    let position = cursor_position(&position);
     if is_managed_position_acknowledged(cursor.state(), &position) {
         return Ok(());
     }

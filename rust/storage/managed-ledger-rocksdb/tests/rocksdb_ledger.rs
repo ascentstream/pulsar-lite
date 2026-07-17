@@ -399,3 +399,122 @@ fn read_entries_from_respects_limit() {
     assert_eq!(entries[0].payload, "first".as_bytes());
     assert_eq!(entries[1].payload, "second".as_bytes());
 }
+
+#[test]
+fn managed_ledger_open_initializes_last_position_runtime_state() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("runtime-last-position");
+
+    let expected_position = {
+        let db = open_test_db(&db_path);
+        let entry_log = open_test_entry_log(&db_path);
+        let mut ledger = RocksDBManagedLedger::open("ledger-a", db, entry_log).unwrap();
+        ledger.add_entry_with_partition(7, b"first").unwrap()
+    };
+
+    let db = open_test_db(&db_path);
+    let entry_log = open_test_entry_log(&db_path);
+    // When opening, it should be based on the persistent catalog and the last EntryLocation.
+    // Initialize runtime.last_confirmed_position.
+    let ledger = RocksDBManagedLedger::open("ledger-a", Arc::clone(&db), entry_log).unwrap();
+    // Remove the last EntryLocation, to demonstrate the subsequent call to last_position()
+    // The runtime that is initialized when opened is used, rather than querying RocksDB again.
+    db.delete(keys::managed_entry_key(
+        expected_position.ledger_id,
+        expected_position.entry_id,
+    ))
+    .unwrap();
+    assert_eq!(ledger.last_position().unwrap(), Some(expected_position),);
+}
+
+#[test]
+fn message_ledger_append_updates_runtime_last_position() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("runtime-append-last-position");
+
+    let db = open_test_db(&db_path);
+    let entry_log = open_test_entry_log(&db_path);
+
+    let mut ledger =
+        RocksDBManagedLedger::open("ledger-a", Arc::clone(&db), Arc::clone(&entry_log)).unwrap();
+
+    let first = ledger.add_entry_with_partition(7, b"first").unwrap();
+
+    // Delete the index and ensure that last_position cannot be obtained through a temporary query in RocksDB.
+    db.delete(keys::managed_entry_key(first.ledger_id, first.entry_id))
+        .unwrap();
+    assert_eq!(ledger.last_position().unwrap(), Some(first));
+
+    // Consecutive append - advancing to the last position in the runtime.
+    let mut ledger =
+        RocksDBManagedLedger::open("ledger-b", Arc::clone(&db), Arc::clone(&entry_log)).unwrap();
+
+    let first = ledger.add_entry_with_partition(7, b"first").unwrap();
+    let second = ledger.add_entry_with_partition(7, b"second").unwrap();
+    assert_eq!(ledger.last_position().unwrap(), Some(second.clone()),);
+    assert_eq!(second.ledger_id, first.ledger_id);
+    assert_eq!(second.entry_id, first.entry_id + 1);
+}
+
+#[test]
+fn managed_ledger_runtime_last_position_survives_rollover_to_empty_ledger() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("runtime-rollover-last-position");
+    let db = open_test_db(&db_path);
+    let entry_log = open_test_entry_log(&db_path);
+    let config = ManagedLedgerConfig {
+        max_entries_per_ledger: Some(2),
+        ..ManagedLedgerConfig::default()
+    };
+
+    let mut ledger = RocksDBManagedLedger::open_with_config(
+        "ledger-a",
+        Arc::clone(&db),
+        Arc::clone(&entry_log),
+        &config,
+    )
+    .unwrap();
+
+    let first = ledger.add_entry_with_partition(7, b"first").unwrap();
+    let second = ledger.add_entry_with_partition(7, b"second").unwrap();
+    assert_eq!(first.ledger_id, second.ledger_id);
+    assert_eq!(second.ledger_id, 0);
+
+    // After creating a new ledger, if the new ledger is empty, it should find the last entry of the previous ledger.
+    assert_eq!(ledger.last_position().unwrap(), Some(second),);
+
+    // After adding a new entry to the new ledger, the last position should be updated.
+    let third = ledger.add_entry_with_partition(7, b"third").unwrap();
+    assert_eq!(third.ledger_id, 1);
+    assert_eq!(ledger.last_position().unwrap(), Some(third),)
+}
+
+#[test]
+fn managed_ledger_runtime_state_recovers_and_continues_after_reopen() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("runtime-reopen");
+
+    let second = {
+        let db = open_test_db(&db_path);
+        let entry_log = open_test_entry_log(&db_path);
+
+        let mut ledger = RocksDBManagedLedger::open("ledger-a", db, entry_log).unwrap();
+
+        ledger.add_entry_with_partition(7, b"first").unwrap();
+        ledger.add_entry_with_partition(7, b"second").unwrap()
+    };
+
+    let db = open_test_db(&db_path);
+    let entry_log = open_test_entry_log(&db_path);
+
+    let mut ledger = RocksDBManagedLedger::open("ledger-a", db, entry_log).unwrap();
+
+    assert_eq!(ledger.last_position().unwrap(), Some(second.clone()));
+
+    let third = ledger.add_entry_with_partition(7, b"third").unwrap();
+
+    assert_eq!(third.ledger_id, second.ledger_id);
+    assert_eq!(third.entry_id, second.entry_id + 1);
+
+    assert_eq!(ledger.last_position().unwrap(), Some(third))
+}

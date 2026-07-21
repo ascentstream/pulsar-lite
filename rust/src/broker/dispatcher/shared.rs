@@ -229,17 +229,17 @@ impl SharedDispatcher {
         storage: SharedStorage,
         topic: String,
         subscription: String,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
         // Check if we have permits
         let total_permits = self.total_available_permits.load(Ordering::Relaxed);
         if total_permits == 0 {
             log::debug!("No permits available, skipping dispatch");
-            return Ok(());
+            return Ok(0);
         }
 
         // Dispatch up to DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE messages
-        let mut dispatched = 0;
-        let mut redelivered = 0;
+        let mut dispatched = 0u32;
+        let mut redelivered = 0u32;
         let max_batch = std::cmp::min(total_permits, DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE);
 
         log::debug!(
@@ -389,7 +389,7 @@ impl SharedDispatcher {
             );
         }
 
-        Ok(())
+        Ok(dispatched)
     }
 
     /// Add messages to redelivery queue
@@ -631,10 +631,25 @@ impl Dispatcher for SharedDispatcher {
             log::debug!("Dispatch already in progress, skipping");
             return Ok(());
         }
-
-        let result = self
-            .dispatch_messages_batch(storage, topic, subscription)
-            .await;
+        let  result = async {
+            // Keep dispatching batches while we still make progress and have permits.
+            // read/send one batch, then readMoreEntries again
+            loop {
+                let dispatcher = self.dispatch_messages_batch(
+                    storage.clone(), 
+                    topic.clone(), 
+                    subscription.clone()
+                ).await?;
+                if dispatcher <= 0 {break;}
+                if self.total_available_permits.load(Ordering::Relaxed) == 0 {
+                    break;
+                }
+    
+                // yield so other tasks can run on large backlogs.
+                tokio::task::yield_now().await;
+            }
+            Ok(())  
+        }.await;
 
         // Reset flag
         self.dispatch_in_progress.store(false, Ordering::Relaxed);

@@ -244,16 +244,20 @@ impl Dispatcher for FailoverDispatcher {
         topic: String,
         subscription: String,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // For Failover, only dispatch to the active consumer.
-        if let Some(primary_consumer) = self.get_active_consumer() {
+        // Failover: keep draining beyond a single batch while permits remain.
+        loop {
+            let Some(primary_consumer) = self.get_active_consumer() else {
+                break;
+            };
+
             let available_permits = self.total_available_permits.load(Ordering::Relaxed);
             if available_permits == 0 {
-                return Ok(());
+                break;
             }
 
             let max_messages =
                 std::cmp::min(available_permits, DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE);
-            let mut dispatched = 0;
+            let mut dispatched = 0u32;
 
             for _ in 0..max_messages {
                 if !primary_consumer.use_permit().await {
@@ -302,6 +306,15 @@ impl Dispatcher for FailoverDispatcher {
                     primary_consumer.consumer_id
                 );
             }
+
+            if dispatched == 0 {
+                break;
+            }
+            if self.total_available_permits.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+
+            tokio::task::yield_now().await;
         }
 
         Ok(())

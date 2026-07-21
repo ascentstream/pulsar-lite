@@ -314,6 +314,147 @@ impl KeySharedDispatcher {
         self.rebuild_assignments();
         consumer
     }
+
+    /// One Key_Shared batch (≤ 20).
+    /// Returns progress: successful sends + blocked-hash read advances.
+    async fn dispatch_messages_batch(
+        &self,
+        storage: SharedStorage,
+        topic: String,
+        subscription: String,
+    ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+        let max_batch = self
+            .total_available_permits
+            .load(Ordering::Relaxed)
+            .min(DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE);
+        if max_batch == 0 {
+            return Ok(0);
+        }
+
+        let mut remaining_dispatches = max_batch;
+        let mut progress = 0u32;
+
+        while remaining_dispatches > 0 {
+            let redelivery = {
+                let guard = storage.lock().await;
+                self.pop_dispatchable_redelivery_message(&guard, &topic, &subscription)?
+            };
+
+            if let Some((redelivery, entry, consumer)) = redelivery {
+                let sticky_key_hash = redelivery
+                    .sticky_key_hash
+                    .unwrap_or_else(|| sticky_key_hash_from_metadata(&entry.metadata));
+                if !consumer.use_permit().await {
+                    self.restore_redelivery_message(RedeliveryEntry {
+                        sticky_key_hash: Some(sticky_key_hash),
+                        ..redelivery
+                    });
+                    break;
+                }
+                remaining_dispatches -= 1;
+                self.subtract_total_permits(1);
+
+                if consumer
+                    .send_message_with_sticky_hash(
+                        entry.message_id.clone(),
+                        entry.metadata,
+                        entry.payload.clone(),
+                        redelivery.redelivery_count,
+                        Some(sticky_key_hash),
+                    )
+                    .await
+                {
+                    consumer
+                        .record_message_dispatched(entry.payload.len())
+                        .await;
+                    progress += 1;
+                } else {
+                    self.restore_redelivery_message(RedeliveryEntry {
+                        message_id: entry.message_id,
+                        redelivery_count: redelivery.redelivery_count + 1,
+                        sticky_key_hash: Some(sticky_key_hash),
+                    });
+                    consumer.add_permits(1).await;
+                    self.total_available_permits.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+                continue;
+            }
+
+            let Some(candidate) = self
+                .next_dispatchable_message(storage.clone(), &topic, &subscription)
+                .await?
+            else {
+                break;
+            };
+
+            let sticky_key_hash = sticky_key_hash_from_metadata(&candidate.metadata);
+            log::debug!(
+                "NORMAL SEND {:?} hash={} blocked={}",
+                candidate.message_id,
+                sticky_key_hash,
+                self.redelivery_controller
+                    .read()
+                    .unwrap()
+                    .is_hash_blocked(sticky_key_hash)
+            );
+            if self
+                .redelivery_controller
+                .read()
+                .unwrap()
+                .is_hash_blocked(sticky_key_hash)
+            {
+                self.add_redelivery_entries(vec![RedeliveryEntry {
+                    message_id: candidate.message_id,
+                    redelivery_count: 0,
+                    sticky_key_hash: Some(sticky_key_hash),
+                }]);
+                commit_read_position(&self.read_position, candidate.next_position);
+                // Blocked-hash advance still counts as progress so the outer
+                // drain loop does not stop while the cursor is moving.
+                progress += 1;
+                continue;
+            }
+
+            let Some(consumer) = self.select_consumer_for_hash(sticky_key_hash) else {
+                break;
+            };
+            if !consumer.use_permit().await {
+                break;
+            }
+            remaining_dispatches -= 1;
+            self.subtract_total_permits(1);
+
+            if consumer
+                .send_message_with_sticky_hash(
+                    candidate.message_id.clone(),
+                    candidate.metadata,
+                    candidate.payload.clone(),
+                    0,
+                    Some(sticky_key_hash),
+                )
+                .await
+            {
+                commit_read_position(&self.read_position, candidate.next_position);
+                consumer
+                    .record_message_dispatched(candidate.payload.len())
+                    .await;
+                progress += 1;
+            } else {
+                self.restore_redelivery_message(RedeliveryEntry {
+                    message_id: candidate.message_id,
+                    redelivery_count: 1,
+                    sticky_key_hash: Some(sticky_key_hash),
+                });
+                commit_read_position(&self.read_position, candidate.next_position);
+                consumer.add_permits(1).await;
+                self.total_available_permits.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+
+        Ok(progress)
+    }
 }
 
 impl Dispatcher for KeySharedDispatcher {
@@ -377,127 +518,20 @@ impl Dispatcher for KeySharedDispatcher {
         topic: String,
         subscription: String,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let max_batch = self
-            .total_available_permits
-            .load(Ordering::Relaxed)
-            .min(DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE);
-        if max_batch == 0 {
-            return Ok(());
-        }
+        // Keep draining while a batch still makes progress and permits remain.
+        loop {
+            let progress = self
+                .dispatch_messages_batch(storage.clone(), topic.clone(), subscription.clone())
+                .await?;
 
-        let mut remaining_dispatches = max_batch;
-        while remaining_dispatches > 0 {
-            let redelivery = {
-                let guard = storage.lock().await;
-                self.pop_dispatchable_redelivery_message(&guard, &topic, &subscription)?
-            };
-
-            if let Some((redelivery, entry, consumer)) = redelivery {
-                let sticky_key_hash = redelivery
-                    .sticky_key_hash
-                    .unwrap_or_else(|| sticky_key_hash_from_metadata(&entry.metadata));
-                if !consumer.use_permit().await {
-                    self.restore_redelivery_message(RedeliveryEntry {
-                        sticky_key_hash: Some(sticky_key_hash),
-                        ..redelivery
-                    });
-                    break;
-                }
-                remaining_dispatches -= 1;
-                self.subtract_total_permits(1);
-
-                if consumer
-                    .send_message_with_sticky_hash(
-                        entry.message_id.clone(),
-                        entry.metadata,
-                        entry.payload.clone(),
-                        redelivery.redelivery_count,
-                        Some(sticky_key_hash),
-                    )
-                    .await
-                {
-                    consumer
-                        .record_message_dispatched(entry.payload.len())
-                        .await;
-                } else {
-                    self.restore_redelivery_message(RedeliveryEntry {
-                        message_id: entry.message_id,
-                        redelivery_count: redelivery.redelivery_count + 1,
-                        sticky_key_hash: Some(sticky_key_hash),
-                    });
-                    consumer.add_permits(1).await;
-                    self.total_available_permits.fetch_add(1, Ordering::Relaxed);
-                    break;
-                }
-                continue;
-            }
-
-            let Some(candidate) = self
-                .next_dispatchable_message(storage.clone(), &topic, &subscription)
-                .await?
-            else {
-                break;
-            };
-
-            let sticky_key_hash = sticky_key_hash_from_metadata(&candidate.metadata);
-            log::debug!(
-                "NORMAL SEND {:?} hash={} blocked={}",
-                candidate.message_id,
-                sticky_key_hash,
-                self.redelivery_controller
-                    .read()
-                    .unwrap()
-                    .is_hash_blocked(sticky_key_hash)
-            );
-            if self
-                .redelivery_controller
-                .read()
-                .unwrap()
-                .is_hash_blocked(sticky_key_hash)
-            {
-                self.add_redelivery_entries(vec![RedeliveryEntry {
-                    message_id: candidate.message_id,
-                    redelivery_count: 0,
-                    sticky_key_hash: Some(sticky_key_hash),
-                }]);
-                commit_read_position(&self.read_position, candidate.next_position);
-                continue;
-            }
-
-            let Some(consumer) = self.select_consumer_for_hash(sticky_key_hash) else {
-                break;
-            };
-            if !consumer.use_permit().await {
+            if progress == 0 {
                 break;
             }
-            remaining_dispatches -= 1;
-            self.subtract_total_permits(1);
-
-            if consumer
-                .send_message_with_sticky_hash(
-                    candidate.message_id.clone(),
-                    candidate.metadata,
-                    candidate.payload.clone(),
-                    0,
-                    Some(sticky_key_hash),
-                )
-                .await
-            {
-                commit_read_position(&self.read_position, candidate.next_position);
-                consumer
-                    .record_message_dispatched(candidate.payload.len())
-                    .await;
-            } else {
-                self.restore_redelivery_message(RedeliveryEntry {
-                    message_id: candidate.message_id,
-                    redelivery_count: 1,
-                    sticky_key_hash: Some(sticky_key_hash),
-                });
-                commit_read_position(&self.read_position, candidate.next_position);
-                consumer.add_permits(1).await;
-                self.total_available_permits.fetch_add(1, Ordering::Relaxed);
+            if self.total_available_permits.load(Ordering::Relaxed) == 0 {
                 break;
             }
+
+            tokio::task::yield_now().await;
         }
 
         Ok(())

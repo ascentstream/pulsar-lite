@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib import ROOT
 from lib.broker import BrokerConfig, BrokerProcess, DockerBrokerProcess
 from lib.docker_image import build_broker_image
+from lib.observability import PerfCollector
 from lib.parsing import parse_consumer_output, parse_producer_output
 from lib.perf_cmd import ensure_prereqs, perf_cmd, run_consumer_then_feed, run_sync
 
@@ -593,11 +594,21 @@ def main(argv: list[str]) -> int:
         broker.start()
 
         try:
+            
             for scenario in broker_scenarios:
                 print(f"\n[{scenario.name}] {scenario.description}")
                 scenario_dir = run_artifacts / scenario.name
                 scenario_dir.mkdir(parents=True, exist_ok=True)
-
+                # Start perf recording (must be after restart to capture the new PID)
+                perf_data_path = scenario_dir / "perf.data"
+                perf_collector: PerfCollector | None = None
+                if broker.broker_pid:
+                    perf_collector = PerfCollector(
+                        pid=broker.broker_pid,
+                        duration=300,
+                        perf_data_path=perf_data_path,
+                    )
+                    perf_collector.start_persist()
                 try:
                     result = run_scenario(scenario, broker, scenario_dir)
 
@@ -611,6 +622,25 @@ def main(argv: list[str]) -> int:
                     if broker.sampler:
                         broker.sampler.write_csv(scenario_dir / "broker_timeseries.csv")
 
+                    # Record artifact paths in result
+                    perf_collector.stop()
+                    if perf_data_path.exists():
+                        svg_path = scenario_dir / "flamegraph.svg"
+                        ok = PerfCollector.generate_flamegraph(perf_data_path, svg_path)
+                        if ok:
+                            result["flamegraph_file"] = str(svg_path.relative_to(ROOT))
+                            print(f"  flamegraph -> {svg_path}", file=sys.stderr)
+                        else:
+                            result["flamegraph_file"] = None
+                            print(
+                                f"  flamegraph skipped for {perf_data_path.name}",
+                                file=sys.stderr,
+                            )
+                    else:
+                        result["perf_data_file"] = None
+                        result["flamegraph_file"] = None
+                        print("  perf data not captured", file=sys.stderr)
+                    
                     results["scenarios"].append(
                         {
                             "name": scenario.name,
@@ -625,6 +655,9 @@ def main(argv: list[str]) -> int:
                     print(f"  ✓ PASS")
 
                 except Exception as e:
+                    print(f"  ERROR: {e}", file=sys.stderr)
+                    if perf_collector is not None:
+                        perf_collector.stop()
                     results["scenarios"].append(
                         {
                             "name": scenario.name,

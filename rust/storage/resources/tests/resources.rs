@@ -86,7 +86,7 @@ fn topic_resource_ensures_subscription_and_topic() {
 #[test]
 fn pulsar_resources_supports_in_memory_metadata_store() {
     let store = InMemoryMetadataStore::new();
-    let mut resources = PulsarResources::from_metadata_store(store);
+    let resources = PulsarResources::from_metadata_store(store);
     let topic = "persistent://public/default/t3";
 
     resources.ensure_topic(topic, true, 3, VERSION).unwrap();
@@ -114,7 +114,7 @@ fn pulsar_resources_file_store_roundtrips_metadata() {
     let topic = "persistent://public/default/roundtrip";
 
     {
-        let mut resources = PulsarResources::<FileMetadataStore>::new(&db_path).unwrap();
+        let resources = PulsarResources::<FileMetadataStore>::new(&db_path).unwrap();
 
         resources.ensure_topic(topic, true, 4, VERSION).unwrap();
         resources

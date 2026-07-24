@@ -8,7 +8,6 @@
 
 use super::read_position::{commit_read_position, next_unacked_candidate};
 use crate::broker::dispatcher::Dispatcher;
-use crate::broker::non_persistent::dispatcher;
 use crate::broker::service::topic::SubscriptionType;
 use crate::broker::service::{Consumer, SharedStorage};
 use crate::storage::ManagedLedgerPosition;
@@ -119,17 +118,17 @@ impl Dispatcher for ExclusiveDispatcher {
                 if available_permits == 0 {
                     return Ok(());
                 }
-    
+
                 let max_messages =
                     std::cmp::min(available_permits, DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE);
                 let mut dispatched = 0;
-    
+
                 for _ in 0..max_messages {
                     if !consumer.use_permit().await {
                         break;
                     }
                     self.total_available_permits.fetch_sub(1, Ordering::Relaxed);
-    
+
                     let candidate = next_unacked_candidate(
                         storage.clone(),
                         &topic,
@@ -137,7 +136,7 @@ impl Dispatcher for ExclusiveDispatcher {
                         &self.read_position,
                     )
                     .await?;
-    
+
                     if let Some(candidate) = candidate {
                         if consumer
                             .enqueue_message(
@@ -163,7 +162,7 @@ impl Dispatcher for ExclusiveDispatcher {
                         break;
                     }
                 }
-    
+
                 if dispatched > 0 {
                     log::info!(
                         "Exclusive dispatched {} messages to consumer {}",
@@ -177,7 +176,7 @@ impl Dispatcher for ExclusiveDispatcher {
                 if self.total_available_permits.load(Ordering::Relaxed) == 0 {
                     break;
                 }
-                
+
                 tokio::task::yield_now().await;
             }
         }

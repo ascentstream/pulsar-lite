@@ -631,25 +631,26 @@ impl Dispatcher for SharedDispatcher {
             log::debug!("Dispatch already in progress, skipping");
             return Ok(());
         }
-        let  result = async {
+        let result = async {
             // Keep dispatching batches while we still make progress and have permits.
             // read/send one batch, then readMoreEntries again
             loop {
-                let dispatcher = self.dispatch_messages_batch(
-                    storage.clone(), 
-                    topic.clone(), 
-                    subscription.clone()
-                ).await?;
-                if dispatcher <= 0 {break;}
+                let dispatcher = self
+                    .dispatch_messages_batch(storage.clone(), topic.clone(), subscription.clone())
+                    .await?;
+                if dispatcher <= 0 {
+                    break;
+                }
                 if self.total_available_permits.load(Ordering::Relaxed) == 0 {
                     break;
                 }
-    
+
                 // yield so other tasks can run on large backlogs.
                 tokio::task::yield_now().await;
             }
-            Ok(())  
-        }.await;
+            Ok(())
+        }
+        .await;
 
         // Reset flag
         self.dispatch_in_progress.store(false, Ordering::Relaxed);

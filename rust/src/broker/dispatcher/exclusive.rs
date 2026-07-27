@@ -179,7 +179,7 @@ impl Dispatcher for ExclusiveDispatcher {
 
                 tokio::task::yield_now().await;
             } else {
-                return Ok(())
+                return Ok(());
             }
         }
         Ok(())

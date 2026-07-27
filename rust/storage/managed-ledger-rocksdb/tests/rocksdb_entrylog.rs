@@ -156,3 +156,52 @@ fn entrylog_default_size_limit_matches_bookkeeper_like_threshold() {
         2 * 1024 * 1024 * 1024
     );
 }
+
+#[test]
+fn entrylog_handles_concurrent_appends() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(EntryLogStore::open(dir.path()).unwrap());
+
+    // Fan out concurrent appends through the shared writer queue.
+    let handles: Vec<_> = (0..4)
+        .map(|i| {
+            let store = Arc::clone(&store);
+            thread::spawn(move || {
+                let payload = format!("msg-{i}");
+                store
+                    .append(0, i as u64, -1, payload.as_bytes())
+                    .expect("concurrent append should succeed")
+            })
+        })
+        .collect();
+
+    let mut indices: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("append thread should not panic"))
+        .collect();
+
+    // All four entries must be readable with the expected payload.
+    indices.sort_by_key(|index| index.entry_id);
+    for (entry_id, index) in indices.iter().enumerate() {
+        assert_eq!(index.entry_id, entry_id as u64);
+        let entry = store.read(index).unwrap();
+        assert_eq!(entry.payload, format!("msg-{entry_id}").as_bytes());
+    }
+
+    // Writer assigns offsets serially, so [offset, offset+len) ranges must not overlap.
+    let mut ranges: Vec<_> = indices
+        .iter()
+        .map(|index| (index.offset, index.offset + index.len))
+        .collect();
+    ranges.sort_unstable();
+    for window in ranges.windows(2) {
+        assert!(
+            window[0].1 <= window[1].0,
+            "offset ranges must not overlap: {:?}",
+            window
+        );
+    }
+}

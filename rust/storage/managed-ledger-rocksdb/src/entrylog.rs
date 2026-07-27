@@ -1,11 +1,15 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
+use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::SeekFrom;
 use std::io::Write;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 const ENTRY_MAGIC: u32 = 0x504C4547; // "PLEG"
 const ENTRY_VERSION_LEGACY: u16 = 1;
@@ -13,6 +17,17 @@ const ENTRY_VERSION: u16 = 2;
 const ENTRY_HEADER_LEN_LEGACY: u16 = 40;
 const ENTRY_HEADER_LEN: u16 = 44;
 const DEFAULT_LOG_SIZE_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_BATCH: usize = 64;
+const BATCH_WINDOW: Duration = Duration::from_micros(200);
+
+struct WriteRequest {
+    ledger_id: u64,
+    entry_id: u64,
+    partition: i32,
+    metadata: Vec<u8>,
+    payload: Vec<u8>,
+    reply: mpsc::Sender<Result<EntryIndex>>,
+}
 
 #[derive(Debug, Clone)]
 pub struct EntryIndex {
@@ -32,17 +47,154 @@ pub struct EntryRecord {
     pub payload: Vec<u8>,
 }
 
-#[derive(Debug)]
-struct EntryLogState {
-    active_file_id: u64,
-    active_offset: u64,
-}
-
+// Holds request-queue sender, entrylog directory, and writer-thread handle.
 #[derive(Debug)]
 pub struct EntryLogStore {
-    dir: PathBuf,
+    dir: Arc<PathBuf>,
+    sender: Option<mpsc::Sender<WriteRequest>>,
+    _thread: Option<JoinHandle<()>>,
+}
+
+struct WriteState {
+    dir: Arc<PathBuf>,
     log_size_limit: u64,
-    state: Mutex<EntryLogState>,
+    active_file_id: u64,
+    active_offset: u64,
+    file: File,
+}
+
+fn next_entry_log_file_id(dir: &Path) -> Result<u64> {
+    let mut max_file_id: Option<u64> = None;
+
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("failed to read entrylog dir {}", dir.display()))?
+    {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(file_id) = parse_log_file_id(&name) else {
+            continue;
+        };
+
+        max_file_id = Some(max_file_id.map_or(file_id, |max| max.max(file_id)));
+    }
+
+    max_file_id.map_or(Ok(0), |file_id| {
+        file_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("entrylog file id overflow"))
+    })
+}
+
+fn parse_log_file_id(name: &str) -> Option<u64> {
+    name.strip_suffix(".log")?.parse::<u64>().ok()
+}
+
+impl WriteState {
+    fn open(dir: Arc<PathBuf>, log_size_limit: u64) -> Result<Self> {
+        let active_file_id = next_entry_log_file_id(dir.as_ref())?;
+        let path = dir.join(format!("{active_file_id}.log"));
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&path)?;
+        Ok(Self {
+            dir,
+            log_size_limit,
+            active_file_id,
+            active_offset: 0,
+            file,
+        })
+    }
+
+    // Writes a batch of entries to the log, returning a vector of results indicating success or failure.
+    fn write_batch(&mut self, batch: &[WriteRequest]) -> Vec<Result<EntryIndex>> {
+        let mut results = Vec::with_capacity(batch.len());
+        if batch.is_empty() {
+            return results;
+        }
+        let mut batch_len = 0;
+        for req in batch {
+            batch_len +=
+                ENTRY_HEADER_LEN as u64 + req.metadata.len() as u64 + req.payload.len() as u64;
+        }
+        if self.active_offset > 0 && self.active_offset + batch_len > self.log_size_limit {
+            self.active_file_id += 1;
+            self.active_offset = 0;
+            let path = self.dir.join(format!("{}.log", self.active_file_id));
+            match OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(true)
+                .open(&path)
+            {
+                Ok(f) => self.file = f,
+                Err(e) => {
+                    let err = format!("open entrylog failed: {e}");
+                    for _ in batch {
+                        results.push(Err(anyhow!(err.clone())));
+                    }
+                    return results;
+                }
+            }
+        }
+
+        let mut buf = Vec::new();
+        let mut pending = Vec::with_capacity(batch.len());
+        let mut cursor = self.active_offset;
+
+        for req in batch {
+            let checksum = EntryLogStore::checksum(&[&req.metadata, &req.payload]);
+            let metadata_len = req.metadata.len() as u32;
+            let payload_len = req.payload.len() as u32;
+            let len =
+                ENTRY_HEADER_LEN as u64 + req.metadata.len() as u64 + req.payload.len() as u64;
+
+            pending.push(EntryIndex {
+                ledger_id: req.ledger_id,
+                entry_id: req.entry_id,
+                file_id: self.active_file_id,
+                offset: cursor,
+                len,
+                checksum,
+                partition: req.partition,
+            });
+            buf.extend_from_slice(&ENTRY_MAGIC.to_le_bytes());
+            buf.extend_from_slice(&ENTRY_VERSION.to_le_bytes());
+            buf.extend_from_slice(&ENTRY_HEADER_LEN.to_le_bytes());
+            buf.extend_from_slice(&req.ledger_id.to_le_bytes());
+            buf.extend_from_slice(&req.entry_id.to_le_bytes());
+            buf.extend_from_slice(&req.partition.to_le_bytes());
+            buf.extend_from_slice(&metadata_len.to_le_bytes());
+            buf.extend_from_slice(&payload_len.to_le_bytes());
+            buf.extend_from_slice(&checksum.to_le_bytes());
+            buf.extend_from_slice(&req.metadata);
+            buf.extend_from_slice(&req.payload);
+            cursor += len;
+        }
+
+        if buf.is_empty() {
+            return results;
+        }
+
+        match self.file.write_all(&buf).and_then(|_| self.file.flush()) {
+            Ok(()) => {
+                self.active_offset = cursor;
+                for index in pending {
+                    results.push(Ok(index));
+                }
+            }
+            Err(e) => {
+                let err = format!("write entrylog failed: {e}");
+                for _ in pending {
+                    results.push(Err(anyhow!(err.clone())));
+                }
+            }
+        }
+        results
+    }
 }
 
 impl EntryLogStore {
@@ -56,51 +208,70 @@ impl EntryLogStore {
     }
 
     fn open_with_limit(root: &Path, log_size_limit: u64) -> Result<Self> {
-        let dir = root.join("entrylog");
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("failed to create entrylog dir {}", dir.display()))?;
-        let active_file_id = Self::next_entry_log_file_id(&dir)?;
+        let dir = Arc::new(root.join("entrylog"));
+        fs::create_dir_all(dir.as_ref())?;
+
+        let (sender, receiver) = mpsc::channel::<WriteRequest>();
+
+        let dir_for_writer = Arc::clone(&dir);
+        let handle = thread::Builder::new()
+            .name("entrylog-writer".to_string())
+            .spawn(move || {
+                Self::write_loop(dir_for_writer, log_size_limit, receiver);
+            })?;
         Ok(Self {
             dir,
-            log_size_limit,
-            state: Mutex::new(EntryLogState {
-                active_file_id,
-                active_offset: 0,
-            }),
+            sender: Some(sender),
+            _thread: Some(handle),
         })
+    }
+
+    fn write_loop(dir: Arc<PathBuf>, log_size_limit: u64, receiver: mpsc::Receiver<WriteRequest>) {
+        let mut state = match WriteState::open(dir, log_size_limit) {
+            Ok(s) => s,
+            Err(e) => {
+                let err = format!("{e:#}");
+                while let Ok(req) = receiver.recv() {
+                    let _ = req.reply.send(Err(anyhow!(err.clone())));
+                }
+                return;
+            }
+        };
+
+        loop {
+            // first, wait for the first request
+            let first = match receiver.recv() {
+                Ok(req) => req,
+                Err(_) => break,
+            };
+            let mut batch = vec![first];
+
+            // second, try to accumulate as much as possible within the batch window.
+            let deadline = Instant::now() + BATCH_WINDOW;
+            while batch.len() < MAX_BATCH {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match receiver.recv_timeout(remaining) {
+                    Ok(req) => batch.push(req),
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+
+            // third, write the batch to disk
+            let results = state.write_batch(&batch);
+
+            for (req, result) in batch.into_iter().zip(results) {
+                let _ = req.reply.send(result);
+            }
+        }
     }
 
     #[doc(hidden)]
     pub fn default_log_size_limit() -> u64 {
         DEFAULT_LOG_SIZE_LIMIT
-    }
-
-    fn next_entry_log_file_id(dir: &Path) -> Result<u64> {
-        let mut max_file_id: Option<u64> = None;
-
-        for entry in fs::read_dir(dir)
-            .with_context(|| format!("failed to read entrylog dir {}", dir.display()))?
-        {
-            let entry = entry?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            let Some(file_id) = Self::parse_log_file_id(&name) else {
-                continue;
-            };
-
-            max_file_id = Some(max_file_id.map_or(file_id, |max| max.max(file_id)));
-        }
-
-        max_file_id.map_or(Ok(0), |file_id| {
-            file_id
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("entrylog file id overflow"))
-        })
-    }
-
-    fn parse_log_file_id(name: &str) -> Option<u64> {
-        name.strip_suffix(".log")?.parse::<u64>().ok()
     }
 
     fn entry_log_path(&self, file_id: u64) -> PathBuf {
@@ -133,47 +304,24 @@ impl EntryLogStore {
         metadata: &[u8],
         payload: &[u8],
     ) -> Result<EntryIndex> {
-        let mut state = self.state.lock().unwrap();
-        let checksum = EntryLogStore::checksum(&[metadata, payload]);
-        let metadata_len = metadata.len() as u32;
-        let payload_len = payload.len() as u32;
-        let len = ENTRY_HEADER_LEN as u64 + metadata.len() as u64 + payload.len() as u64;
-        if state.active_offset > 0 && state.active_offset + len > self.log_size_limit {
-            state.active_file_id += 1;
-            state.active_offset = 0;
-        }
-        let file_id = state.active_file_id;
-        let offset = state.active_offset;
-        let path = self.entry_log_path(file_id);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)?;
+        let (tx, rx) = mpsc::channel();
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or_else(|| anyhow!("entrylog writer is closed"))?;
 
-        file.write_all(&ENTRY_MAGIC.to_le_bytes())?;
-        file.write_all(&ENTRY_VERSION.to_le_bytes())?;
-        file.write_all(&ENTRY_HEADER_LEN.to_le_bytes())?;
-        file.write_all(&ledger_id.to_le_bytes())?;
-        file.write_all(&entry_id.to_le_bytes())?;
-        file.write_all(&partition.to_le_bytes())?;
-        file.write_all(&metadata_len.to_le_bytes())?;
-        file.write_all(&payload_len.to_le_bytes())?;
-        file.write_all(&checksum.to_le_bytes())?;
-        file.write_all(metadata)?;
-        file.write_all(payload)?;
-        file.flush()?;
-        state.active_offset += len;
-
-        Ok(EntryIndex {
-            ledger_id,
-            entry_id,
-            file_id,
-            offset,
-            len,
-            checksum,
-            partition,
-        })
+        sender
+            .send(WriteRequest {
+                ledger_id,
+                entry_id,
+                partition,
+                metadata: metadata.to_vec(),
+                payload: payload.to_vec(),
+                reply: tx,
+            })
+            .map_err(|_| anyhow!("entrylog writer disconnected"))?;
+        rx.recv()
+            .map_err(|_| anyhow!("entrylog writer disconnected"))?
     }
 
     pub fn read(&self, index: &EntryIndex) -> Result<EntryRecord> {
@@ -244,5 +392,16 @@ impl EntryLogStore {
             metadata,
             payload,
         })
+    }
+}
+
+impl Drop for EntryLogStore {
+    // Drop the sender first so write_loop's recv returns Err and the thread exits.
+    // Then join the writer thread. Joining before closing the sender would deadlock.
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if let Some(handle) = self._thread.take() {
+            let _ = handle.join();
+        }
     }
 }

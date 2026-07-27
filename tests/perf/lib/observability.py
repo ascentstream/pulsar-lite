@@ -42,6 +42,29 @@ class PerfCollector:
             stderr=subprocess.DEVNULL,
         )
 
+    def start_persist(self) -> None:
+        if not shutil.which("perf"):
+            return
+        self._proc = subprocess.Popen(
+            [
+                "perf",
+                "record",
+                "-F",
+                self.PERF_FREQUENCY_HZ,
+                "--call-graph",
+                self.PERF_CALL_GRAPH,
+                "-p",
+                str(self.pid),
+                "-o",
+                str(self.perf_data_path),
+                "--",
+                "sleep",
+                str(self.duration),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
     def stop(self) -> None:
         if self._proc and self._proc.poll() is None:
             # Send SIGINT to perf record so it flushes data and exits

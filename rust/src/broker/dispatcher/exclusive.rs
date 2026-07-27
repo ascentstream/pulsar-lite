@@ -111,66 +111,77 @@ impl Dispatcher for ExclusiveDispatcher {
         topic: String,
         subscription: String,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // For Exclusive, just dispatch to the single consumer
-        if let Some(consumer) = &self.consumer {
-            let available_permits = self.total_available_permits.load(Ordering::Relaxed);
-            if available_permits == 0 {
-                return Ok(());
-            }
-
-            let max_messages =
-                std::cmp::min(available_permits, DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE);
-            let mut dispatched = 0;
-
-            for _ in 0..max_messages {
-                if !consumer.use_permit().await {
-                    break;
+        loop {
+            // For Exclusive, just dispatch to the single consumer
+            if let Some(consumer) = &self.consumer {
+                let available_permits = self.total_available_permits.load(Ordering::Relaxed);
+                if available_permits == 0 {
+                    return Ok(());
                 }
-                self.total_available_permits.fetch_sub(1, Ordering::Relaxed);
 
-                let candidate = next_unacked_candidate(
-                    storage.clone(),
-                    &topic,
-                    &subscription,
-                    &self.read_position,
-                )
-                .await?;
+                let max_messages =
+                    std::cmp::min(available_permits, DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE);
+                let mut dispatched = 0;
 
-                if let Some(candidate) = candidate {
-                    if consumer
-                        .enqueue_message(
-                            candidate.message_id,
-                            candidate.metadata,
-                            candidate.payload.clone(),
-                        )
-                        .await
-                    {
-                        commit_read_position(&self.read_position, candidate.next_position);
-                        consumer
-                            .record_message_dispatched(candidate.payload.len())
-                            .await;
-                        dispatched += 1;
+                for _ in 0..max_messages {
+                    if !consumer.use_permit().await {
+                        break;
+                    }
+                    self.total_available_permits.fetch_sub(1, Ordering::Relaxed);
+
+                    let candidate = next_unacked_candidate(
+                        storage.clone(),
+                        &topic,
+                        &subscription,
+                        &self.read_position,
+                    )
+                    .await?;
+
+                    if let Some(candidate) = candidate {
+                        if consumer
+                            .enqueue_message(
+                                candidate.message_id,
+                                candidate.metadata,
+                                candidate.payload.clone(),
+                            )
+                            .await
+                        {
+                            commit_read_position(&self.read_position, candidate.next_position);
+                            consumer
+                                .record_message_dispatched(candidate.payload.len())
+                                .await;
+                            dispatched += 1;
+                        } else {
+                            consumer.add_permits(1).await;
+                            self.total_available_permits.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
                     } else {
                         consumer.add_permits(1).await;
                         self.total_available_permits.fetch_add(1, Ordering::Relaxed);
                         break;
                     }
-                } else {
-                    consumer.add_permits(1).await;
-                    self.total_available_permits.fetch_add(1, Ordering::Relaxed);
+                }
+
+                if dispatched > 0 {
+                    log::info!(
+                        "Exclusive dispatched {} messages to consumer {}",
+                        dispatched,
+                        consumer.consumer_id
+                    );
+                }
+                if dispatched == 0 {
                     break;
                 }
-            }
+                if self.total_available_permits.load(Ordering::Relaxed) == 0 {
+                    break;
+                }
 
-            if dispatched > 0 {
-                log::info!(
-                    "Exclusive dispatched {} messages to consumer {}",
-                    dispatched,
-                    consumer.consumer_id
-                );
+                tokio::task::yield_now().await;
+            } else {
+                return Ok(());
             }
         }
-
         Ok(())
     }
 }

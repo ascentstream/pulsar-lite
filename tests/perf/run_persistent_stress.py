@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib import ROOT
 from lib.broker import BrokerConfig, BrokerProcess, DockerBrokerProcess
 from lib.docker_image import build_broker_image
+from lib.observability import PerfCollector
 from lib.parsing import parse_consumer_output, parse_producer_output
 from lib.perf_cmd import ensure_prereqs, perf_cmd, run_consumer_then_feed, run_sync
 
@@ -53,87 +54,104 @@ SCENARIOS: list[Scenario] = [
         name="stress_persistent_producer_max_rate",
         kind="produce",
         broker="persistent_stress",
-        description="单 producer 最大速率 60s",
-        producer_args=["-time", "60", "-s", "1024", "-r", "999999","-o","1000"],
+        description="单 producer 全速发送 500k 条",
+        producer_args=["-m", "500000", "-s", "1024", "-r", "999999", "-o", "1000"],
     ),
     Scenario(
         name="stress_persistent_producer_multi_producer",
         kind="produce",
         broker="persistent_stress",
-        description="4 producers 并发 60s",
-        producer_args=["-time", "60", "-s", "1024", "-r", "999999", "-n", "4","-threads", "4","-c", "4","-o","1000"],
+        description="4 producers 并发全速发送 100k 条",
+        producer_args=[
+            "-m",
+            "100000",
+            "-s",
+            "1024",
+            "-r",
+            "999999",
+            "-n",
+            "4",
+            "-threads",
+            "4",
+            "-c",
+            "4",
+            "-o",
+            "1000",
+        ],
     ),
     Scenario(
         name="stress_persistent_producer_large_payload",
         kind="produce",
         broker="persistent_stress",
-        description="100KiB payload 60s",
-        producer_args=["-time", "60", "-s", "102400", "-r", "500"],
+        description="100KiB payload 发送 10k 条",
+        # 10k * 100KiB ≈ 1GiB payload; 200k would be ~19GiB
+        producer_args=["-m", "10000", "-s", "102400", "-r", "500"],
     ),
     Scenario(
         name="stress_persistent_producer_sustained",
         kind="produce",
         broker="persistent_stress",
-        description="持续性测试 300s",
-        producer_args=["-time", "300", "-s", "1024", "-r", "5000"],
+        description="持续限速发送 500k 条 @ 10k msg/s (~50s)",
+        producer_args=["-m", "500000", "-s", "1024", "-r", "10000"],
     ),
     # Consumer/E2E stress (4)
     Scenario(
         name="stress_persistent_consume_shared_max_rate",
         kind="consume_e2e",
         broker="persistent_stress",
-        description="Shared 最大消费速率",
-        consumer_args=["-time", "60", "-q", "1000", "-st", "Shared"],
-        feed_producer_args=["-time", "65", "-s", "1024", "-r", "999999"],
+        description="Shared 全速消费 200k 条",
+        consumer_args=["-m", "200000", "-q", "1000", "-st", "Shared"],
+        feed_producer_args=["-m", "200000", "-s", "1024", "-r", "999999"],
     ),
     Scenario(
         name="stress_persistent_consume_shared_high_fanout",
         kind="consume_e2e",
         broker="persistent_stress",
-        description="16 consumers 高扇出",
-        consumer_args=["-time", "60", "-q", "1000", "-st", "Shared", "-n", "16"],
-        feed_producer_args=["-time", "65", "-s", "1024", "-r", "999999"],
+        description="16 consumers 高扇出消费 200k 条",
+        consumer_args=["-m", "200000", "-q", "1000", "-st", "Shared", "-n", "16"],
+        feed_producer_args=["-m", "200000", "-s", "1024", "-r", "999999"],
     ),
     Scenario(
         name="stress_persistent_consume_multi_subscription_fanout",
         kind="consume_e2e",
         broker="persistent_stress",
-        description="8 subscriptions 扇出",
-        consumer_args=["-time", "60", "-q", "1000", "-st", "Shared", "-ns", "8"],
-        feed_producer_args=["-time", "65", "-s", "1024", "-r", "999999"],
+        description="8 subscriptions 扇出：生产 100k / 消费 800k 条",
+        # each subscription receives a full copy; consumer -m = produce * ns
+        consumer_args=["-m", "800000", "-q", "1000", "-st", "Shared", "-ns", "8"],
+        feed_producer_args=["-m", "100000", "-s", "1024", "-r", "999999"],
     ),
     Scenario(
         name="stress_persistent_consume_partitioned_max_rate",
         kind="consume_e2e",
         broker="persistent_stress_partitioned",
-        description="4 partitions + 4 consumers",
-        consumer_args=["-time", "60", "-q", "1000", "-st", "Shared", "-n", "4"],
-        feed_producer_args=["-time", "65", "-s", "1024", "-r", "999999"],
+        description="4 partitions + 4 consumers 消费 200k 条",
+        consumer_args=["-m", "200000", "-q", "1000", "-st", "Shared", "-n", "4"],
+        feed_producer_args=["-m", "200000", "-s", "1024", "-r", "999999"],
     ),
     # Persistent-specific stress (3)
     Scenario(
         name="stress_persistent_backlog_drain",
         kind="backlog_drain",
         broker="persistent_stress",
-        description="大 backlog drain 吞吐测试",
-        producer_args=["-time", "60", "-r", "999999", "-s", "1024", "-db", "-o", "1000"],
-        consumer_args=["-time", "60", "-q", "1000", "-st", "Shared", "-sp", "Earliest"],
+        description="大 backlog drain：生产/消费 200k 条",
+        producer_args=["-m", "200000", "-r", "999999", "-s", "1024", "-db", "-o", "1000"],
+        consumer_args=["-m", "200000", "-q", "1000", "-st", "Shared", "-sp", "Earliest"],
     ),
     Scenario(
         name="stress_persistent_restart_replay",
         kind="restart_replay",
         broker="persistent_stress",
-        description="重启后 backlog replay 吞吐 (Consumer)",
-        producer_args=["-time", "60", "-r", "999999", "-s", "1024", "-db", "-o", "1000"],
-        consumer_args=["-time", "60", "-q", "1000", "-st", "Shared", "-sp", "Earliest"],
+        description="重启后 backlog replay：生产/消费 200k 条",
+        producer_args=["-m", "200000", "-r", "999999", "-s", "1024", "-db", "-o", "1000"],
+        consumer_args=["-m", "200000", "-q", "1000", "-st", "Shared", "-sp", "Earliest"],
         restart_preserve=True,
     ),
     Scenario(
         name="stress_persistent_redelivery_unacked",
         kind="redelivery_unacked",
         broker="persistent_stress",
-        description="未 ack 消息 redelivery 成本",
-        producer_args=["-m", "30000", "-r", "999999", "-s", "1024", "-db",'-o','1000'],
+        description="未 ack redelivery 成本：生产 30k / 仅 ack 10k",
+        producer_args=["-m", "30000", "-r", "999999", "-s", "1024", "-db", "-o", "1000"],
         consumer_args=["-m", "10000", "-q", "1000", "-st", "Shared"],  # Only ack 1/3
         feed_producer_args=["-m", "30000", "-r", "999999", "-s", "1024", "-db", "-o", "1000"],
         restart_preserve=True,
@@ -484,9 +502,6 @@ def run_scenario(
 
 def main(argv: list[str]) -> int:
     """Main entry point."""
-    ensure_prereqs()
-
-    # Parse arguments
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -520,6 +535,7 @@ def main(argv: list[str]) -> int:
         help="Reuse an existing Docker image instead of rebuilding it before the run.",
     )
     args = parser.parse_args(argv[1:])
+    ensure_prereqs(require_broker_bin=args.broker_backend == "local")
 
     # Parse scenario filter from argv
     filter_names = set(args.scenarios)
@@ -578,11 +594,21 @@ def main(argv: list[str]) -> int:
         broker.start()
 
         try:
+            
             for scenario in broker_scenarios:
                 print(f"\n[{scenario.name}] {scenario.description}")
                 scenario_dir = run_artifacts / scenario.name
                 scenario_dir.mkdir(parents=True, exist_ok=True)
-
+                # Start perf recording (must be after restart to capture the new PID)
+                perf_data_path = scenario_dir / "perf.data"
+                perf_collector: PerfCollector | None = None
+                if broker.broker_pid:
+                    perf_collector = PerfCollector(
+                        pid=broker.broker_pid,
+                        duration=300,
+                        perf_data_path=perf_data_path,
+                    )
+                    perf_collector.start_persist()
                 try:
                     result = run_scenario(scenario, broker, scenario_dir)
 
@@ -596,6 +622,25 @@ def main(argv: list[str]) -> int:
                     if broker.sampler:
                         broker.sampler.write_csv(scenario_dir / "broker_timeseries.csv")
 
+                    # Record artifact paths in result
+                    perf_collector.stop()
+                    if perf_data_path.exists():
+                        svg_path = scenario_dir / "flamegraph.svg"
+                        ok = PerfCollector.generate_flamegraph(perf_data_path, svg_path)
+                        if ok:
+                            result["flamegraph_file"] = str(svg_path.relative_to(ROOT))
+                            print(f"  flamegraph -> {svg_path}", file=sys.stderr)
+                        else:
+                            result["flamegraph_file"] = None
+                            print(
+                                f"  flamegraph skipped for {perf_data_path.name}",
+                                file=sys.stderr,
+                            )
+                    else:
+                        result["perf_data_file"] = None
+                        result["flamegraph_file"] = None
+                        print("  perf data not captured", file=sys.stderr)
+                    
                     results["scenarios"].append(
                         {
                             "name": scenario.name,
@@ -610,6 +655,9 @@ def main(argv: list[str]) -> int:
                     print(f"  ✓ PASS")
 
                 except Exception as e:
+                    print(f"  ERROR: {e}", file=sys.stderr)
+                    if perf_collector is not None:
+                        perf_collector.stop()
                     results["scenarios"].append(
                         {
                             "name": scenario.name,

@@ -638,7 +638,7 @@ impl Dispatcher for SharedDispatcher {
                 let dispatcher = self
                     .dispatch_messages_batch(storage.clone(), topic.clone(), subscription.clone())
                     .await?;
-                if dispatcher <= 0 {
+                if dispatcher == 0 {
                     break;
                 }
                 if self.total_available_permits.load(Ordering::Relaxed) == 0 {

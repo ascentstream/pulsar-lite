@@ -101,7 +101,7 @@ impl WriteState {
             .read(true)
             .open(&path)?;
         Ok(Self {
-            dir: dir,
+            dir,
             log_size_limit,
             active_file_id,
             active_offset: 0,

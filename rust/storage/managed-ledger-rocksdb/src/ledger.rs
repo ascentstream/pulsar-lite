@@ -232,49 +232,70 @@ impl RocksDBManagedLedger {
         metadata: &[u8],
         payload: &[u8],
     ) -> Result<ManagedLedgerPosition> {
+        let mut positions = self.add_entries_with_partition_and_metadata(&[(partition,metadata,payload)])?;
+        positions.pop().ok_or_else(|| anyhow::anyhow!("add_entries returned empty positions"))
+    }
+
+    /// Append many entries in one rocksdb write.
+    /// 
+    /// - entry_id assignment stays serial(same as single append)
+    /// - entrylog append is still per-item(lower layer may batch)
+    /// - entry locations + final managed-ledger info are written once
+    pub fn add_entries_with_partition_and_metadata(
+        &mut self,
+        items: &[(i32,&[u8],&[u8])],
+    ) -> Result<Vec<ManagedLedgerPosition>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut next_info = self.info.clone();
         let mut next_runtime = self.runtime.clone();
-        if next_runtime.current_ledger_entries >= self.max_entries_per_ledger {
-            let next_ledger_id = Self::allocate_ledger_id(&self.db)?;
-            next_info.roll_over_current_ledger(next_ledger_id);
-            next_runtime.current_ledger_id = next_ledger_id;
-            next_runtime.current_ledger_entries = 0;
-            next_runtime.current_ledger_size = 0;
-        }
-        let position = ManagedLedgerPosition {
-            ledger_id: next_runtime.current_ledger_id,
-            entry_id: next_runtime.current_ledger_entries,
-            partition,
-        };
-        let current_ledger = next_info.current_ledger_mut();
-        let message_size = metadata.len() as u64 + payload.len() as u64;
-        current_ledger.entries += 1;
-        current_ledger.size += message_size;
-        next_runtime.current_ledger_entries += 1;
-        next_runtime.current_ledger_size += message_size;
-        next_runtime.last_confirmed_position = Some(position.clone());
-        if next_runtime.current_ledger_entries >= self.max_entries_per_ledger {
-            let next_ledger_id = Self::allocate_ledger_id(&self.db)?;
-            next_info.roll_over_current_ledger(next_ledger_id);
-            next_runtime.current_ledger_id = next_ledger_id;
-            next_runtime.current_ledger_entries = 0;
-            next_runtime.current_ledger_size = 0;
-        }
+        let mut positions = Vec::with_capacity(items.len());
+        let mut entry_puts: Vec<(Vec<u8>,Vec<u8>)> = Vec::with_capacity(items.len());
 
-        let entry_index = self.entry_log.append_with_metadata(
-            position.ledger_id,
-            position.entry_id,
-            partition,
-            metadata,
-            payload,
-        )?;
-        let stored_entry_location = StoredEntryLocation::from(entry_index.clone());
+        for (partition,metadata,payload) in items {
+            if next_runtime.current_ledger_entries >= self.max_entries_per_ledger {
+                let next_ledger_id = Self::allocate_ledger_id(&self.db)?;
+                next_info.roll_over_current_ledger(next_ledger_id);
+                next_runtime.current_ledger_id = next_ledger_id;
+                next_runtime.current_ledger_entries = 0;
+                next_runtime.current_ledger_size = 0;
+            }
 
+            let position = ManagedLedgerPosition {
+                ledger_id: next_runtime.current_ledger_id,
+                entry_id: next_runtime.current_ledger_entries,
+                partition: *partition,
+            };
+
+            let current_ledger = next_info.current_ledger_mut();
+            let message_size = metadata.len() as u64 + payload.len() as u64;
+            current_ledger.entries += 1;
+            current_ledger.size += message_size;
+            next_runtime.current_ledger_entries += 1;
+            next_runtime.current_ledger_size += message_size;
+            next_runtime.last_confirmed_position = Some(position.clone());
+
+            if next_runtime.current_ledger_entries >= self.max_entries_per_ledger {
+                let next_ledger_id = Self::allocate_ledger_id(&self.db)?;
+
+                next_info.roll_over_current_ledger(next_ledger_id);
+                next_runtime.current_ledger_entries = 0;
+                next_runtime.current_ledger_size = 0;
+                next_runtime.current_ledger_id = next_ledger_id;
+            }
+
+            let entry_index = self.entry_log.append_with_metadata(
+                position.ledger_id, position.entry_id, *partition, metadata, payload)?;
+            let stored_entry_location = StoredEntryLocation::from(entry_index);
+            entry_puts.push((keys::managed_entry_key(position.ledger_id, position.entry_id),bincode::serialize(&stored_entry_location)?,));
+            positions.push(position)
+        }
         let mut batch = WriteBatch::default();
-        batch.put(
-            keys::managed_entry_key(position.ledger_id, position.entry_id),
-            bincode::serialize(&stored_entry_location)?,
-        );
+        for (key,value) in entry_puts {
+            batch.put(key,value);
+        }
         batch.put(
             keys::managed_ledger_key(&self.name),
             next_info.encode_to_vec(),
@@ -283,10 +304,9 @@ impl RocksDBManagedLedger {
 
         self.info = next_info;
         self.runtime = next_runtime;
-
-        Ok(position)
+        Ok(positions)
     }
-
+    
     #[allow(dead_code)]
     pub fn ledger_info(&self) -> &StoredManagedLedgerInfo {
         &self.info

@@ -72,25 +72,66 @@ impl WriteQueue {
                 }
             }
 
+            // Group by ledger so one rocksdb write covers many entries of the same topic.
+            let mut order: Vec<String> = Vec::new();
+            let mut groups: HashMap<String, Vec<WriteReq>> = HashMap::new();
             for req in batch {
-                let result = (|| -> Result<MessageId,String>{
-                    let ledger_name = keys::managed_ledger_name(&req.topic);
-                    if !ledgers.contains_key(&ledger_name) {
-                        let ledger = factory.open_owned_ledger(&ledger_name).map_err(|e| e.to_string())?;
-                        ledgers.insert(ledger_name.clone(),ledger);
+                let ledger_name = keys::managed_ledger_name(&req.topic);
+                if !groups.contains_key(&ledger_name) {
+                    order.push(ledger_name.clone());
+                }
+                groups.entry(ledger_name).or_default().push(req);
+            }
+
+            for ledger_name in order {
+                let reqs = match groups.remove(&ledger_name) {
+                    Some(reqs) if !reqs.is_empty() => reqs,
+                    _ => continue,
+                };
+
+                if !ledgers.contains_key(&ledger_name) {
+                    match factory.open_owned_ledger(&ledger_name) {
+                        Ok(ledger) => {
+                            ledgers.insert(ledger_name.clone(), ledger);
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            for req in reqs {
+                                let _ = req.reply.send(Err(msg.clone()));
+                            }
+                            continue;
+                        }
                     }
-    
-                    // ledger is already exists
-                    let ledger = ledgers
-                        .get_mut(&ledger_name)
-                        .ok_or_else(|| "ledger missing from worker cache".to_string())?;
-    
-                    let position = ledger.add_entry_with_partition_and_metadata(req.partition, &req.metadata, &req.payload).map_err(|e| e.to_string())?;
-    
-                    Ok(MessageId::from(position))
-                })();
-    
-                let _ = req.reply.send(result);
+                }
+
+                let Some(ledger) = ledgers.get_mut(&ledger_name) else {
+                    for req in reqs {
+                        let _ = req
+                            .reply
+                            .send(Err("ledger missing from worker cache".to_string()));
+                    }
+                    continue;
+                };
+
+                // Borrow metadata/payload only while reqs is still alive.
+                let inputs: Vec<(i32, &[u8], &[u8])> = reqs
+                    .iter()
+                    .map(|r| (r.partition, r.metadata.as_slice(), r.payload.as_slice()))
+                    .collect();
+
+                match ledger.add_entries_with_partition_and_metadata(&inputs) {
+                    Ok(positions) => {
+                        for (req, position) in reqs.into_iter().zip(positions.into_iter()) {
+                            let _ = req.reply.send(Ok(MessageId::from(position)));
+                        }
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        for req in reqs {
+                            let _ = req.reply.send(Err(msg.clone()));
+                        }
+                    }
+                }
             }
         }
     }

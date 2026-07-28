@@ -8,7 +8,7 @@ mod metadata;
 mod store;
 mod write_queue;
 
-pub use store::RocksDbManagedLedgerStorage;
+pub use store::{ConcurrentAppender, RocksDbManagedLedgerStorage};
 
 /// Internal types exposed for integration tests in `tests/`.
 #[doc(hidden)]

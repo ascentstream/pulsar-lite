@@ -12,7 +12,7 @@ const MAX_BATCH: usize = 64;
 /// The maximum waiting time for this batch
 const BATCH_WINDOW: Duration = Duration::from_micros(200);
 
-struct WriteReq {
+pub(crate) struct WriteReq {
     topic: String,
     partition: i32,
     metadata: Vec<u8>,
@@ -48,7 +48,19 @@ impl WriteQueue {
 
     fn worker_loop(factory: RocksDBManagedLedgerFactory, rx: mpsc::Receiver<WriteReq>) {
         // ledger cache that belongs solely to this worker thread; no redundant Arc/Mutex
-        let mut ledgers:HashMap<String,RocksDBManagedLedger> = HashMap::new();
+        let mut ledgers: HashMap<String, RocksDBManagedLedger> = HashMap::new();
+
+        // Batch-size metrics (aggregated to avoid log spam under stress).
+        let mut metric_batches: u64 = 0;
+        let mut metric_msgs: u64 = 0;
+        let mut metric_max_batch: usize = 0;
+        let mut metric_batch_eq1: u64 = 0;
+        let mut metric_group_ops: u64 = 0;
+        let mut metric_group_msgs: u64 = 0;
+        let mut metric_max_group: usize = 0;
+        let mut metric_group_eq1: u64 = 0;
+        let mut metric_window_started = Instant::now();
+
         loop {
             let first = match rx.recv() {
                 Ok(req) => req,
@@ -72,6 +84,14 @@ impl WriteQueue {
                 }
             }
 
+            let queue_batch_len = batch.len();
+            metric_batches += 1;
+            metric_msgs += queue_batch_len as u64;
+            metric_max_batch = metric_max_batch.max(queue_batch_len);
+            if queue_batch_len == 1 {
+                metric_batch_eq1 += 1;
+            }
+
             // Group by ledger so one rocksdb write covers many entries of the same topic.
             let mut order: Vec<String> = Vec::new();
             let mut groups: HashMap<String, Vec<WriteReq>> = HashMap::new();
@@ -88,6 +108,14 @@ impl WriteQueue {
                     Some(reqs) if !reqs.is_empty() => reqs,
                     _ => continue,
                 };
+
+                let group_len = reqs.len();
+                metric_group_ops += 1;
+                metric_group_msgs += group_len as u64;
+                metric_max_group = metric_max_group.max(group_len);
+                if group_len == 1 {
+                    metric_group_eq1 += 1;
+                }
 
                 if !ledgers.contains_key(&ledger_name) {
                     match factory.open_owned_ledger(&ledger_name) {
@@ -133,7 +161,62 @@ impl WriteQueue {
                     }
                 }
             }
+
+            // Emit ~1Hz summary so stress runs stay readable.
+            if metric_window_started.elapsed() >= Duration::from_secs(1) {
+                let avg_queue = if metric_batches == 0 {
+                    0.0
+                } else {
+                    metric_msgs as f64 / metric_batches as f64
+                };
+                let avg_group = if metric_group_ops == 0 {
+                    0.0
+                } else {
+                    metric_group_msgs as f64 / metric_group_ops as f64
+                };
+                let pct_queue_eq1 = if metric_batches == 0 {
+                    0.0
+                } else {
+                    100.0 * metric_batch_eq1 as f64 / metric_batches as f64
+                };
+                let pct_group_eq1 = if metric_group_ops == 0 {
+                    0.0
+                } else {
+                    100.0 * metric_group_eq1 as f64 / metric_group_ops as f64
+                };
+
+                log::info!(
+                    "write_queue metrics: queue_batches={} queue_msgs={} queue_batch_avg={:.2} queue_batch_max={} queue_batch_eq1={:.1}% group_ops={} group_msgs={} group_avg={:.2} group_max={} group_eq1={:.1}%",
+                    metric_batches,
+                    metric_msgs,
+                    avg_queue,
+                    metric_max_batch,
+                    pct_queue_eq1,
+                    metric_group_ops,
+                    metric_group_msgs,
+                    avg_group,
+                    metric_max_group,
+                    pct_group_eq1,
+                );
+
+                metric_batches = 0;
+                metric_msgs = 0;
+                metric_max_batch = 0;
+                metric_batch_eq1 = 0;
+                metric_group_ops = 0;
+                metric_group_msgs = 0;
+                metric_max_group = 0;
+                metric_group_eq1 = 0;
+                metric_window_started = Instant::now();
+            }
         }
+    }
+
+    pub(crate) fn sender(&self) -> Result<mpsc::Sender<WriteReq>, String> {
+        self.tx
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "write queue closed".to_string())
     }
 
     pub(crate) fn submit(
@@ -143,11 +226,18 @@ impl WriteQueue {
         metadata: &[u8],
         payload: &[u8],
     ) -> Result<MessageId, String> {
-        let tx = self
-            .tx
-            .as_ref()
-            .ok_or_else(|| "write queue closed".to_string())?;
+        let tx = self.sender()?;
+        Self::submit_with_tx(&tx, topic, partition, metadata, payload)
+    }
 
+    /// Submit on a cloned sender. Safe to call without holding any storage lock.
+    pub(crate) fn submit_with_tx(
+        tx: &mpsc::Sender<WriteReq>,
+        topic: &str,
+        partition: i32,
+        metadata: &[u8],
+        payload: &[u8],
+    ) -> Result<MessageId, String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         tx.send(WriteReq {
             topic: topic.to_string(),

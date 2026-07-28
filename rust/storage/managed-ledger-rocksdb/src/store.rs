@@ -16,6 +16,35 @@ use pulsar_lite_storage_managed_ledger::{
     ManagedLedgerPosition, ManagedLedgerStorage, MessageId, StoredMessage,
 };
 
+/// Cloned handle that can append without holding `Mutex<Storage>`.
+#[derive(Clone)]
+pub struct ConcurrentAppender {
+    tx: std::sync::mpsc::Sender<super::write_queue::WriteReq>,
+}
+
+impl ConcurrentAppender {
+    pub fn append_message_with_metadata(
+        &self,
+        topic: &str,
+        partition: i32,
+        metadata: &[u8],
+        payload: &[u8],
+    ) -> Result<MessageId> {
+        WriteQueue::submit_with_tx(&self.tx, topic, partition, metadata, payload)
+            .map_err(|e| anyhow!(e))
+    }
+
+    pub fn append_message(&self, topic: &str, partition: i32, data: &[u8]) -> Result<MessageId> {
+        self.append_message_with_metadata(topic, partition, &[], data)
+    }
+}
+
+impl fmt::Debug for ConcurrentAppender {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ConcurrentAppender")
+    }
+}
+
 /// RocksDB-backed managed-ledger store for persistent topics.
 pub struct RocksDbManagedLedgerStorage {
     factory: RocksDBManagedLedgerFactory,
@@ -42,6 +71,13 @@ impl RocksDbManagedLedgerStorage {
         Ok(Self {
             write_queue: WriteQueue::new(factory.clone()),
             factory,
+        })
+    }
+
+    /// Clone a queue sender so callers can append without holding outer locks.
+    pub fn concurrent_appender(&self) -> Result<ConcurrentAppender> {
+        Ok(ConcurrentAppender {
+            tx: self.write_queue.sender().map_err(|e| anyhow!(e))?,
         })
     }
 

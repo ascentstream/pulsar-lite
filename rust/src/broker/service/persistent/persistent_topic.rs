@@ -45,8 +45,28 @@ impl PersistentTopicRuntime {
         metadata: Option<Bytes>,
         payload: Bytes,
     ) -> Result<MessageId, Box<dyn std::error::Error + Send + Sync>> {
-        let mut guard = self.storage.lock().await;
         let metadata = metadata.unwrap_or_default();
+
+        // Prefer the concurrent write-queue handle so we do not hold Mutex<Storage>
+        // while waiting for disk IO. Fall back to the locked path for backends
+        // without a queue (e.g. in-memory).
+        #[cfg(feature = "rocksdb-storage")]
+        {
+            let appender = {
+                let guard = self.storage.lock().await;
+                guard.concurrent_appender()?
+            };
+            if let Some(appender) = appender {
+                return Ok(appender.append_message_with_metadata(
+                    topic_name,
+                    partition,
+                    metadata.as_ref(),
+                    payload.as_ref(),
+                )?);
+            }
+        }
+
+        let mut guard = self.storage.lock().await;
         let message_id = guard.append_message_with_metadata(
             topic_name,
             partition,

@@ -82,6 +82,16 @@ impl Storage {
         &mut self.resources
     }
 
+    /// Clone a concurrent append handle when the managed-ledger backend provides one.
+    ///
+    /// Callers can append without holding `Mutex<Storage>` for the duration of the write.
+    #[cfg(feature = "rocksdb-storage")]
+    pub fn concurrent_appender(
+        &self,
+    ) -> StorageResult<Option<pulsar_lite_storage_managed_ledger_rocksdb::ConcurrentAppender>> {
+        self.managed_ledger.concurrent_appender()
+    }
+
     /// Create a topic.
     pub fn create_topic(&mut self, name: &str) -> StorageResult<()> {
         self.managed_ledger.create_topic(name)

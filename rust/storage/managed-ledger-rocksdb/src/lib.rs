@@ -6,6 +6,7 @@ mod keys;
 mod ledger;
 mod metadata;
 mod store;
+mod write_queue;
 
 pub use store::RocksDbManagedLedgerStorage;
 

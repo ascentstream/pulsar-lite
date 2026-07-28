@@ -1,0 +1,229 @@
+use crate::factory::RocksDBManagedLedgerFactory;
+use crate::keys;
+use crate::ledger::RocksDBManagedLedger;
+use pulsar_lite_storage_managed_ledger::MessageId;
+use std::collections::HashMap;
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
+use std::time::{Instant,Duration};
+
+/// The maximum number of items that can be taken from the queue at one time
+const MAX_BATCH: usize = 64;
+/// The maximum waiting time for this batch
+const BATCH_WINDOW: Duration = Duration::from_micros(200);
+
+struct WriteReq {
+    topic: String,
+    partition: i32,
+    metadata: Vec<u8>,
+    payload: Vec<u8>,
+    reply: mpsc::Sender<Result<MessageId, String>>,
+}
+
+/// Single-writer queue for managed-ledger appends.
+///
+/// Step 3: worker owns ledgers in a local HashMap and writes via '&mut'
+/// (no SharedLedger lock on the append path).
+pub(crate) struct WriteQueue {
+    tx: Option<mpsc::Sender<WriteReq>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl WriteQueue {
+    pub(crate) fn new(factory: RocksDBManagedLedgerFactory) -> Self {
+        let (tx, rx) = mpsc::channel::<WriteReq>();
+
+        let worker = thread::Builder::new()
+            .name("managed-ledger-write-queue".to_string())
+            .spawn(move || {
+                Self::worker_loop(factory, rx);
+            })
+            .expect("spawn managed-ledger write queue worker");
+
+        Self {
+            tx: Some(tx),
+            worker: Some(worker),
+        }
+    }
+
+    fn worker_loop(factory: RocksDBManagedLedgerFactory, rx: mpsc::Receiver<WriteReq>) {
+        // ledger cache that belongs solely to this worker thread; no redundant Arc/Mutex
+        let mut ledgers:HashMap<String,RocksDBManagedLedger> = HashMap::new();
+        loop {
+            let first = match rx.recv() {
+                Ok(req) => req,
+                Err(_) => break,
+            };
+
+            let mut batch = Vec::with_capacity(MAX_BATCH);
+            batch.push(first);
+
+            let deadline = Instant::now() + BATCH_WINDOW;
+            while batch.len() < MAX_BATCH {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+
+                match rx.recv_timeout(remaining) {
+                    Ok(req) => batch.push(req),
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+
+            for req in batch {
+                let result = (|| -> Result<MessageId,String>{
+                    let ledger_name = keys::managed_ledger_name(&req.topic);
+                    if !ledgers.contains_key(&ledger_name) {
+                        let ledger = factory.open_owned_ledger(&ledger_name).map_err(|e| e.to_string())?;
+                        ledgers.insert(ledger_name.clone(),ledger);
+                    }
+    
+                    // ledger is already exists
+                    let ledger = ledgers
+                        .get_mut(&ledger_name)
+                        .ok_or_else(|| "ledger missing from worker cache".to_string())?;
+    
+                    let position = ledger.add_entry_with_partition_and_metadata(req.partition, &req.metadata, &req.payload).map_err(|e| e.to_string())?;
+    
+                    Ok(MessageId::from(position))
+                })();
+    
+                let _ = req.reply.send(result);
+            }
+        }
+    }
+
+    pub(crate) fn submit(
+        &self,
+        topic: &str,
+        partition: i32,
+        metadata: &[u8],
+        payload: &[u8],
+    ) -> Result<MessageId, String> {
+        let tx = self
+            .tx
+            .as_ref()
+            .ok_or_else(|| "write queue closed".to_string())?;
+
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send(WriteReq {
+            topic: topic.to_string(),
+            partition,
+            metadata: metadata.to_vec(),
+            payload: payload.to_vec(),
+            reply: reply_tx,
+        })
+        .map_err(|_| "write queue worker disconnected".to_string())?;
+
+        match reply_rx.recv() {
+            Ok(Ok(id)) => Ok(id),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err("write queue worker disconnected".to_string()),
+        }
+    }
+}
+
+impl Drop for WriteQueue {
+    fn drop(&mut self) {
+        // Close the sender first so worker_loop's recv returns Err and exits.
+        drop(self.tx.take());
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entrylog::EntryLogStore;
+    use rocksdb::{Options, DB};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use tempfile::tempdir;
+
+    fn open_test_factory(path: &std::path::Path) -> RocksDBManagedLedgerFactory {
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        let db = Arc::new(DB::open(&options, path).unwrap());
+        let entry_log = Arc::new(EntryLogStore::open(path).unwrap());
+        RocksDBManagedLedgerFactory::new(db, entry_log)
+    }
+
+    #[test]
+    fn single_submit_returns_entry0() {
+        let dir = tempdir().unwrap();
+        let q = WriteQueue::new(open_test_factory(dir.path()));
+        let id = q
+            .submit("persistent://public/default/t", -1, &[], b"hello")
+            .unwrap();
+        assert_eq!(id.ledger, 0);
+        assert_eq!(id.entry, 0);
+        assert_eq!(id.partition, -1);
+    }
+
+    #[test]
+    fn multi_thread_submit_gets_unique_entry_ids() {
+        let dir = tempdir().unwrap();
+        let q = Arc::new(WriteQueue::new(open_test_factory(dir.path())));
+        let topic = "persistent://public/default/concurrent";
+        let mut handles = vec![];
+
+        for t in 0..8 {
+            let q = Arc::clone(&q);
+            handles.push(thread::spawn(move || {
+                let mut entries = vec![];
+                for i in 0..100 {
+                    let payload = format!("t{t}-{i}");
+                    let id = q.submit(topic, -1, &[], payload.as_bytes()).unwrap();
+                    entries.push(id.entry);
+                }
+                entries
+            }));
+        }
+
+        let mut all = vec![];
+        for h in handles {
+            all.extend(h.join().unwrap());
+        }
+
+        all.sort_unstable();
+        assert_eq!(all.len(), 800);
+        assert_eq!(all, (0..800).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn append_through_mutex_wrapper_still_unique() {
+        // Mirrors how broker may wrap storage later: outer mutex + inner queue.
+        let dir = tempdir().unwrap();
+        let q = Arc::new(Mutex::new(WriteQueue::new(open_test_factory(dir.path()))));
+        let topic = "persistent://public/default/wrapped";
+        let mut handles = vec![];
+
+        for t in 0..4 {
+            let q = Arc::clone(&q);
+            handles.push(thread::spawn(move || {
+                let mut entries = vec![];
+                for i in 0..50 {
+                    let payload = format!("t{t}-{i}");
+                    let id = q
+                        .lock()
+                        .unwrap()
+                        .submit(topic, -1, &[], payload.as_bytes())
+                        .unwrap();
+                    entries.push(id.entry);
+                }
+                entries
+            }));
+        }
+
+        let mut all = vec![];
+        for h in handles {
+            all.extend(h.join().unwrap());
+        }
+        all.sort_unstable();
+        assert_eq!(all, (0..200).collect::<Vec<_>>());
+    }
+}

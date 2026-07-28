@@ -65,6 +65,10 @@ impl RocksDBManagedLedgerFactory {
         self.get_or_open_ledger_with_config(name, &ManagedLedgerConfig::default())
     }
 
+    pub(crate) fn open_owned_ledger(&self, name: &str) -> Result<RocksDBManagedLedger> {
+        self.load_ledger(name, &ManagedLedgerConfig::default())
+    }
+
     pub fn cursor_state_exists(&self, ledger_name: &str, cursor_name: &str) -> Result<bool> {
         Ok(self
             .db

@@ -3,9 +3,11 @@ use super::entrylog::EntryLogStore;
 use super::factory::{RocksDBManagedLedgerFactory, SharedLedger};
 use super::keys;
 use super::ledger::RocksDBManagedLedger;
+use super::write_queue::WriteQueue;
 use crate::cursor::first_position;
 use anyhow::{anyhow, Result};
 use rocksdb::{Options, DB};
+use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, MutexGuard};
 
@@ -15,9 +17,18 @@ use pulsar_lite_storage_managed_ledger::{
 };
 
 /// RocksDB-backed managed-ledger store for persistent topics.
-#[derive(Debug)]
 pub struct RocksDbManagedLedgerStorage {
     factory: RocksDBManagedLedgerFactory,
+    write_queue: WriteQueue,
+}
+
+impl fmt::Debug for RocksDbManagedLedgerStorage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RocksDbManagedLedgerStorage")
+            .field("factory", &self.factory)
+            .field("write_queue", &"WriteQueue")
+            .finish()
+    }
 }
 
 impl RocksDbManagedLedgerStorage {
@@ -26,9 +37,11 @@ impl RocksDbManagedLedgerStorage {
         options.create_if_missing(true);
         let db = Arc::new(DB::open(&options, path)?);
         let entry_log = Arc::new(EntryLogStore::open(path)?);
+        let factory = RocksDBManagedLedgerFactory::new(db, entry_log);
 
         Ok(Self {
-            factory: RocksDBManagedLedgerFactory::new(db, entry_log),
+            write_queue: WriteQueue::new(factory.clone()),
+            factory,
         })
     }
 
@@ -101,10 +114,9 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
     }
 
     fn append_message(&mut self, topic: &str, partition: i32, data: &[u8]) -> Result<MessageId> {
-        let shared = self.topic_ledger(topic)?;
-        let mut ledger = Self::lock_ledger(&shared)?;
-        let position = ledger.add_entry_with_partition(partition, data)?;
-        Ok(MessageId::from(position))
+        self.write_queue
+            .submit(topic, partition, &[], data)
+            .map_err(|e| anyhow!(e))
     }
 
     fn append_message_with_metadata(
@@ -114,11 +126,9 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         metadata: &[u8],
         payload: &[u8],
     ) -> Result<MessageId> {
-        let shared = self.topic_ledger(topic)?;
-        let mut ledger = Self::lock_ledger(&shared)?;
-        let position =
-            ledger.add_entry_with_partition_and_metadata(partition, metadata, payload)?;
-        Ok(MessageId::from(position))
+        self.write_queue
+            .submit(topic, partition, metadata, payload)
+            .map_err(|e| anyhow!(e))
     }
 
     fn initialize_or_open_cursor(

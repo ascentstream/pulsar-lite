@@ -23,7 +23,8 @@ pub struct ConcurrentAppender {
 }
 
 impl ConcurrentAppender {
-    pub fn append_message_with_metadata(
+    /// Async append that waits via oneshot (does not block the Tokio worker thread).
+    pub async fn append_message_with_metadata(
         &self,
         topic: &str,
         partition: i32,
@@ -31,11 +32,30 @@ impl ConcurrentAppender {
         payload: &[u8],
     ) -> Result<MessageId> {
         WriteQueue::submit_with_tx(&self.tx, topic, partition, metadata, payload)
+            .await
             .map_err(|e| anyhow!(e))
     }
 
-    pub fn append_message(&self, topic: &str, partition: i32, data: &[u8]) -> Result<MessageId> {
+    pub async fn append_message(
+        &self,
+        topic: &str,
+        partition: i32,
+        data: &[u8],
+    ) -> Result<MessageId> {
         self.append_message_with_metadata(topic, partition, &[], data)
+            .await
+    }
+
+    /// Blocking helper for non-async callers/tests.
+    pub fn append_message_with_metadata_blocking(
+        &self,
+        topic: &str,
+        partition: i32,
+        metadata: &[u8],
+        payload: &[u8],
+    ) -> Result<MessageId> {
+        WriteQueue::submit_with_tx_blocking(&self.tx, topic, partition, metadata, payload)
+            .map_err(|e| anyhow!(e))
     }
 }
 

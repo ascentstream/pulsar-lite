@@ -5,11 +5,14 @@ use pulsar_lite_storage_managed_ledger::MessageId;
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
-use std::time::{Instant,Duration};
+use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 
 /// The maximum number of items that can be taken from the queue at one time
 const MAX_BATCH: usize = 64;
-/// The maximum waiting time for this batch
+/// The maximum waiting time for this batch after try_recv drain.
+/// Keep short: a fixed 1ms wait regresses max_rate (worker idles while
+/// in-flight slots wait on completion). Prefer try_recv drain for depth.
 const BATCH_WINDOW: Duration = Duration::from_micros(200);
 
 pub(crate) struct WriteReq {
@@ -17,13 +20,14 @@ pub(crate) struct WriteReq {
     partition: i32,
     metadata: Vec<u8>,
     payload: Vec<u8>,
-    reply: mpsc::Sender<Result<MessageId, String>>,
+    reply: oneshot::Sender<Result<MessageId, String>>,
 }
 
 /// Single-writer queue for managed-ledger appends.
 ///
-/// Step 3: worker owns ledgers in a local HashMap and writes via '&mut'
-/// (no SharedLedger lock on the append path).
+/// Worker owns ledgers in a thread-local HashMap and writes via `&mut`
+/// (no SharedLedger lock on the append path). Reply uses tokio oneshot so
+/// async callers can await without blocking the Tokio worker thread.
 pub(crate) struct WriteQueue {
     tx: Option<mpsc::Sender<WriteReq>>,
     worker: Option<JoinHandle<()>>,
@@ -70,17 +74,38 @@ impl WriteQueue {
             let mut batch = Vec::with_capacity(MAX_BATCH);
             batch.push(first);
 
-            let deadline = Instant::now() + BATCH_WINDOW;
+            // Drain anything already queued so a full in-flight pipeline becomes
+            // one add_entries / one entrylog flush instead of N serial flushes.
             while batch.len() < MAX_BATCH {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-
-                match rx.recv_timeout(remaining) {
+                match rx.try_recv() {
                     Ok(req) => batch.push(req),
-                    Err(mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+
+            // Short window to catch stragglers; after each arrival, try_recv again.
+            if batch.len() < MAX_BATCH {
+                let deadline = Instant::now() + BATCH_WINDOW;
+                while batch.len() < MAX_BATCH {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match rx.recv_timeout(remaining) {
+                        Ok(req) => {
+                            batch.push(req);
+                            while batch.len() < MAX_BATCH {
+                                match rx.try_recv() {
+                                    Ok(req) => batch.push(req),
+                                    Err(mpsc::TryRecvError::Empty) => break,
+                                    Err(mpsc::TryRecvError::Disconnected) => break,
+                                }
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
                 }
             }
 
@@ -219,26 +244,15 @@ impl WriteQueue {
             .ok_or_else(|| "write queue closed".to_string())
     }
 
-    pub(crate) fn submit(
-        &self,
-        topic: &str,
-        partition: i32,
-        metadata: &[u8],
-        payload: &[u8],
-    ) -> Result<MessageId, String> {
-        let tx = self.sender()?;
-        Self::submit_with_tx(&tx, topic, partition, metadata, payload)
-    }
-
-    /// Submit on a cloned sender. Safe to call without holding any storage lock.
-    pub(crate) fn submit_with_tx(
+    /// Enqueue without waiting. Caller awaits/blocks on the returned receiver.
+    pub(crate) fn enqueue_with_tx(
         tx: &mpsc::Sender<WriteReq>,
         topic: &str,
         partition: i32,
         metadata: &[u8],
         payload: &[u8],
-    ) -> Result<MessageId, String> {
-        let (reply_tx, reply_rx) = mpsc::channel();
+    ) -> Result<oneshot::Receiver<Result<MessageId, String>>, String> {
+        let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(WriteReq {
             topic: topic.to_string(),
             partition,
@@ -247,12 +261,72 @@ impl WriteQueue {
             reply: reply_tx,
         })
         .map_err(|_| "write queue worker disconnected".to_string())?;
+        Ok(reply_rx)
+    }
 
-        match reply_rx.recv() {
+    /// Async submit: does not block the Tokio worker thread while waiting for disk IO.
+    pub(crate) async fn submit_with_tx(
+        tx: &mpsc::Sender<WriteReq>,
+        topic: &str,
+        partition: i32,
+        metadata: &[u8],
+        payload: &[u8],
+    ) -> Result<MessageId, String> {
+        let reply_rx = Self::enqueue_with_tx(tx, topic, partition, metadata, payload)?;
+        match reply_rx.await {
             Ok(Ok(id)) => Ok(id),
             Ok(Err(e)) => Err(e),
             Err(_) => Err("write queue worker disconnected".to_string()),
         }
+    }
+    /// Blocking submit for sync ManagedLedgerStorage / unit tests.
+    ///
+    /// `oneshot::Receiver::blocking_recv` panics if called on a thread already
+    /// driving a Tokio runtime (e.g. `#[tokio::test]`). In that case wait on a
+    /// helper thread instead.
+    pub(crate) fn submit_with_tx_blocking(
+        tx: &mpsc::Sender<WriteReq>,
+        topic: &str,
+        partition: i32,
+        metadata: &[u8],
+        payload: &[u8],
+    ) -> Result<MessageId, String> {
+        let reply_rx = Self::enqueue_with_tx(tx, topic, partition, metadata, payload)?;
+        let joined = if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::spawn(move || reply_rx.blocking_recv())
+                .join()
+                .map_err(|_| "write queue waiter thread panicked".to_string())?
+        } else {
+            reply_rx.blocking_recv()
+        };
+        match joined {
+            Ok(Ok(id)) => Ok(id),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err("write queue worker disconnected".to_string()),
+        }
+    }
+
+    pub(crate) fn submit(
+        &self,
+        topic: &str,
+        partition: i32,
+        metadata: &[u8],
+        payload: &[u8],
+    ) -> Result<MessageId, String> {
+        let tx = self.sender()?;
+        Self::submit_with_tx_blocking(&tx, topic, partition, metadata, payload)
+    }
+
+    #[allow(dead_code)] // used by unit tests; Phase B pipeline will call async path more broadly
+    pub(crate) async fn submit_async(
+        &self,
+        topic: &str,
+        partition: i32,
+        metadata: &[u8],
+        payload: &[u8],
+    ) -> Result<MessageId, String> {
+        let tx = self.sender()?;
+        Self::submit_with_tx(&tx, topic, partition, metadata, payload).await
     }
 }
 
@@ -272,7 +346,6 @@ mod tests {
     use crate::entrylog::EntryLogStore;
     use rocksdb::{Options, DB};
     use std::sync::{Arc, Mutex};
-    use std::thread;
     use tempfile::tempdir;
 
     fn open_test_factory(path: &std::path::Path) -> RocksDBManagedLedgerFactory {
@@ -295,6 +368,19 @@ mod tests {
         assert_eq!(id.partition, -1);
     }
 
+    #[tokio::test]
+    async fn single_submit_async_returns_entry0() {
+        let dir = tempdir().unwrap();
+        let q = WriteQueue::new(open_test_factory(dir.path()));
+        let id = q
+            .submit_async("persistent://public/default/t", -1, &[], b"hello")
+            .await
+            .unwrap();
+        assert_eq!(id.ledger, 0);
+        assert_eq!(id.entry, 0);
+        assert_eq!(id.partition, -1);
+    }
+
     #[test]
     fn multi_thread_submit_gets_unique_entry_ids() {
         let dir = tempdir().unwrap();
@@ -304,7 +390,7 @@ mod tests {
 
         for t in 0..8 {
             let q = Arc::clone(&q);
-            handles.push(thread::spawn(move || {
+            handles.push(std::thread::spawn(move || {
                 let mut entries = vec![];
                 for i in 0..100 {
                     let payload = format!("t{t}-{i}");
@@ -325,9 +411,40 @@ mod tests {
         assert_eq!(all, (0..800).collect::<Vec<_>>());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_async_submit_gets_unique_entry_ids() {
+        let dir = tempdir().unwrap();
+        let q = Arc::new(WriteQueue::new(open_test_factory(dir.path())));
+        let topic = "persistent://public/default/concurrent-async";
+
+        let mut tasks = vec![];
+        for t in 0..8 {
+            let q = Arc::clone(&q);
+            tasks.push(tokio::spawn(async move {
+                let mut entries = vec![];
+                for i in 0..100 {
+                    let payload = format!("t{t}-{i}");
+                    let id = q
+                        .submit_async(topic, -1, &[], payload.as_bytes())
+                        .await
+                        .unwrap();
+                    entries.push(id.entry);
+                }
+                entries
+            }));
+        }
+
+        let mut all = vec![];
+        for task in tasks {
+            all.extend(task.await.unwrap());
+        }
+        all.sort_unstable();
+        assert_eq!(all.len(), 800);
+        assert_eq!(all, (0..800).collect::<Vec<_>>());
+    }
+
     #[test]
     fn append_through_mutex_wrapper_still_unique() {
-        // Mirrors how broker may wrap storage later: outer mutex + inner queue.
         let dir = tempdir().unwrap();
         let q = Arc::new(Mutex::new(WriteQueue::new(open_test_factory(dir.path()))));
         let topic = "persistent://public/default/wrapped";
@@ -335,7 +452,7 @@ mod tests {
 
         for t in 0..4 {
             let q = Arc::clone(&q);
-            handles.push(thread::spawn(move || {
+            handles.push(std::thread::spawn(move || {
                 let mut entries = vec![];
                 for i in 0..50 {
                     let payload = format!("t{t}-{i}");

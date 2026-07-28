@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tokio_util::codec::Framed;
 
@@ -67,6 +68,25 @@ struct ConnectionCheck {
     timeout_reason: CloseReasonKind,
 }
 
+/// Default cap on pipelined persistent publishes per connection.
+/// Match typical client maxOutstanding / max_pending_publish (1000) so
+/// multi-connection stress can fill WriteQueue under the short 200µs batch window.
+/// (Was 32 → 256 in P0-1; raised again to probe max batch depth.)
+const DEFAULT_MAX_PERSISTENT_IN_FLIGHT: usize = 1000;
+
+#[derive(Debug)]
+enum PersistentSendErrorKind {
+    RateLimited(String),
+    Other(String),
+}
+
+#[derive(Debug)]
+struct PersistentSendOutcome {
+    producer_id: u64,
+    sequence_id: u64,
+    result: Result<crate::storage::MessageId, PersistentSendErrorKind>,
+}
+
 /// Runtime context for a single broker connection.
 /// This owns protocol I/O, connection state, keep-alive handling, and cleanup/recovery entry points.
 pub struct ServerCnx<T>
@@ -103,7 +123,8 @@ where
 
     /// Topic manager reference
     topic_manager: SharedBrokerService,
-    /// Number of in-flight non-persistent publish tasks spawned from this connection.
+    /// Number of in-flight publish tasks on this connection
+    /// (non-persistent sync path + persistent pipelined path).
     pending_send_requests: usize,
     /// Drop gate: messages are silently dropped with fake receipt when this is exceeded.
     /// Maps to Pulsar's maxConcurrentNonPersistentMessagePerConnection.
@@ -111,12 +132,16 @@ where
     /// TCP throttle gate: reading from framed stops when pending reaches this limit.
     /// Maps to Pulsar's maxPendingPublishRequestsPerConnection.
     max_pending_publish_requests: usize,
+    /// Cap for pipelined persistent Send tasks on this connection.
+    max_persistent_in_flight: usize,
     /// Resume reading threshold (hysteresis = max_pending_publish_requests / 2).
     resume_threshold: usize,
     /// When true, the event loop skips framed.next(), equivalent to Netty auto-read = false.
     read_paused: bool,
     /// Maximum message size accepted by the broker.
     max_message_size: usize,
+    /// In-flight persistent publish tasks (completed → SendReceipt/SendError).
+    persistent_sends: JoinSet<PersistentSendOutcome>,
 
     /// Advertised broker service url returned from Lookup.
     broker_service_url: String,
@@ -190,9 +215,11 @@ where
             pending_send_requests: 0,
             max_concurrent_non_persistent,
             max_pending_publish_requests,
+            max_persistent_in_flight: DEFAULT_MAX_PERSISTENT_IN_FLIGHT,
             resume_threshold: max_pending_publish_requests / 2,
             read_paused: false,
             max_message_size,
+            persistent_sends: JoinSet::new(),
             broker_service_url,
         }
     }
@@ -240,6 +267,32 @@ where
                         self.set_failed(CloseReason::ProtocolError(e.to_string()));
                         log::error!("Error handling command: {}", e);
                         break Err(e);
+                    }
+                    self.sync_connection_writable_from_framed_buffer();
+                }
+
+                // Completed persistent pipelined publishes → SendReceipt / SendError.
+                Some(join_result) = self.persistent_sends.join_next() => {
+                    match join_result {
+                        Ok(outcome) => {
+                            if let Err(e) = self.complete_persistent_send(outcome).await {
+                                self.set_failed(CloseReason::ProtocolError(e.to_string()));
+                                log::error!("Error completing persistent send: {}", e);
+                                break Err(e);
+                            }
+                        }
+                        Err(join_err) => {
+                            self.pending_send_requests =
+                                self.pending_send_requests.saturating_sub(1);
+                            self.maybe_resume_read_after_send();
+                            if join_err.is_panic() {
+                                log::error!(
+                                    "Persistent send task panicked on {}: {}",
+                                    self.connection_id,
+                                    join_err
+                                );
+                            }
+                        }
                     }
                     self.sync_connection_writable_from_framed_buffer();
                 }
@@ -500,10 +553,17 @@ where
 
     async fn cleanup(&mut self) -> CnxResult<()> {
         log::debug!(
-            "Cleaning up connection: {} producers, {} consumers",
+            "Cleaning up connection: {} producers, {} consumers, {} persistent in-flight",
             self.producers.len(),
-            self.consumers.len()
+            self.consumers.len(),
+            self.persistent_sends.len()
         );
+
+        // Drop pipelined publish tasks; do not wait for storage completion on close.
+        self.persistent_sends.abort_all();
+        while self.persistent_sends.join_next().await.is_some() {}
+        self.pending_send_requests = 0;
+        self.read_paused = false;
 
         for (producer_id, producer) in self.producers.drain() {
             let topic = producer.get_topic();
@@ -568,6 +628,47 @@ where
         .map_err(to_cnx_error)
     }
 
+    fn maybe_resume_read_after_send(&mut self) {
+        if self.read_paused && self.pending_send_requests <= self.resume_threshold {
+            self.read_paused = false;
+        }
+    }
+
+    async fn complete_persistent_send(&mut self, outcome: PersistentSendOutcome) -> CnxResult<()> {
+        self.pending_send_requests = self.pending_send_requests.saturating_sub(1);
+        self.maybe_resume_read_after_send();
+
+        match outcome.result {
+            Ok(message_id) => {
+                self.framed
+                    .send(ServerCommand::SendReceipt {
+                        producer_id: outcome.producer_id,
+                        sequence_id: outcome.sequence_id,
+                        ledger_id: message_id.ledger,
+                        entry_id: message_id.entry,
+                        partition: message_id.partition,
+                    })
+                    .await
+                    .map_err(to_cnx_error)?;
+            }
+            Err(PersistentSendErrorKind::RateLimited(message)) => {
+                self.framed
+                    .send(ServerCommand::SendError {
+                        producer_id: outcome.producer_id,
+                        sequence_id: outcome.sequence_id,
+                        error: ServerError::ServiceNotReady,
+                        message,
+                    })
+                    .await
+                    .map_err(to_cnx_error)?;
+            }
+            Err(PersistentSendErrorKind::Other(message)) => {
+                return Err(to_cnx_error(message));
+            }
+        }
+        Ok(())
+    }
+
     async fn handle_send(&mut self, cmd: BaseCommand, frame: PulsarFrame) -> CnxResult<()> {
         let send_cmd = cmd
             .send
@@ -597,8 +698,8 @@ where
         if message_size > self.max_message_size {
             self.framed
                 .send(ServerCommand::SendError {
-                    producer_id: send_cmd.producer_id,
-                    sequence_id: send_cmd.sequence_id,
+                    producer_id,
+                    sequence_id,
                     error: ServerError::NotAllowedError,
                     message: format!(
                         "Exceed maximum message size: {} > {}",
@@ -629,36 +730,92 @@ where
             if self.pending_send_requests >= self.max_pending_publish_requests {
                 self.read_paused = true;
             }
-        }
 
-        let result = handler::handle_send(&mut self.framed, cmd, frame, &self.producers).await;
+            let result = handler::handle_send(&mut self.framed, cmd, frame, &self.producers).await;
 
-        if is_non_persistent {
             self.pending_send_requests = self.pending_send_requests.saturating_sub(1);
-            if self.read_paused && self.pending_send_requests <= self.resume_threshold {
-                self.read_paused = false;
-            }
+            self.maybe_resume_read_after_send();
+
+            return match result {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    if let Some(rate_error) = error.downcast_ref::<TopicPublishRateExceeded>() {
+                        self.framed
+                            .send(ServerCommand::SendError {
+                                producer_id,
+                                sequence_id,
+                                error: ServerError::ServiceNotReady,
+                                message: rate_error.to_string(),
+                            })
+                            .await
+                            .map_err(to_cnx_error)?;
+                        Ok(())
+                    } else {
+                        Err(to_cnx_error(error))
+                    }
+                }
+            };
         }
 
-        match result {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                if let Some(rate_error) = error.downcast_ref::<TopicPublishRateExceeded>() {
-                    self.framed
-                        .send(ServerCommand::SendError {
-                            producer_id,
-                            sequence_id,
-                            error: ServerError::ServiceNotReady,
-                            message: rate_error.to_string(),
-                        })
-                        .await
-                        .map_err(to_cnx_error)?;
-                    Ok(())
-                } else {
-                    Err(to_cnx_error(error))
+        // Persistent path: pipeline publish so the connection can keep reading.
+        while self.persistent_sends.len() >= self.max_persistent_in_flight {
+            let Some(join_result) = self.persistent_sends.join_next().await else {
+                break;
+            };
+            match join_result {
+                Ok(outcome) => self.complete_persistent_send(outcome).await?,
+                Err(join_err) => {
+                    self.pending_send_requests = self.pending_send_requests.saturating_sub(1);
+                    self.maybe_resume_read_after_send();
+                    if join_err.is_panic() {
+                        return Err(to_cnx_error(format!(
+                            "persistent send task panicked: {join_err}"
+                        )));
+                    }
                 }
             }
         }
+
+        self.pending_send_requests += 1;
+        if self.pending_send_requests >= self.max_pending_publish_requests {
+            self.read_paused = true;
+        }
+
+        let metadata = frame.metadata.clone();
+        let payload = frame.payload.clone();
+        self.persistent_sends.spawn(async move {
+            match handler::publish_persistent_send(
+                producer,
+                producer_id,
+                sequence_id,
+                metadata,
+                payload,
+            )
+            .await
+            {
+                Ok(published) => PersistentSendOutcome {
+                    producer_id: published.producer_id,
+                    sequence_id: published.sequence_id,
+                    result: Ok(published.message_id),
+                },
+                Err(error) => {
+                    let kind = if let Some(rate_error) =
+                        error.downcast_ref::<TopicPublishRateExceeded>()
+                    {
+                        PersistentSendErrorKind::RateLimited(rate_error.to_string())
+                    } else {
+                        PersistentSendErrorKind::Other(error.to_string())
+                    };
+                    PersistentSendOutcome {
+                        producer_id,
+                        sequence_id,
+                        result: Err(kind),
+                    }
+                }
+            }
+        });
+
+        Ok(())
     }
 
     async fn handle_subscribe(&mut self, cmd: BaseCommand) -> CnxResult<()> {
@@ -884,6 +1041,48 @@ mod tests {
         server_cnx.producers.insert(producer_id, producer.clone());
         producer
     }
+
+    async fn attach_persistent_producer(
+        server_cnx: &mut ServerCnx<DuplexStream>,
+        topic_name: &str,
+        producer_id: u64,
+    ) -> Arc<Producer> {
+        let topic = {
+            let mut broker = server_cnx.topic_manager.write().await;
+            match broker.get_or_create_topic_auto(topic_name).await {
+                TopicRef::NonPartitioned(topic) | TopicRef::Partition(topic) => topic,
+                TopicRef::Partitioned(_) => panic!("expected concrete topic"),
+            }
+        };
+
+        // Default runtime is Persistent; set explicitly for clarity.
+        topic
+            .write()
+            .await
+            .set_runtime_mode(TopicRuntimeMode::Persistent);
+        let producer = Arc::new(Producer::new(
+            producer_id,
+            format!("producer-{producer_id}"),
+            topic.clone(),
+            server_cnx.connection_id.clone(),
+        ));
+        topic.write().await.add_producer(producer.clone()).unwrap();
+        server_cnx.producers.insert(producer_id, producer.clone());
+        producer
+    }
+
+    async fn drain_persistent_sends(server_cnx: &mut ServerCnx<DuplexStream>) {
+        while !server_cnx.persistent_sends.is_empty() {
+            match server_cnx.persistent_sends.join_next().await {
+                Some(Ok(outcome)) => {
+                    server_cnx.complete_persistent_send(outcome).await.unwrap();
+                }
+                Some(Err(join_err)) => panic!("persistent send task failed: {join_err}"),
+                None => break,
+            }
+        }
+    }
+
 
     #[tokio::test]
     async fn connect_transitions_to_connected_and_records_protocol_version() {
@@ -1142,4 +1341,118 @@ mod tests {
         assert_eq!(server_cnx.pending_send_requests, 0);
         assert!(!server_cnx.read_paused);
     }
+
+    #[tokio::test]
+    async fn persistent_send_pipelines_and_writes_receipt_on_completion() {
+        let (mut server_cnx, mut client, _test_dir) = build_test_connection();
+        attach_persistent_producer(
+            &mut server_cnx,
+            "persistent://public/default/pipeline-topic",
+            21,
+        )
+        .await;
+
+        server_cnx
+            .handle_send(
+                send_command(21, 1),
+                PulsarFrame {
+                    command: Bytes::new(),
+                    metadata: None,
+                    payload: Bytes::from_static(b"hello-pipeline"),
+                    checksum: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // handle_send must return without waiting for storage + framed receipt.
+        assert_eq!(server_cnx.pending_send_requests, 1);
+        assert_eq!(server_cnx.persistent_sends.len(), 1);
+
+        drain_persistent_sends(&mut server_cnx).await;
+
+        assert_eq!(server_cnx.pending_send_requests, 0);
+        assert!(server_cnx.persistent_sends.is_empty());
+
+        let frame = client.next().await.unwrap().unwrap();
+        let cmd = BaseCommand::decode(&frame.command[..]).unwrap();
+        assert_eq!(cmd.r#type, base_command::Type::SendReceipt as i32);
+        let send_receipt = cmd.send_receipt.expect("send receipt payload");
+        assert_eq!(send_receipt.producer_id, 21);
+        assert_eq!(send_receipt.sequence_id, 1);
+        let message_id = send_receipt.message_id.expect("message id");
+        assert_ne!(message_id.ledger_id, u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn persistent_send_respects_in_flight_cap_and_drains_multiple() {
+        let (mut server_cnx, mut client, _test_dir) = build_test_connection();
+        server_cnx.max_persistent_in_flight = 2;
+        attach_persistent_producer(
+            &mut server_cnx,
+            "persistent://public/default/pipeline-cap-topic",
+            22,
+        )
+        .await;
+
+        for seq in 1..=3u64 {
+            server_cnx
+                .handle_send(
+                    send_command(22, seq),
+                    PulsarFrame {
+                        command: Bytes::new(),
+                        metadata: None,
+                        payload: Bytes::from(format!("msg-{seq}")),
+                        checksum: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        // Cap is 2: third send may have awaited a slot, but all three must complete.
+        drain_persistent_sends(&mut server_cnx).await;
+        assert_eq!(server_cnx.pending_send_requests, 0);
+
+        let mut receipts = Vec::new();
+        for _ in 0..3 {
+            let frame = client.next().await.unwrap().unwrap();
+            let cmd = BaseCommand::decode(&frame.command[..]).unwrap();
+            assert_eq!(cmd.r#type, base_command::Type::SendReceipt as i32);
+            receipts.push(cmd.send_receipt.unwrap().sequence_id);
+        }
+        receipts.sort_unstable();
+        assert_eq!(receipts, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn cleanup_aborts_persistent_in_flight_without_waiting() {
+        let (mut server_cnx, _client, _test_dir) = build_test_connection();
+        attach_persistent_producer(
+            &mut server_cnx,
+            "persistent://public/default/pipeline-cleanup-topic",
+            23,
+        )
+        .await;
+
+        server_cnx
+            .handle_send(
+                send_command(23, 9),
+                PulsarFrame {
+                    command: Bytes::new(),
+                    metadata: None,
+                    payload: Bytes::from_static(b"will-abort"),
+                    checksum: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!server_cnx.persistent_sends.is_empty());
+
+        server_cnx.cleanup().await.unwrap();
+        assert!(server_cnx.persistent_sends.is_empty());
+        assert_eq!(server_cnx.pending_send_requests, 0);
+        assert!(server_cnx.producers.is_empty());
+    }
+
 }

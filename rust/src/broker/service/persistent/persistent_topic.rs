@@ -57,12 +57,14 @@ impl PersistentTopicRuntime {
                 guard.concurrent_appender()?
             };
             if let Some(appender) = appender {
-                return Ok(appender.append_message_with_metadata(
-                    topic_name,
-                    partition,
-                    metadata.as_ref(),
-                    payload.as_ref(),
-                )?);
+                return Ok(appender
+                    .append_message_with_metadata(
+                        topic_name,
+                        partition,
+                        metadata.as_ref(),
+                        payload.as_ref(),
+                    )
+                    .await?);
             }
         }
 

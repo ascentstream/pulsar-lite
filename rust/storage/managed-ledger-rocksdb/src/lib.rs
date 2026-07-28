@@ -16,7 +16,7 @@ pub mod test_support {
     pub use crate::cursor::{
         ack_managed_cursor_shared, is_managed_position_acknowledged, RocksDBManagedCursor,
     };
-    pub use crate::entrylog::EntryLogStore;
+    pub use crate::entrylog::{EntryLogStore, EntryToAppend};
     pub use crate::factory::RocksDBManagedLedgerFactory;
     pub use crate::ledger::RocksDBManagedLedger;
     pub use crate::metadata::{proto, StoredEntryLocation, StoredManagedLedgerInfo};

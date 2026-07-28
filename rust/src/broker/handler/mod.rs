@@ -15,4 +15,7 @@ pub use consumer_handler::{
     handle_redeliver_unacknowledged_messages, handle_seek, handle_subscribe, handle_unsubscribe,
 };
 pub use lookup_handler::{handle_lookup, handle_partition_metadata};
-pub use producer_handler::{handle_close_producer, handle_producer, handle_send};
+pub use producer_handler::{
+    handle_close_producer, handle_producer, handle_send, publish_persistent_send, publish_send,
+    PublishedSend,
+};

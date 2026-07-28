@@ -1,5 +1,5 @@
 use super::cursor::{next_position, RocksDBManagedCursor};
-use super::entrylog::{EntryIndex, EntryLogStore, EntryRecord};
+use super::entrylog::{EntryIndex, EntryLogStore, EntryRecord, EntryToAppend};
 use super::keys;
 use super::metadata::{StoredEntryLocation, StoredManagedLedgerInfo};
 use anyhow::{Ok, Result};
@@ -236,25 +236,27 @@ impl RocksDBManagedLedger {
         positions.pop().ok_or_else(|| anyhow::anyhow!("add_entries returned empty positions"))
     }
 
-    /// Append many entries in one rocksdb write.
-    /// 
-    /// - entry_id assignment stays serial(same as single append)
-    /// - entrylog append is still per-item(lower layer may batch)
+    /// Append many entries with one entrylog flush and one RocksDB WriteBatch.
+    ///
+    /// - entry_id assignment stays serial (same as single append)
+    /// - entrylog is written once via `append_batch` (one write_all + flush)
     /// - entry locations + final managed-ledger info are written once
+    /// - runtime state is published only after both durable steps succeed
     pub fn add_entries_with_partition_and_metadata(
         &mut self,
-        items: &[(i32,&[u8],&[u8])],
+        items: &[(i32, &[u8], &[u8])],
     ) -> Result<Vec<ManagedLedgerPosition>> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
 
+        // Pass 1: allocate positions and next ledger/runtime state in memory.
         let mut next_info = self.info.clone();
         let mut next_runtime = self.runtime.clone();
         let mut positions = Vec::with_capacity(items.len());
-        let mut entry_puts: Vec<(Vec<u8>,Vec<u8>)> = Vec::with_capacity(items.len());
+        let mut to_append = Vec::with_capacity(items.len());
 
-        for (partition,metadata,payload) in items {
+        for (partition, metadata, payload) in items {
             if next_runtime.current_ledger_entries >= self.max_entries_per_ledger {
                 let next_ledger_id = Self::allocate_ledger_id(&self.db)?;
                 next_info.roll_over_current_ledger(next_ledger_id);
@@ -279,22 +281,40 @@ impl RocksDBManagedLedger {
 
             if next_runtime.current_ledger_entries >= self.max_entries_per_ledger {
                 let next_ledger_id = Self::allocate_ledger_id(&self.db)?;
-
                 next_info.roll_over_current_ledger(next_ledger_id);
                 next_runtime.current_ledger_entries = 0;
                 next_runtime.current_ledger_size = 0;
                 next_runtime.current_ledger_id = next_ledger_id;
             }
 
-            let entry_index = self.entry_log.append_with_metadata(
-                position.ledger_id, position.entry_id, *partition, metadata, payload)?;
-            let stored_entry_location = StoredEntryLocation::from(entry_index);
-            entry_puts.push((keys::managed_entry_key(position.ledger_id, position.entry_id),bincode::serialize(&stored_entry_location)?,));
-            positions.push(position)
+            to_append.push(EntryToAppend {
+                ledger_id: position.ledger_id,
+                entry_id: position.entry_id,
+                partition: *partition,
+                metadata: metadata.to_vec(),
+                payload: payload.to_vec(),
+            });
+            positions.push(position);
         }
+
+        // Pass 2: one entrylog IO for the whole batch.
+        let indices = self.entry_log.append_batch(to_append)?;
+        if indices.len() != positions.len() {
+            anyhow::bail!(
+                "entrylog append_batch size mismatch: got {} indices for {} entries",
+                indices.len(),
+                positions.len()
+            );
+        }
+
+        // Pass 3: one RocksDB WriteBatch for locations + ledger info.
         let mut batch = WriteBatch::default();
-        for (key,value) in entry_puts {
-            batch.put(key,value);
+        for (position, entry_index) in positions.iter().zip(indices.into_iter()) {
+            let stored_entry_location = StoredEntryLocation::from(entry_index);
+            batch.put(
+                keys::managed_entry_key(position.ledger_id, position.entry_id),
+                bincode::serialize(&stored_entry_location)?,
+            );
         }
         batch.put(
             keys::managed_ledger_key(&self.name),
@@ -302,6 +322,7 @@ impl RocksDBManagedLedger {
         );
         self.db.write(batch)?;
 
+        // Pass 4: publish in-memory state only after durable writes succeed.
         self.info = next_info;
         self.runtime = next_runtime;
         Ok(positions)

@@ -190,8 +190,8 @@ class BrokerProcess:
             self.sampler = BrokerSampler(self.broker_pid)
             self.sampler.start()
         else:
-            # Original behavior: fresh start
-            self.stop()
+            # Fresh storage: drop the previous /tmp workdir so disk does not accumulate.
+            self.stop(cleanup=True)
             self.start()
 
     def metrics(self) -> dict[str, float]:
@@ -378,6 +378,6 @@ class DockerBrokerProcess(BrokerProcess):
             self.sampler = BrokerSampler(self.broker_pid)
             self.sampler.start()
         else:
-            # Original behavior: fresh start
-            self.stop()
+            # Fresh storage: drop the previous /tmp workdir so disk does not accumulate.
+            self.stop(cleanup=True)
             self.start()

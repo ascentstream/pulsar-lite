@@ -612,7 +612,7 @@ def main(argv: list[str]) -> int:
                 try:
                     result = run_scenario(scenario, broker, scenario_dir)
 
-                    # Save broker log and timeseries
+                    # Save broker log and timeseries while workdir still exists.
                     if broker.log_path:
                         (scenario_dir / "broker.log").write_text(
                             broker.log_path.read_text(
@@ -623,7 +623,8 @@ def main(argv: list[str]) -> int:
                         broker.sampler.write_csv(scenario_dir / "broker_timeseries.csv")
 
                     # Record artifact paths in result
-                    perf_collector.stop()
+                    if perf_collector is not None:
+                        perf_collector.stop()
                     if perf_data_path.exists():
                         svg_path = scenario_dir / "flamegraph.svg"
                         ok = PerfCollector.generate_flamegraph(perf_data_path, svg_path)
@@ -656,6 +657,16 @@ def main(argv: list[str]) -> int:
 
                 except Exception as e:
                     print(f"  ERROR: {e}", file=sys.stderr)
+                    # Best-effort capture before wiping storage.
+                    try:
+                        if broker.log_path and broker.log_path.exists():
+                            (scenario_dir / "broker.log").write_text(
+                                broker.log_path.read_text(
+                                    encoding="utf-8", errors="replace"
+                                )
+                            )
+                    except OSError:
+                        pass
                     if perf_collector is not None:
                         perf_collector.stop()
                     results["scenarios"].append(
@@ -670,6 +681,22 @@ def main(argv: list[str]) -> int:
                     )
                     failed += 1
                     print(f"  ✗ FAIL: {e}")
+                finally:
+                    # Drop /tmp DB+entrylog after each scenario so storage does not accumulate.
+                    # restart_replay / redelivery manage their own in-scenario preserve restart;
+                    # once the scenario finishes we always wipe before the next one.
+                    try:
+                        broker.restart(preserve_storage=False)
+                        print(
+                            "  storage cleaned for next scenario "
+                            f"(workdir={broker.workdir})",
+                            file=sys.stderr,
+                        )
+                    except Exception as cleanup_err:
+                        print(
+                            f"  WARNING: failed to reset broker storage: {cleanup_err}",
+                            file=sys.stderr,
+                        )
 
         finally:
             broker.stop(cleanup=True)

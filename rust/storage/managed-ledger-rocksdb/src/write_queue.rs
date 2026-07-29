@@ -15,12 +15,52 @@ const MAX_BATCH: usize = 64;
 /// in-flight slots wait on completion). Prefer try_recv drain for depth.
 const BATCH_WINDOW: Duration = Duration::from_micros(200);
 
+/// Result delivered to a broker connection after durable append (no await on enqueue path).
+#[derive(Debug)]
+pub struct ConnAppendResult {
+    pub producer_id: u64,
+    pub sequence_id: u64,
+    pub result: Result<MessageId, String>,
+}
+
+enum WriteReply {
+    /// Legacy / unit-test path: caller awaits oneshot.
+    Oneshot(oneshot::Sender<Result<MessageId, String>>),
+    /// Connection path: worker pushes completion; connection select writes Receipt.
+    Conn {
+        producer_id: u64,
+        sequence_id: u64,
+        tx: tokio::sync::mpsc::Sender<ConnAppendResult>,
+    },
+}
+
+impl WriteReply {
+    fn complete(self, result: Result<MessageId, String>) {
+        match self {
+            WriteReply::Oneshot(tx) => {
+                let _ = tx.send(result);
+            }
+            WriteReply::Conn {
+                producer_id,
+                sequence_id,
+                tx,
+            } => {
+                let _ = tx.blocking_send(ConnAppendResult {
+                    producer_id,
+                    sequence_id,
+                    result,
+                });
+            }
+        }
+    }
+}
+
 pub(crate) struct WriteReq {
     topic: String,
     partition: i32,
     metadata: Vec<u8>,
     payload: Vec<u8>,
-    reply: oneshot::Sender<Result<MessageId, String>>,
+    reply: WriteReply,
 }
 
 /// Single-writer queue for managed-ledger appends.
@@ -150,7 +190,7 @@ impl WriteQueue {
                         Err(e) => {
                             let msg = e.to_string();
                             for req in reqs {
-                                let _ = req.reply.send(Err(msg.clone()));
+                                req.reply.complete(Err(msg.clone()));
                             }
                             continue;
                         }
@@ -159,9 +199,8 @@ impl WriteQueue {
 
                 let Some(ledger) = ledgers.get_mut(&ledger_name) else {
                     for req in reqs {
-                        let _ = req
-                            .reply
-                            .send(Err("ledger missing from worker cache".to_string()));
+                        req.reply
+                            .complete(Err("ledger missing from worker cache".to_string()));
                     }
                     continue;
                 };
@@ -175,13 +214,13 @@ impl WriteQueue {
                 match ledger.add_entries_with_partition_and_metadata(&inputs) {
                     Ok(positions) => {
                         for (req, position) in reqs.into_iter().zip(positions.into_iter()) {
-                            let _ = req.reply.send(Ok(MessageId::from(position)));
+                            req.reply.complete(Ok(MessageId::from(position)));
                         }
                     }
                     Err(e) => {
                         let msg = e.to_string();
                         for req in reqs {
-                            let _ = req.reply.send(Err(msg.clone()));
+                            req.reply.complete(Err(msg.clone()));
                         }
                     }
                 }
@@ -258,10 +297,35 @@ impl WriteQueue {
             partition,
             metadata: metadata.to_vec(),
             payload: payload.to_vec(),
-            reply: reply_tx,
+            reply: WriteReply::Oneshot(reply_tx),
         })
         .map_err(|_| "write queue worker disconnected".to_string())?;
         Ok(reply_rx)
+    }
+
+    /// Enqueue for a broker connection: returns immediately; completion is pushed to `completion_tx`.
+    pub(crate) fn enqueue_for_connection(
+        tx: &mpsc::Sender<WriteReq>,
+        topic: &str,
+        partition: i32,
+        metadata: &[u8],
+        payload: &[u8],
+        producer_id: u64,
+        sequence_id: u64,
+        completion_tx: tokio::sync::mpsc::Sender<ConnAppendResult>,
+    ) -> Result<(), String> {
+        tx.send(WriteReq {
+            topic: topic.to_string(),
+            partition,
+            metadata: metadata.to_vec(),
+            payload: payload.to_vec(),
+            reply: WriteReply::Conn {
+                producer_id,
+                sequence_id,
+                tx: completion_tx,
+            },
+        })
+        .map_err(|_| "write queue worker disconnected".to_string())
     }
 
     /// Async submit: does not block the Tokio worker thread while waiting for disk IO.
@@ -379,6 +443,38 @@ mod tests {
         assert_eq!(id.ledger, 0);
         assert_eq!(id.entry, 0);
         assert_eq!(id.partition, -1);
+    }
+
+    #[tokio::test]
+    async fn enqueue_for_connection_delivers_conn_append_result() {
+        let dir = tempdir().unwrap();
+        let q = WriteQueue::new(open_test_factory(dir.path()));
+        let tx = q.sender().unwrap();
+        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(4);
+
+        WriteQueue::enqueue_for_connection(
+            &tx,
+            "persistent://public/default/conn-path",
+            3,
+            b"meta",
+            b"payload",
+            42,
+            7,
+            completion_tx,
+        )
+        .unwrap();
+
+        let append = tokio::time::timeout(Duration::from_secs(2), completion_rx.recv())
+            .await
+            .expect("conn append timed out")
+            .expect("conn append channel closed");
+
+        assert_eq!(append.producer_id, 42);
+        assert_eq!(append.sequence_id, 7);
+        let id = append.result.expect("append ok");
+        assert_eq!(id.ledger, 0);
+        assert_eq!(id.entry, 0);
+        assert_eq!(id.partition, 3);
     }
 
     #[test]

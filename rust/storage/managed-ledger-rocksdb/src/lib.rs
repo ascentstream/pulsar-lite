@@ -9,6 +9,7 @@ mod store;
 mod write_queue;
 
 pub use store::{ConcurrentAppender, RocksDbManagedLedgerStorage};
+pub use write_queue::ConnAppendResult;
 
 /// Internal types exposed for integration tests in `tests/`.
 #[doc(hidden)]

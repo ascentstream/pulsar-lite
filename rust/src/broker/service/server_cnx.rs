@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tokio_util::codec::Framed;
 
@@ -27,6 +26,21 @@ use crate::protocol::ServerCommand;
 
 type CnxError = Box<dyn Error + Send + Sync>;
 type CnxResult<T> = Result<T, CnxError>;
+
+#[cfg(not(feature = "rocksdb-storage"))]
+mod conn_append_stub {
+    #[derive(Debug)]
+    pub struct ConnAppendResult {
+        pub producer_id: u64,
+        pub sequence_id: u64,
+        pub result: Result<crate::storage::MessageId, String>,
+    }
+}
+#[cfg(feature = "rocksdb-storage")]
+use pulsar_lite_storage_managed_ledger_rocksdb::ConnAppendResult;
+#[cfg(not(feature = "rocksdb-storage"))]
+use conn_append_stub::ConnAppendResult;
+
 
 fn to_cnx_error(error: impl ToString) -> CnxError {
     Box::new(std::io::Error::other(error.to_string()))
@@ -140,8 +154,13 @@ where
     read_paused: bool,
     /// Maximum message size accepted by the broker.
     max_message_size: usize,
-    /// In-flight persistent publish tasks (completed → SendReceipt/SendError).
-    persistent_sends: JoinSet<PersistentSendOutcome>,
+    /// Completions from write-queue worker (legacy oneshot path → SendReceipt/SendError).
+    #[allow(dead_code)]
+    completion_tx: mpsc::Sender<PersistentSendOutcome>,
+    completion_rx: mpsc::Receiver<PersistentSendOutcome>,
+    /// Direct completions from write-queue ConnReply (enqueue-return path).
+    conn_append_tx: mpsc::Sender<ConnAppendResult>,
+    conn_append_rx: mpsc::Receiver<ConnAppendResult>,
 
     /// Advertised broker service url returned from Lookup.
     broker_service_url: String,
@@ -189,6 +208,10 @@ where
         let mut framed = Framed::new(socket, PulsarFrameCodec::new());
         framed.set_backpressure_boundary(channel_write_buffer_high_water_mark_bytes);
         let (message_tx, message_rx) = mpsc::channel(8192);
+        let (completion_tx, completion_rx) =
+            mpsc::channel(max_pending_publish_requests.max(DEFAULT_MAX_PERSISTENT_IN_FLIGHT));
+        let (conn_append_tx, conn_append_rx) =
+            mpsc::channel(max_pending_publish_requests.max(DEFAULT_MAX_PERSISTENT_IN_FLIGHT));
         let connection_write_state = Arc::new(ConnectionWriteState::new(
             channel_write_buffer_high_water_mark_bytes,
             channel_write_buffer_low_water_mark_bytes,
@@ -219,7 +242,10 @@ where
             resume_threshold: max_pending_publish_requests / 2,
             read_paused: false,
             max_message_size,
-            persistent_sends: JoinSet::new(),
+            completion_tx,
+            completion_rx,
+            conn_append_tx,
+            conn_append_rx,
             broker_service_url,
         }
     }
@@ -271,28 +297,25 @@ where
                     self.sync_connection_writable_from_framed_buffer();
                 }
 
-                // Completed persistent pipelined publishes → SendReceipt / SendError.
-                Some(join_result) = self.persistent_sends.join_next() => {
-                    match join_result {
-                        Ok(outcome) => {
-                            if let Err(e) = self.complete_persistent_send(outcome).await {
-                                self.set_failed(CloseReason::ProtocolError(e.to_string()));
-                                log::error!("Error completing persistent send: {}", e);
-                                break Err(e);
-                            }
-                        }
-                        Err(join_err) => {
-                            self.pending_send_requests =
-                                self.pending_send_requests.saturating_sub(1);
-                            self.maybe_resume_read_after_send();
-                            if join_err.is_panic() {
-                                log::error!(
-                                    "Persistent send task panicked on {}: {}",
-                                    self.connection_id,
-                                    join_err
-                                );
-                            }
-                        }
+                // Durable append completions from write-queue → SendReceipt / SendError.
+                Some(append) = self.conn_append_rx.recv() => {
+                    let outcome = PersistentSendOutcome {
+                        producer_id: append.producer_id,
+                        sequence_id: append.sequence_id,
+                        result: append.result.map_err(PersistentSendErrorKind::Other),
+                    };
+                    if let Err(e) = self.complete_persistent_send(outcome).await {
+                        self.set_failed(CloseReason::ProtocolError(e.to_string()));
+                        log::error!("Error completing persistent send: {}", e);
+                        break Err(e);
+                    }
+                    self.sync_connection_writable_from_framed_buffer();
+                }
+                Some(outcome) = self.completion_rx.recv() => {
+                    if let Err(e) = self.complete_persistent_send(outcome).await {
+                        self.set_failed(CloseReason::ProtocolError(e.to_string()));
+                        log::error!("Error completing persistent send: {}", e);
+                        break Err(e);
                     }
                     self.sync_connection_writable_from_framed_buffer();
                 }
@@ -553,15 +576,17 @@ where
 
     async fn cleanup(&mut self) -> CnxResult<()> {
         log::debug!(
-            "Cleaning up connection: {} producers, {} consumers, {} persistent in-flight",
+            "Cleaning up connection: {} producers, {} consumers, {} pending publishes",
             self.producers.len(),
             self.consumers.len(),
-            self.persistent_sends.len()
+            self.pending_send_requests
         );
 
-        // Drop pipelined publish tasks; do not wait for storage completion on close.
-        self.persistent_sends.abort_all();
-        while self.persistent_sends.join_next().await.is_some() {}
+        // Drop completion sender so worker conn_reply sends fail fast; drain leftover outcomes.
+        self.completion_rx.close();
+        while self.completion_rx.try_recv().is_ok() {}
+        self.conn_append_rx.close();
+        while self.conn_append_rx.try_recv().is_ok() {}
         self.pending_send_requests = 0;
         self.read_paused = false;
 
@@ -650,6 +675,11 @@ where
                     })
                     .await
                     .map_err(to_cnx_error)?;
+                if let Some(producer) = self.producers.get(&outcome.producer_id) {
+                    let topic = producer.get_topic();
+                    let mut topic_guard = topic.write().await;
+                    topic_guard.dispatch_to_subscriptions().await;
+                }
             }
             Err(PersistentSendErrorKind::RateLimited(message)) => {
                 self.framed
@@ -757,63 +787,126 @@ where
             };
         }
 
-        // Persistent path: pipeline publish so the connection can keep reading.
-        while self.persistent_sends.len() >= self.max_persistent_in_flight {
-            let Some(join_result) = self.persistent_sends.join_next().await else {
+        // Persistent path (BK logAddEntry style): enqueue only; completion via channel.
+        while self.pending_send_requests >= self.max_persistent_in_flight {
+            let Some(append) = self.conn_append_rx.recv().await else {
                 break;
             };
-            match join_result {
-                Ok(outcome) => self.complete_persistent_send(outcome).await?,
-                Err(join_err) => {
-                    self.pending_send_requests = self.pending_send_requests.saturating_sub(1);
-                    self.maybe_resume_read_after_send();
-                    if join_err.is_panic() {
-                        return Err(to_cnx_error(format!(
-                            "persistent send task panicked: {join_err}"
-                        )));
-                    }
+            let outcome = PersistentSendOutcome {
+                producer_id: append.producer_id,
+                sequence_id: append.sequence_id,
+                result: append.result.map_err(PersistentSendErrorKind::Other),
+            };
+            self.complete_persistent_send(outcome).await?;
+        }
+
+        let meta_len = frame.metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+        let payload_len = frame.payload.len();
+
+        let (topic_name, partition, storage) = {
+            let mut topic_guard = topic.write().await;
+            if let Err(error) =
+                topic_guard.validate_publish_rate_public(frame.metadata.as_ref(), payload_len)
+            {
+                if let Some(rate_error) = error.downcast_ref::<TopicPublishRateExceeded>() {
+                    self.framed
+                        .send(ServerCommand::SendError {
+                            producer_id,
+                            sequence_id,
+                            error: ServerError::ServiceNotReady,
+                            message: rate_error.to_string(),
+                        })
+                        .await
+                        .map_err(to_cnx_error)?;
+                    return Ok(());
                 }
+                return Err(to_cnx_error(error));
+            }
+            (
+                topic_guard.name.clone(),
+                topic_guard.partition,
+                topic_guard.shared_storage(),
+            )
+        };
+
+        #[cfg(feature = "rocksdb-storage")]
+        {
+            let appender = {
+                let guard = storage.lock().await;
+                guard
+                    .concurrent_appender()
+                    .map_err(|e| to_cnx_error(e.to_string()))?
+            };
+            if let Some(appender) = appender {
+                let meta_slice = frame
+                    .metadata
+                    .as_ref()
+                    .map(|b| b.as_ref())
+                    .unwrap_or(&[]);
+                appender
+                    .enqueue_for_connection(
+                        &topic_name,
+                        partition,
+                        meta_slice,
+                        frame.payload.as_ref(),
+                        producer_id,
+                        sequence_id,
+                        self.conn_append_tx.clone(),
+                    )
+                    .map_err(to_cnx_error)?;
+
+                producer.record_message_sent(payload_len + meta_len).await;
+
+                self.pending_send_requests += 1;
+                if self.pending_send_requests >= self.max_pending_publish_requests {
+                    self.read_paused = true;
+                }
+                return Ok(());
             }
         }
 
+        // Memory backend fallback (unit tests): await publish on this task.
         self.pending_send_requests += 1;
         if self.pending_send_requests >= self.max_pending_publish_requests {
             self.read_paused = true;
         }
-
         let metadata = frame.metadata.clone();
         let payload = frame.payload.clone();
-        self.persistent_sends.spawn(async move {
-            match handler::publish_persistent_send(
-                producer,
-                producer_id,
-                sequence_id,
-                metadata,
-                payload,
-            )
-            .await
-            {
-                Ok(published) => PersistentSendOutcome {
+        match handler::publish_persistent_send(
+            producer,
+            producer_id,
+            sequence_id,
+            metadata,
+            payload,
+        )
+        .await
+        {
+            Ok(published) => {
+                self.complete_persistent_send(PersistentSendOutcome {
                     producer_id: published.producer_id,
                     sequence_id: published.sequence_id,
                     result: Ok(published.message_id),
-                },
-                Err(error) => {
-                    let kind = if let Some(rate_error) =
-                        error.downcast_ref::<TopicPublishRateExceeded>()
-                    {
-                        PersistentSendErrorKind::RateLimited(rate_error.to_string())
-                    } else {
-                        PersistentSendErrorKind::Other(error.to_string())
-                    };
-                    PersistentSendOutcome {
-                        producer_id,
-                        sequence_id,
-                        result: Err(kind),
-                    }
+                })
+                .await?;
+            }
+            Err(error) => {
+                self.pending_send_requests = self.pending_send_requests.saturating_sub(1);
+                self.maybe_resume_read_after_send();
+                if let Some(rate_error) = error.downcast_ref::<TopicPublishRateExceeded>() {
+                    self.framed
+                        .send(ServerCommand::SendError {
+                            producer_id,
+                            sequence_id,
+                            error: ServerError::ServiceNotReady,
+                            message: rate_error.to_string(),
+                        })
+                        .await
+                        .map_err(to_cnx_error)?;
+                } else {
+                    return Err(to_cnx_error(error));
                 }
             }
-        });
+        }
 
         Ok(())
     }
@@ -1071,14 +1164,32 @@ mod tests {
         producer
     }
 
+    /// Drain any pending durable-append completions (rocksdb enqueue path).
+    /// Memory-backend tests complete inline in handle_send, so this is a no-op there.
     async fn drain_persistent_sends(server_cnx: &mut ServerCnx<DuplexStream>) {
-        while !server_cnx.persistent_sends.is_empty() {
-            match server_cnx.persistent_sends.join_next().await {
-                Some(Ok(outcome)) => {
-                    server_cnx.complete_persistent_send(outcome).await.unwrap();
-                }
-                Some(Err(join_err)) => panic!("persistent send task failed: {join_err}"),
-                None => break,
+        loop {
+            let mut progressed = false;
+            while let Ok(append) = server_cnx.conn_append_rx.try_recv() {
+                progressed = true;
+                let outcome = PersistentSendOutcome {
+                    producer_id: append.producer_id,
+                    sequence_id: append.sequence_id,
+                    result: append.result.map_err(PersistentSendErrorKind::Other),
+                };
+                server_cnx
+                    .complete_persistent_send(outcome)
+                    .await
+                    .expect("complete conn append");
+            }
+            while let Ok(outcome) = server_cnx.completion_rx.try_recv() {
+                progressed = true;
+                server_cnx
+                    .complete_persistent_send(outcome)
+                    .await
+                    .expect("complete oneshot append");
+            }
+            if !progressed {
+                break;
             }
         }
     }
@@ -1365,14 +1476,10 @@ mod tests {
             .await
             .unwrap();
 
-        // handle_send must return without waiting for storage + framed receipt.
-        assert_eq!(server_cnx.pending_send_requests, 1);
-        assert_eq!(server_cnx.persistent_sends.len(), 1);
-
+        // Memory backend completes inline in handle_send (no write-queue).
+        // Rocksdb path would leave pending_send_requests > 0 until conn_append_rx fires.
         drain_persistent_sends(&mut server_cnx).await;
-
         assert_eq!(server_cnx.pending_send_requests, 0);
-        assert!(server_cnx.persistent_sends.is_empty());
 
         let frame = client.next().await.unwrap().unwrap();
         let cmd = BaseCommand::decode(&frame.command[..]).unwrap();
@@ -1410,7 +1517,7 @@ mod tests {
                 .unwrap();
         }
 
-        // Cap is 2: third send may have awaited a slot, but all three must complete.
+        // Cap is 2 on rocksdb path; memory path completes inline so all three finish here.
         drain_persistent_sends(&mut server_cnx).await;
         assert_eq!(server_cnx.pending_send_requests, 0);
 
@@ -1447,10 +1554,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!server_cnx.persistent_sends.is_empty());
 
+        // Memory path already completed; cleanup must still drop producers and clear pending.
         server_cnx.cleanup().await.unwrap();
-        assert!(server_cnx.persistent_sends.is_empty());
         assert_eq!(server_cnx.pending_send_requests, 0);
         assert!(server_cnx.producers.is_empty());
     }

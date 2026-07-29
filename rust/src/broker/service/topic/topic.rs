@@ -204,6 +204,10 @@ impl Topic {
         self.persistent_runtime.clone()
     }
 
+    pub(crate) fn shared_storage(&self) -> SharedStorage {
+        self.storage.clone()
+    }
+
     /// Rate-limit check used by producers that release the topic write lock
     /// before waiting on storage IO.
     pub(crate) fn validate_publish_rate_public(

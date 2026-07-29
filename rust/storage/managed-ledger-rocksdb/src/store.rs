@@ -57,6 +57,31 @@ impl ConcurrentAppender {
         WriteQueue::submit_with_tx_blocking(&self.tx, topic, partition, metadata, payload)
             .map_err(|e| anyhow!(e))
     }
+
+    /// Enqueue without waiting (BookKeeper logAddEntry style for connections).
+    /// Completion is delivered on `completion_tx` from the write-queue worker thread.
+    pub fn enqueue_for_connection(
+        &self,
+        topic: &str,
+        partition: i32,
+        metadata: &[u8],
+        payload: &[u8],
+        producer_id: u64,
+        sequence_id: u64,
+        completion_tx: tokio::sync::mpsc::Sender<super::write_queue::ConnAppendResult>,
+    ) -> Result<()> {
+        WriteQueue::enqueue_for_connection(
+            &self.tx,
+            topic,
+            partition,
+            metadata,
+            payload,
+            producer_id,
+            sequence_id,
+            completion_tx,
+        )
+        .map_err(|e| anyhow!(e))
+    }
 }
 
 impl fmt::Debug for ConcurrentAppender {

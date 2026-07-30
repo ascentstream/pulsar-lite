@@ -4,9 +4,9 @@ mod common;
 
 use common::*;
 use prost::Message;
-use pulsar_lite_storage_managed_ledger::{ManagedCursor, ManagedLedger};
+use pulsar_lite_storage_managed_ledger::ManagedCursor;
 use pulsar_lite_storage_managed_ledger_rocksdb::test_support::{
-    keys, proto, RocksDBManagedCursor, RocksDBManagedLedger,
+    append_payload, keys, proto, RocksDBManagedCursor, RocksDBManagedLedger,
 };
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -36,9 +36,9 @@ fn managed_ledger_info_value_is_protobuf_encoded() {
 
     {
         let entry_log = open_test_entry_log(&db_path);
-        let mut ledger =
+        let ledger =
             RocksDBManagedLedger::open("ledger-a", Arc::clone(&db), entry_log).unwrap();
-        ledger.add_entry(b"first").unwrap();
+        append_payload(&ledger, b"first").unwrap();
     }
 
     let bytes = read_raw_value(&db, keys::managed_ledger_key("ledger-a"));

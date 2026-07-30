@@ -1,4 +1,4 @@
-use crate::factory::RocksDBManagedLedgerFactory;
+use crate::factory::{RocksDBManagedLedgerFactory, SharedLedger};
 use crate::keys;
 use pulsar_lite_storage_managed_ledger::MessageId;
 use std::collections::HashMap;
@@ -64,9 +64,9 @@ pub(crate) struct WriteReq {
 
 /// Single-writer queue for managed-ledger appends.
 ///
-/// Worker owns ledgers in a thread-local HashMap and writes via `&mut`
-/// (no SharedLedger lock on the append path). Reply uses tokio oneshot so
-/// async callers can await without blocking the Tokio worker thread.
+/// Worker caches the same `Arc<RocksDBManagedLedger>` handles as store reads so
+/// durable success updates one published LAC/meta view. Entry-id assignment stays
+/// serial on this thread; no outer content mutex around append IO.
 pub(crate) struct WriteQueue {
     tx: Option<mpsc::Sender<WriteReq>>,
     worker: Option<JoinHandle<()>>,
@@ -90,6 +90,9 @@ impl WriteQueue {
     }
 
     fn worker_loop(factory: RocksDBManagedLedgerFactory, rx: mpsc::Receiver<WriteReq>) {
+        // Same Arc instances as store reads (singleton per ledger name).
+        let mut ledgers: HashMap<String, SharedLedger> = HashMap::new();
+
         // Batch-size metrics (aggregated to avoid log spam under stress).
         let mut metric_batches: u64 = 0;
         let mut metric_msgs: u64 = 0;
@@ -178,26 +181,27 @@ impl WriteQueue {
                     metric_group_eq1 += 1;
                 }
 
-                // Route the batch through the factory's SHARED ledger cache:
-                // the worker-owned ledger keeps its runtime state (LAC,
-                // entry counters) private in memory, so appends committed
-                // through it were invisible to readers using the shared
-                // ledger until the LAC-ArcSwap rework. Locking the shared
-                // ledger unifies the in-memory state; batching (one entrylog
-                // flush + one RocksDB write per group) is preserved.
-                let shared = match factory.open_ledger(&ledger_name) {
-                    Ok(shared) => shared,
-                    Err(e) => {
-                        let msg = e.to_string();
-                        for req in reqs {
-                            req.reply.complete(Err(msg.clone()));
+                if !ledgers.contains_key(&ledger_name) {
+                    match factory.open_ledger(&ledger_name) {
+                        Ok(ledger) => {
+                            ledgers.insert(ledger_name.clone(), ledger);
                         }
-                        continue;
+                        Err(e) => {
+                            let msg = e.to_string();
+                            for req in reqs {
+                                req.reply.complete(Err(msg.clone()));
+                            }
+                            continue;
+                        }
                     }
-                };
-                let mut ledger = match shared.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
+                }
+
+                let Some(ledger) = ledgers.get(&ledger_name) else {
+                    for req in reqs {
+                        req.reply
+                            .complete(Err("ledger missing from worker cache".to_string()));
+                    }
+                    continue;
                 };
 
                 // Borrow metadata/payload only while reqs is still alive.
@@ -206,6 +210,8 @@ impl WriteQueue {
                     .map(|r| (r.partition, r.metadata.as_slice(), r.payload.as_slice()))
                     .collect();
 
+                // Append publishes meta then LAC only after durable OK;
+                // complete only after that returns Ok.
                 match ledger.add_entries_with_partition_and_metadata(&inputs) {
                     Ok(positions) => {
                         for (req, position) in reqs.into_iter().zip(positions) {

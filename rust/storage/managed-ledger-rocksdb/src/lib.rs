@@ -28,4 +28,28 @@ pub mod test_support {
             managed_ledger_name,
         };
     }
+
+    use anyhow::Result;
+    use pulsar_lite_storage_managed_ledger::ManagedLedgerPosition;
+
+    /// Test-only durable append (crate-private API). Production must use WriteQueue.
+    pub fn append_payload(
+        ledger: &RocksDBManagedLedger,
+        payload: &[u8],
+    ) -> Result<ManagedLedgerPosition> {
+        append_with_partition(ledger, -1, payload)
+    }
+
+    /// Test-only durable append with partition.
+    pub fn append_with_partition(
+        ledger: &RocksDBManagedLedger,
+        partition: i32,
+        payload: &[u8],
+    ) -> Result<ManagedLedgerPosition> {
+        let mut positions =
+            ledger.add_entries_with_partition_and_metadata(&[(partition, &[] as &[u8], payload)])?;
+        positions
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("add_entries returned empty positions"))
+    }
 }

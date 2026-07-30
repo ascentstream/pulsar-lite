@@ -3,7 +3,9 @@
 mod common;
 
 use common::*;
-use pulsar_lite_storage_managed_ledger::ManagedLedgerStorage;
+use pulsar_lite_storage_managed_ledger::{
+    CursorInitOptions, InitialPosition, ManagedLedgerStorage,
+};
 use pulsar_lite_storage_managed_ledger_rocksdb::{test_support::keys, RocksDbManagedLedgerStorage};
 use tempfile::tempdir;
 
@@ -101,4 +103,53 @@ fn storage_normalizes_topic_url_and_encodes_cursor_name() {
         .get(keys::managed_cursor_key(ledger_name, subscription))
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn append_after_latest_cursor_is_visible_to_reads() {
+    // Reproduces the consumer-0-message bug:
+    // 1) subscribe/Latest warms the SharedLedger cache with empty in-memory info
+    // 2) producer appends through the write-queue worker's owned ledger copy
+    // 3) dispatch reads via SharedLedger and must still see the new entries
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("storage-append-visibility");
+    let topic = "persistent://public/default/visibility";
+    let subscription = "sub";
+
+    let mut storage = RocksDbManagedLedgerStorage::open(&db_path).unwrap();
+    storage.create_topic(topic).unwrap();
+
+    // Warm the reader-side SharedLedger cache the same way subscribe does.
+    storage
+        .initialize_or_open_cursor(
+            topic,
+            subscription,
+            CursorInitOptions {
+                initial_position: InitialPosition::Latest,
+                start_message_id: None,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        storage.first_unacked_position(topic, subscription).unwrap(),
+        None,
+        "empty topic with Latest cursor should have no backlog"
+    );
+
+    let message_id = storage.append_message(topic, -1, b"hello-after-subscribe").unwrap();
+
+    let first = storage
+        .first_unacked_position(topic, subscription)
+        .unwrap()
+        .expect("appended entry must be visible as first unacked");
+    assert_eq!(first.ledger_id, message_id.ledger);
+    assert_eq!(first.entry_id, message_id.entry);
+
+    let entries = storage
+        .read_entries_from(topic, &first, 1)
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].message_id, message_id);
+    assert_eq!(entries[0].payload, b"hello-after-subscribe");
 }

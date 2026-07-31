@@ -151,7 +151,7 @@ impl RocksDbManagedLedgerStorage {
         self.with_cursor_lock(|| {
             let cursor_name = keys::encode_cursor_name(subscription);
             let ledger = self.topic_ledger(topic)?;
-            let mut cursor = ledger.open_cursor(&cursor_name)?;
+            let cursor = ledger.open_cursor(&cursor_name)?;
             cursor.persist_state()
         })
     }

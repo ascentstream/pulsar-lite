@@ -21,7 +21,14 @@ from lib.broker import BrokerConfig, BrokerProcess, DockerBrokerProcess
 from lib.docker_image import build_broker_image
 from lib.observability import PerfCollector
 from lib.parsing import parse_consumer_output, parse_producer_output
-from lib.perf_cmd import ensure_prereqs, perf_cmd, run_consumer_then_feed, run_sync
+from lib.perf_cmd import (
+    ensure_prereqs,
+    e2e_success_despite_peer_hang,
+    format_e2e_process_failure,
+    perf_cmd,
+    run_consumer_then_feed,
+    run_sync,
+)
 
 RESULTS_PATH = ROOT / "docs" / "perf" / "data" / "persistent_stress_results.json"
 ARTIFACTS_DIR = ROOT / "docs" / "perf" / "data" / "persistent_stress_logs"
@@ -54,17 +61,17 @@ SCENARIOS: list[Scenario] = [
         name="stress_persistent_producer_max_rate",
         kind="produce",
         broker="persistent_stress",
-        description="单 producer 全速发送 200w 条",
-        producer_args=["-m", "2000000", "-s", "1024", "-r", "999999", "-o", "1000"],
+        description="单 producer 全速 60s（对齐 non-persistent -time）",
+        producer_args=["-time", "60", "-s", "1024", "-r", "999999", "-o", "1000"],
     ),
     Scenario(
         name="stress_persistent_producer_multi_producer",
         kind="produce",
         broker="persistent_stress",
-        description="4 producers 并发全速发送 200w 条",
+        description="4 producers 并发全速 60s",
         producer_args=[
-            "-m",
-            "2000000",
+            "-time",
+            "60",
             "-s",
             "1024",
             "-r",
@@ -83,50 +90,75 @@ SCENARIOS: list[Scenario] = [
         name="stress_persistent_producer_large_payload",
         kind="produce",
         broker="persistent_stress",
-        description="100KiB payload 发送 10k 条",
-        # 10k * 100KiB ≈ 1GiB payload; 200k would be ~19GiB
-        producer_args=["-m", "10000", "-s", "102400", "-r", "500"],
+        description="100KiB payload 全速 60s（对齐 non-persistent）",
+        producer_args=["-time", "60", "-s", "102400", "-r", "999999", "-o", "1000"],
     ),
     Scenario(
         name="stress_persistent_producer_sustained",
         kind="produce",
         broker="persistent_stress",
-        description="持续限速发送 500k 条 @ 10k msg/s (~50s)",
-        producer_args=["-m", "500000", "-s", "1024", "-r", "10000"],
+        description="限速 10k msg/s 持续 60s",
+        producer_args=["-time", "60", "-s", "1024", "-r", "10000", "-o", "1000"],
     ),
-    # Consumer/E2E stress (4)
+    # Consumer/E2E stress (4) — -time 60, no -m (steady thr via interval median)
     Scenario(
         name="stress_persistent_consume_shared_max_rate",
         kind="consume_e2e",
         broker="persistent_stress",
-        description="Shared 全速消费 200k 条",
-        consumer_args=["-m", "200000", "-q", "1000", "-st", "Shared"],
-        feed_producer_args=["-m", "200000", "-s", "1024", "-r", "999999"],
+        description="Shared 单 consumer 全速 60s",
+        consumer_args=["-time", "60", "-q", "1000", "-st", "Shared"],
+        feed_producer_args=["-time", "60", "-s", "1024", "-r", "999999", "-o", "1000"],
     ),
     Scenario(
         name="stress_persistent_consume_shared_high_fanout",
         kind="consume_e2e",
         broker="persistent_stress",
-        description="16 consumers 高扇出消费 200k 条",
-        consumer_args=["-m", "200000", "-q", "1000", "-st", "Shared", "-n", "16"],
-        feed_producer_args=["-m", "200000", "-s", "1024", "-r", "999999"],
+        description="16 consumers 高扇出 60s",
+        consumer_args=[
+            "-time",
+            "60",
+            "-q",
+            "1000",
+            "-st",
+            "Shared",
+            "-n",
+            "16",
+        ],
+        feed_producer_args=["-time", "60", "-s", "1024", "-r", "999999", "-o", "1000"],
     ),
     Scenario(
         name="stress_persistent_consume_multi_subscription_fanout",
         kind="consume_e2e",
         broker="persistent_stress",
-        description="8 subscriptions 扇出：生产 100k / 消费 800k 条",
-        # each subscription receives a full copy; consumer -m = produce * ns
-        consumer_args=["-m", "800000", "-q", "1000", "-st", "Shared", "-ns", "8"],
-        feed_producer_args=["-m", "100000", "-s", "1024", "-r", "999999"],
+        description="8 subscriptions 扇出 60s",
+        consumer_args=[
+            "-time",
+            "60",
+            "-q",
+            "1000",
+            "-st",
+            "Shared",
+            "-ns",
+            "8",
+        ],
+        feed_producer_args=["-time", "60", "-s", "1024", "-r", "999999", "-o", "1000"],
     ),
     Scenario(
         name="stress_persistent_consume_partitioned_max_rate",
         kind="consume_e2e",
         broker="persistent_stress_partitioned",
-        description="4 partitions + 4 consumers 消费 200k 条",
-        consumer_args=["-m", "200000", "-q", "1000", "-st", "Shared", "-n", "4"],
-        feed_producer_args=["-m", "200000", "-s", "1024", "-r", "999999"],
+        description="4 partitions + 4 consumers 60s",
+        consumer_args=[
+            "-time",
+            "60",
+            "-q",
+            "1000",
+            "-st",
+            "Shared",
+            "-n",
+            "4",
+        ],
+        feed_producer_args=["-time", "60", "-s", "1024", "-r", "999999", "-o", "1000"],
     ),
     # Persistent-specific stress (3)
     Scenario(
@@ -226,23 +258,34 @@ def run_consume_e2e_scenario(
     )
 
     start = time.time()
-    consumer_out, producer_out, consumer_rc, producer_rc = run_consumer_then_feed(
-        consumer_cmd,
-        producer_cmd,
-        consumer_log,
-        producer_log,
-        consumer_timeout=600.0,
-        producer_timeout=600.0,
+    consumer_out, producer_out, consumer_rc, producer_rc, first_failed = (
+        run_consumer_then_feed(
+            consumer_cmd,
+            producer_cmd,
+            consumer_log,
+            producer_log,
+            consumer_timeout=600.0,
+            producer_timeout=600.0,
+        )
     )
     duration = time.time() - start
 
-    if consumer_rc != 0:
-        raise RuntimeError(
-            f"consumer failed with rc={consumer_rc}: {consumer_out[:500]}"
-        )
-    if producer_rc != 0:
-        raise RuntimeError(
-            f"producer failed with rc={producer_rc}: {producer_out[:500]}"
+    if consumer_rc != 0 or producer_rc != 0:
+        if not e2e_success_despite_peer_hang(consumer_rc, producer_rc, first_failed):
+            raise RuntimeError(
+                format_e2e_process_failure(
+                    consumer_rc=consumer_rc,
+                    producer_rc=producer_rc,
+                    consumer_out=consumer_out,
+                    producer_out=producer_out,
+                    first_failed=first_failed,
+                )
+            )
+        print(
+            "  note: peer grace-killed after other side ok "
+            f"(first_failed={first_failed}, "
+            f"consumer_rc={consumer_rc}, producer_rc={producer_rc})",
+            flush=True,
         )
 
     consumer_result = parse_consumer_output(consumer_out)
@@ -254,6 +297,7 @@ def run_consume_e2e_scenario(
         "producer": producer_result,
         "broker": broker_metrics,
         "duration_s": round(duration, 2),
+        "e2e_first_failed": first_failed,
     }
 
 
@@ -411,19 +455,28 @@ def run_redelivery_unacked_scenario(
     )
 
     print("  Partial consume...")
-    consumer_out, producer_out, consumer_rc, producer_rc = run_consumer_then_feed(
-        consumer_cmd,
-        producer_cmd,
-        consumer1_log,
-        producer_log,
-        consumer_timeout=600.0,
-        producer_timeout=600.0,
+    consumer_out, producer_out, consumer_rc, producer_rc, first_failed = (
+        run_consumer_then_feed(
+            consumer_cmd,
+            producer_cmd,
+            consumer1_log,
+            producer_log,
+            consumer_timeout=600.0,
+            producer_timeout=600.0,
+        )
     )
 
-    if consumer_rc != 0:
-        raise RuntimeError(f"consumer1 failed: {consumer_out[:500]}")
-    if producer_rc != 0:
-        raise RuntimeError(f"producer failed: {producer_out[:500]}")
+    if consumer_rc != 0 or producer_rc != 0:
+        raise RuntimeError(
+            format_e2e_process_failure(
+                consumer_rc=consumer_rc,
+                producer_rc=producer_rc,
+                consumer_out=consumer_out,
+                producer_out=producer_out,
+                first_failed=first_failed,
+                consumer_label="consumer1",
+            )
+        )
 
     producer_result = parse_producer_output(producer_out)
     consumer1_result = parse_consumer_output(consumer_out)

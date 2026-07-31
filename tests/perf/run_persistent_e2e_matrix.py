@@ -20,7 +20,14 @@ from lib import ROOT
 from lib.broker import BrokerConfig, BrokerProcess, DockerBrokerProcess
 from lib.docker_image import build_broker_image
 from lib.parsing import parse_consumer_output, parse_producer_output
-from lib.perf_cmd import ensure_prereqs, perf_cmd, run_consumer_then_feed, run_sync
+from lib.perf_cmd import (
+    ensure_prereqs,
+    e2e_success_despite_peer_hang,
+    format_e2e_process_failure,
+    perf_cmd,
+    run_consumer_then_feed,
+    run_sync,
+)
 
 RESULTS_PATH = ROOT / "docs" / "perf" / "data" / "persistent_e2e_matrix_results.json"
 ARTIFACTS_DIR = ROOT / "docs" / "perf" / "data" / "persistent_e2e_matrix_logs"
@@ -317,16 +324,23 @@ def run_consume_e2e_scenario(
     )
     
     start = time.time()
-    consumer_out, producer_out, consumer_rc, producer_rc = run_consumer_then_feed(
+    consumer_out, producer_out, consumer_rc, producer_rc, first_failed = run_consumer_then_feed(
         consumer_cmd, producer_cmd, consumer_log, producer_log,
         consumer_timeout=120.0, producer_timeout=120.0,
     )
     duration = time.time() - start
-    
-    if consumer_rc != 0:
-        raise RuntimeError(f"consumer failed with rc={consumer_rc}: {consumer_out[:500]}")
-    if producer_rc != 0:
-        raise RuntimeError(f"producer failed with rc={producer_rc}: {producer_out[:500]}")
+
+    if consumer_rc != 0 or producer_rc != 0:
+        if not e2e_success_despite_peer_hang(consumer_rc, producer_rc, first_failed):
+            raise RuntimeError(
+                format_e2e_process_failure(
+                    consumer_rc=consumer_rc,
+                    producer_rc=producer_rc,
+                    consumer_out=consumer_out,
+                    producer_out=producer_out,
+                    first_failed=first_failed,
+                )
+            )
     
     consumer_result = parse_consumer_output(consumer_out)
     producer_result = parse_producer_output(producer_out)

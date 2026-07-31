@@ -12,7 +12,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib import ROOT
 from lib.broker import BrokerConfig, BrokerProcess
 from lib.parsing import parse_consumer_output, parse_producer_output
-from lib.perf_cmd import ensure_prereqs, perf_cmd, run_consumer_then_feed, run_sync
+from lib.perf_cmd import (
+    ensure_prereqs,
+    format_e2e_process_failure,
+    perf_cmd,
+    run_consumer_then_feed,
+    run_sync,
+)
 
 RESULTS_PATH = ROOT / "docs" / "perf" / "data" / "non_persistent_e2e_matrix_results.json"
 ARTIFACTS_DIR = ROOT / "docs" / "perf" / "data" / "non_persistent_e2e_matrix_logs"
@@ -399,15 +405,21 @@ def main() -> int:
                             topic,
                             scenario_dir / "feed_producer.hdr",
                         )
-                        consumer_text, producer_text, consumer_rc, producer_rc = (
+                        consumer_text, producer_text, consumer_rc, producer_rc, first_failed = (
                             run_consumer_then_feed(
                                 consumer_cmd, producer_cmd, consumer_log, producer_log
                             )
                         )
-                        if producer_rc != 0:
-                            raise RuntimeError(f"producer failed:\n{producer_text}")
-                        if consumer_rc != 0:
-                            raise RuntimeError(f"consumer failed:\n{consumer_text}")
+                        if consumer_rc != 0 or producer_rc != 0:
+                            raise RuntimeError(
+                                format_e2e_process_failure(
+                                    consumer_rc=consumer_rc,
+                                    producer_rc=producer_rc,
+                                    consumer_out=consumer_text,
+                                    producer_out=producer_text,
+                                    first_failed=first_failed,
+                                )
+                            )
                         result_entry["producer_metrics"] = parse_producer_output(producer_text)
                         result_entry["metrics"] = parse_consumer_output(consumer_text)
                     else:

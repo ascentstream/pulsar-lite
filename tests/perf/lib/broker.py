@@ -92,13 +92,45 @@ def _config_text(config: BrokerConfig, db_path: str) -> str:
 
 
 class BrokerProcess:
-    def __init__(self, config: BrokerConfig):
+    def __init__(
+        self,
+        config: BrokerConfig,
+        cgroup_memory: str | None = None,
+        cgroup_cpus: str | None = None,
+    ):
+        """Local broker process.
+
+        cgroup_memory: MemoryMax for systemd-run --user --scope (e.g. "4294967296"
+            or "4G"); MemorySwapMax is pinned to 0 to match docker --memory-swap.
+            Requires user-scope cgroup delegation (memory controller).
+        cgroup_cpus: CPU affinity via taskset -c (e.g. "0-3"), equivalent to
+            docker --cpuset-cpus (same sched_setaffinity mechanism).
+        """
         self.config = config
+        self.cgroup_memory = cgroup_memory
+        self.cgroup_cpus = cgroup_cpus
         self.proc: subprocess.Popen[str] | None = None
         self.broker_pid: int | None = None
         self.workdir: Path | None = None
         self.log_path: Path | None = None
         self.sampler: BrokerSampler | None = None
+
+    def _broker_cmd(self) -> list[str]:
+        cmd: list[str] = []
+        if self.cgroup_memory:
+            cmd += [
+                "systemd-run",
+                "--user",
+                "--scope",
+                "-p",
+                f"MemoryMax={self.cgroup_memory}",
+                "-p",
+                "MemorySwapMax=0",
+            ]
+        if self.cgroup_cpus:
+            cmd += ["taskset", "-c", self.cgroup_cpus]
+        cmd.append(str(BROKER_BIN))
+        return cmd
 
     def start(self) -> None:
         temp_dir = Path(
@@ -111,7 +143,7 @@ class BrokerProcess:
         self.log_path = temp_dir / "broker.log"
         log_file = self.log_path.open("w", encoding="utf-8")
         self.proc = subprocess.Popen(
-            [str(BROKER_BIN)],
+            self._broker_cmd(),
             cwd=temp_dir,
             stdout=log_file,
             stderr=subprocess.STDOUT,
@@ -178,7 +210,7 @@ class BrokerProcess:
             # Reopen log file for appending
             log_file = self.log_path.open("a", encoding="utf-8")
             self.proc = subprocess.Popen(
-                [str(BROKER_BIN)],
+                self._broker_cmd(),
                 cwd=self.workdir,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
@@ -209,6 +241,38 @@ class BrokerProcess:
             "broker_peak_cpu_pct": round(max(cpu_values), 3),
             "broker_peak_rss_mb": round(max(rss_values), 3),
         }
+
+
+class ExternalBrokerProcess(BrokerProcess):
+    """Adapter for an already-running external broker (e.g. Apache Pulsar
+    standalone started manually with cgroup limits).
+
+    No lifecycle management and no sampler: the harness only builds perf
+    commands against ``broker.config.port`` and merges empty metrics.
+    Scenarios that restart the broker (restart_replay, redelivery_unacked)
+    are not supported.
+    """
+
+    def __init__(self, config: BrokerConfig):
+        super().__init__(config)
+        self.log_path = None
+        self.sampler = None
+
+    def start(self) -> None:
+        # External broker must already be listening; broker_pid stays None so
+        # the harness skips perf sampling.
+        self.broker_pid = None
+        self._wait_for_port()
+
+    def stop(self, cleanup: bool = False) -> dict[str, float]:
+        return self.metrics()
+
+    def restart(self, preserve_storage: bool = False) -> None:
+        raise NotImplementedError(
+            "external broker backend cannot restart the broker; "
+            "use scenarios that do not restart "
+            "(produce / consume_e2e / backlog_drain)"
+        )
 
 
 class DockerBrokerProcess(BrokerProcess):

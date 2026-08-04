@@ -17,7 +17,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib import ROOT
-from lib.broker import BrokerConfig, BrokerProcess, DockerBrokerProcess
+from lib.broker import BrokerConfig, BrokerProcess, DockerBrokerProcess, ExternalBrokerProcess
 from lib.docker_image import build_broker_image
 from lib.observability import PerfCollector
 from lib.parsing import parse_consumer_output, parse_producer_output
@@ -160,7 +160,19 @@ SCENARIOS: list[Scenario] = [
         ],
         feed_producer_args=["-time", "60", "-s", "1024", "-r", "999999", "-o", "1000"],
     ),
-    # Persistent-specific stress (3)
+    # Persistent-specific stress (4)
+    Scenario(
+        name="stress_persistent_consume_solo_10gb",
+        kind="backlog_drain",
+        broker="persistent_stress",
+        description="10GiB backlog（10485760×1KiB）→ 单 consumer 独立消费测速（produce 完成后才消费）",
+        producer_args=[
+            "-m", "10485760", "-r", "999999", "-s", "1024", "-db", "-o", "1000",
+        ],
+        consumer_args=[
+            "-m", "10485760", "-q", "1000", "-st", "Shared", "-sp", "Earliest",
+        ],
+    ),
     Scenario(
         name="stress_persistent_backlog_drain",
         kind="backlog_drain",
@@ -321,7 +333,7 @@ def run_backlog_drain_scenario(
     )
 
     print("  Producing backlog...")
-    producer_proc = run_sync(producer_cmd, producer_log, timeout=600.0)
+    producer_proc = run_sync(producer_cmd, producer_log, timeout=1800.0)
     if producer_proc.returncode != 0:
         raise RuntimeError(f"producer failed: {producer_log.read_text()[:500]}")
 
@@ -341,7 +353,7 @@ def run_backlog_drain_scenario(
 
     print("  Draining backlog...")
     start = time.time()
-    consumer_proc = run_sync(consumer_cmd, consumer_log, timeout=600.0)
+    consumer_proc = run_sync(consumer_cmd, consumer_log, timeout=1800.0)
     drain_duration = time.time() - start
 
     if consumer_proc.returncode != 0:
@@ -356,6 +368,7 @@ def run_backlog_drain_scenario(
         "broker": broker_metrics,
         "drain_duration_s": round(drain_duration, 2),
         "drain_throughput_msg_s": round(consumer_result["records"] / drain_duration, 2),
+        "drain_throughput_mbit_s": round(consumer_result["throughput_mbit_s"], 2),
     }
 
 
@@ -567,10 +580,17 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument(
         "--broker-backend",
-        choices=["local", "docker"],
+        choices=["local", "docker", "external"],
         default="local",
         help="Broker launch backend. local uses rust/target/release/pulsar-lite; "
-        "docker builds and runs a constrained broker container.",
+        "docker builds and runs a constrained broker container; "
+        "external targets an already-running broker via --external-url "
+        "(e.g. Apache Pulsar standalone); no broker lifecycle management.",
+    )
+    parser.add_argument(
+        "--external-url",
+        default="pulsar://127.0.0.1:6650",
+        help="Service URL of the external broker for --broker-backend=external.",
     )
     parser.add_argument(
         "--docker-cpuset",
@@ -581,6 +601,19 @@ def main(argv: list[str]) -> int:
         "--docker-memory",
         default="4g",
         help="Memory limit passed to docker run --memory when --broker-backend=docker.",
+    )
+    parser.add_argument(
+        "--local-cgroup-memory",
+        default=None,
+        help="local backend: MemoryMax via systemd-run --user --scope "
+        "(e.g. 4294967296 or 4G; MemorySwapMax=0 pinned). Requires user-scope "
+        "cgroup delegation for the memory controller.",
+    )
+    parser.add_argument(
+        "--local-cgroup-cpus",
+        default=None,
+        help="local backend: broker CPU affinity via taskset -c (e.g. 0-3), "
+        "equivalent to docker --cpuset-cpus.",
     )
     parser.add_argument(
         "--skip-docker-build",
@@ -642,8 +675,23 @@ def main(argv: list[str]) -> int:
                 cpuset_cpus=args.docker_cpuset,
                 memory=args.docker_memory,
             )
+        elif args.broker_backend == "external":
+            from urllib.parse import urlparse
+
+            parsed = urlparse(args.external_url)
+            if parsed.scheme != "pulsar" or not parsed.hostname:
+                raise ValueError(
+                    f"--external-url must be pulsar://host:port, got {args.external_url!r}"
+                )
+            broker = ExternalBrokerProcess(
+                BrokerConfig("external", parsed.port or 6650, 0)
+            )
         else:
-            broker = BrokerProcess(broker_config)
+            broker = BrokerProcess(
+                broker_config,
+                cgroup_memory=args.local_cgroup_memory,
+                cgroup_cpus=args.local_cgroup_cpus,
+            )
         broker.start()
 
         try:
@@ -738,18 +786,20 @@ def main(argv: list[str]) -> int:
                     # Drop /tmp DB+entrylog after each scenario so storage does not accumulate.
                     # restart_replay / redelivery manage their own in-scenario preserve restart;
                     # once the scenario finishes we always wipe before the next one.
-                    try:
-                        broker.restart(preserve_storage=False)
-                        print(
-                            "  storage cleaned for next scenario "
-                            f"(workdir={broker.workdir})",
-                            file=sys.stderr,
-                        )
-                    except Exception as cleanup_err:
-                        print(
-                            f"  WARNING: failed to reset broker storage: {cleanup_err}",
-                            file=sys.stderr,
-                        )
+                    # external backend owns its storage; nothing to reset.
+                    if args.broker_backend != "external":
+                        try:
+                            broker.restart(preserve_storage=False)
+                            print(
+                                "  storage cleaned for next scenario "
+                                f"(workdir={broker.workdir})",
+                                file=sys.stderr,
+                            )
+                        except Exception as cleanup_err:
+                            print(
+                                f"  WARNING: failed to reset broker storage: {cleanup_err}",
+                                file=sys.stderr,
+                            )
 
         finally:
             broker.stop(cleanup=True)

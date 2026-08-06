@@ -21,6 +21,8 @@ thiserror = "1.0"
 tokio = { version = "1.35", features = ["full"] }
 anyhow = "1.0"
 log = "0.4"
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
+tikv-jemalloc-sys = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
 
 [package]
 name = "pulsar-lite"
@@ -81,6 +83,10 @@ uuid = { version = "1.6", features = ["v4"] }
 # 流处理
 tokio-stream = "0.1"
 futures = "0.3"
+
+# 内存分配器：jemalloc（缓解 glibc arena 内存滞留导致的 RSS 高水位）
+tikv-jemallocator.workspace = true
+tikv-jemalloc-sys.workspace = true
 
 [build-dependencies]
 prost-build = "0.13"

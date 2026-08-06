@@ -19,6 +19,10 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Duration;
 use tokio_util::codec::Framed;
+use tikv_jemallocator::Jemalloc;
+
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 #[derive(Debug, Parser)]
 #[command(name = "pulsar-lite")]

@@ -593,6 +593,13 @@ def main(argv: list[str]) -> int:
         help="Service URL of the external broker for --broker-backend=external.",
     )
     parser.add_argument(
+        "--external-unit",
+        default=None,
+        help="systemd unit name of the external broker (e.g. pulsar-standalone or "
+        "pulsar-lite) to sample CPU/memory via 'systemctl show <unit> -p MainPID' "
+        "+ /proc. Leave unset to disable broker metrics for external backends.",
+    )
+    parser.add_argument(
         "--docker-cpuset",
         default="0-3",
         help="CPU set passed to docker run --cpuset-cpus when --broker-backend=docker.",
@@ -684,7 +691,8 @@ def main(argv: list[str]) -> int:
                     f"--external-url must be pulsar://host:port, got {args.external_url!r}"
                 )
             broker = ExternalBrokerProcess(
-                BrokerConfig("external", parsed.port or 6650, 0)
+                BrokerConfig("external", parsed.port or 6650, 0),
+                unit=args.external_unit,
             )
         else:
             broker = BrokerProcess(
@@ -700,6 +708,10 @@ def main(argv: list[str]) -> int:
                 print(f"\n[{scenario.name}] {scenario.description}")
                 scenario_dir = run_artifacts / scenario.name
                 scenario_dir.mkdir(parents=True, exist_ok=True)
+                # Reset the broker sampler so metrics() / timeseries CSV cover
+                # only this scenario's window, not the whole suite run.
+                if broker.sampler:
+                    broker.sampler.reset()
                 # Start perf recording (must be after restart to capture the new PID)
                 perf_data_path = scenario_dir / "perf.data"
                 perf_collector: PerfCollector | None = None

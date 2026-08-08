@@ -5,7 +5,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .out_dir(&out_dir)
         .protoc_arg("--experimental_allow_proto3_optional")
         .compile_protos(
-            &["proto/PulsarApi.proto", "proto/MLDataFormats.proto"],
+            &["PulsarApi.proto", "MLDataFormats.proto"],
             &["proto"],
         )?;
 

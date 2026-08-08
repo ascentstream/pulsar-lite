@@ -6,6 +6,7 @@ members = [
     "storage/resources",
     "storage/managed-ledger",
     "storage/managed-ledger-rocksdb",
+    "proto",
 ]
 resolver = "2"
 
@@ -47,6 +48,7 @@ pulsar-lite-storage-metadata = { path = "storage/metadata" }
 pulsar-lite-storage-resources = { path ="storage/resources" }
 pulsar-lite-storage-managed-ledger = { path = "storage/managed-ledger" }
 pulsar-lite-storage-managed-ledger-rocksdb = { path = "storage/managed-ledger-rocksdb", optional = true }
+pulsar-lite-proto = { path  =  "proto" }
 
 # 异步运行时
 tokio = { version = "1.35", features = ["full"] }

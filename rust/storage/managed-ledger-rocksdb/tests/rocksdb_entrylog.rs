@@ -4,7 +4,6 @@ use pulsar_lite_storage_managed_ledger_rocksdb::test_support::{EntryLogStore, En
 use std::fs;
 use tempfile::tempdir;
 
-
 #[test]
 fn entrylog_appends_and_reads_entry_payload() {
     let dir = tempdir().unwrap();
@@ -296,4 +295,3 @@ fn entrylog_append_batch_then_single_append_continues_offsets() {
     assert_eq!(single.offset, batch[1].offset + batch[1].len);
     assert_eq!(store.read(&single).unwrap().payload, b"c");
 }
-

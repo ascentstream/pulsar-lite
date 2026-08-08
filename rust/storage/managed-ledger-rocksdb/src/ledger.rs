@@ -397,15 +397,15 @@ impl RocksDBManagedLedger {
 
     pub fn message_entries(&self) -> Result<Vec<StoredMessage>> {
         let info = self.info.load();
-        let Some(from) = info
-            .ledgers
-            .iter()
-            .find(|l| l.entries > 0)
-            .map(|l| ManagedLedgerPosition {
-                ledger_id: l.ledger_id,
-                entry_id: 0,
-                partition: -1,
-            })
+        let Some(from) =
+            info.ledgers
+                .iter()
+                .find(|l| l.entries > 0)
+                .map(|l| ManagedLedgerPosition {
+                    ledger_id: l.ledger_id,
+                    entry_id: 0,
+                    partition: -1,
+                })
         else {
             return Ok(Vec::new());
         };

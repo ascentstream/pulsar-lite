@@ -46,8 +46,11 @@ pub mod test_support {
         partition: i32,
         payload: &[u8],
     ) -> Result<ManagedLedgerPosition> {
-        let mut positions =
-            ledger.add_entries_with_partition_and_metadata(&[(partition, &[] as &[u8], payload)])?;
+        let mut positions = ledger.add_entries_with_partition_and_metadata(&[(
+            partition,
+            &[] as &[u8],
+            payload,
+        )])?;
         positions
             .pop()
             .ok_or_else(|| anyhow::anyhow!("add_entries returned empty positions"))

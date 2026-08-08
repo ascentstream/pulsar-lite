@@ -137,7 +137,9 @@ fn append_after_latest_cursor_is_visible_to_reads() {
         "empty topic with Latest cursor should have no backlog"
     );
 
-    let message_id = storage.append_message(topic, -1, b"hello-after-subscribe").unwrap();
+    let message_id = storage
+        .append_message(topic, -1, b"hello-after-subscribe")
+        .unwrap();
 
     let first = storage
         .first_unacked_position(topic, subscription)
@@ -146,9 +148,7 @@ fn append_after_latest_cursor_is_visible_to_reads() {
     assert_eq!(first.ledger_id, message_id.ledger);
     assert_eq!(first.entry_id, message_id.entry);
 
-    let entries = storage
-        .read_entries_from(topic, &first, 1)
-        .unwrap();
+    let entries = storage.read_entries_from(topic, &first, 1).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].message_id, message_id);
     assert_eq!(entries[0].payload, b"hello-after-subscribe");

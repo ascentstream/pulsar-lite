@@ -3,10 +3,12 @@
 mod common;
 
 use common::*;
-use pulsar_lite_storage_managed_ledger::{ManagedLedger, ManagedLedgerConfig, ManagedLedgerFactory};
+use pulsar_lite_storage_managed_ledger::{
+    ManagedLedger, ManagedLedgerConfig, ManagedLedgerFactory,
+};
 use pulsar_lite_storage_managed_ledger_rocksdb::test_support::{
-    append_payload, append_with_partition, keys, RocksDBManagedLedger,
-    RocksDBManagedLedgerFactory, StoredEntryLocation, StoredManagedLedgerInfo,
+    append_payload, append_with_partition, keys, RocksDBManagedLedger, RocksDBManagedLedgerFactory,
+    StoredEntryLocation, StoredManagedLedgerInfo,
 };
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -432,7 +434,8 @@ fn message_ledger_append_updates_runtime_last_position() {
     let db = open_test_db(&db_path);
     let entry_log = open_test_entry_log(&db_path);
 
-    let ledger = RocksDBManagedLedger::open("ledger-a", Arc::clone(&db), Arc::clone(&entry_log)).unwrap();
+    let ledger =
+        RocksDBManagedLedger::open("ledger-a", Arc::clone(&db), Arc::clone(&entry_log)).unwrap();
 
     let first = append_with_partition(&ledger, 7, b"first").unwrap();
 
@@ -442,7 +445,8 @@ fn message_ledger_append_updates_runtime_last_position() {
     assert_eq!(ledger.last_position().unwrap(), Some(first));
 
     // Consecutive append - advancing to the last position in the runtime.
-    let ledger = RocksDBManagedLedger::open("ledger-b", Arc::clone(&db), Arc::clone(&entry_log)).unwrap();
+    let ledger =
+        RocksDBManagedLedger::open("ledger-b", Arc::clone(&db), Arc::clone(&entry_log)).unwrap();
 
     let first = append_with_partition(&ledger, 7, b"first").unwrap();
     let second = append_with_partition(&ledger, 7, b"second").unwrap();

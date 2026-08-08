@@ -36,8 +36,7 @@ fn managed_ledger_info_value_is_protobuf_encoded() {
 
     {
         let entry_log = open_test_entry_log(&db_path);
-        let ledger =
-            RocksDBManagedLedger::open("ledger-a", Arc::clone(&db), entry_log).unwrap();
+        let ledger = RocksDBManagedLedger::open("ledger-a", Arc::clone(&db), entry_log).unwrap();
         append_payload(&ledger, b"first").unwrap();
     }
 

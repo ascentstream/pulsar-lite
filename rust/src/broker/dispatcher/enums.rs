@@ -8,7 +8,7 @@ use super::{ExclusiveDispatcher, FailoverDispatcher, KeySharedDispatcher, Shared
 use crate::broker::dispatcher::redelivery_controller::RedeliveryEntry;
 use crate::broker::service::topic::{KeySharedPolicy, SubscriptionType};
 use crate::broker::service::{Consumer, SharedStorage};
-use crate::storage::{ManagedLedgerPosition, MessageId};
+use pulsar_lite_storage_managed_ledger::{ManagedLedgerPosition, MessageId};
 use std::sync::Arc;
 
 /// Dispatcher enum - holds the concrete dispatcher implementation

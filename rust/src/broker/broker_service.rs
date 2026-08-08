@@ -8,7 +8,7 @@ use crate::broker::service::topic::{
     PartitionedTopic, PartitionedTopicStats, SharedPartitionedTopic, Topic, TopicPublishRate,
     TopicStats,
 };
-use crate::storage::Storage;
+use pulsar_lite_storage::Storage;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};

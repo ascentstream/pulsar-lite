@@ -3,12 +3,12 @@
  * Handles connection-level commands: Connect, Ping/Pong
  */
 
-use crate::protocol::codec::{
+use futures::SinkExt;
+use pulsar_lite_proto::codec::{
     proto::pulsar::{BaseCommand, CommandPong},
     PulsarFrameCodec,
 };
-use crate::protocol::ServerCommand;
-use futures::SinkExt;
+use pulsar_lite_proto::ServerCommand;
 use tokio_util::codec::Framed;
 
 /// Handle Connect command

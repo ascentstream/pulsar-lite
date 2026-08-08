@@ -10,7 +10,7 @@ use super::rewind_read_position;
 use crate::broker::dispatcher::Dispatcher;
 use crate::broker::service::topic::SubscriptionType;
 use crate::broker::service::{Consumer, SharedStorage};
-use crate::storage::ManagedLedgerPosition;
+use pulsar_lite_storage_managed_ledger::ManagedLedgerPosition;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -325,7 +325,7 @@ impl Dispatcher for FailoverDispatcher {
 mod tests {
     use super::*;
     use crate::broker::service::topic::Subscription;
-    use crate::storage::Storage;
+    use pulsar_lite_storage::Storage;
     use std::path::Path;
     use tokio::sync::{mpsc, Mutex, RwLock};
 

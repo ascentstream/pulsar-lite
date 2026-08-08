@@ -1,6 +1,6 @@
 use crate::broker::service::topic::SubscriptionType;
 use crate::broker::service::Consumer;
-use crate::storage::{MessageId, NonPersistentEntry};
+use pulsar_lite_storage_managed_ledger::{MessageId, NonPersistentEntry};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,

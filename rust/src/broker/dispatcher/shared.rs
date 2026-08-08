@@ -9,7 +9,7 @@ use super::redelivery_controller::{RedeliveryController, RedeliveryEntry};
 use crate::broker::dispatcher::Dispatcher;
 use crate::broker::service::topic::SubscriptionType;
 use crate::broker::service::{Consumer, SharedStorage};
-use crate::storage::{ManagedLedgerPosition, MessageId};
+use pulsar_lite_storage_managed_ledger::{ManagedLedgerPosition, MessageId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -729,7 +729,8 @@ impl Dispatcher for SharedDispatcher {
 mod tests {
     use super::*;
     use crate::broker::service::topic::Subscription;
-    use crate::storage::{CursorInitOptions, InitialPosition, Storage};
+    use pulsar_lite_storage::Storage;
+    use pulsar_lite_storage_managed_ledger::{CursorInitOptions, InitialPosition};
     use std::path::Path;
     use tokio::sync::{mpsc, Mutex, RwLock};
 

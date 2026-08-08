@@ -337,8 +337,8 @@ impl PulsarFrameCodec {
 
 #[cfg(test)]
 mod tests {
-    use crate::codec::proto::pulsar::{BaseCommand, CompressionType, KeyValue, MessageMetadata};
     use super::*;
+    use crate::codec::proto::pulsar::{BaseCommand, CompressionType, KeyValue, MessageMetadata};
     use crate::command::ServerCommand;
     use bytes::Bytes;
     use prost::Message;

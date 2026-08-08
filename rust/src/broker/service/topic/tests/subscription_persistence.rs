@@ -1,6 +1,7 @@
 use crate::broker::service::topic::{Subscription, SubscriptionType};
 use crate::broker::service::{Consumer, PendingMessage, SharedStorage};
-use crate::storage::{CursorInitOptions, InitialPosition, Storage};
+use pulsar_lite_storage::Storage;
+use pulsar_lite_storage_managed_ledger::{CursorInitOptions, InitialPosition};
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -371,8 +372,8 @@ async fn persistent_seek_rewinds_dispatch_to_target_message() {
 }
 
 fn metadata_with_publish_time(publish_time: u64) -> Vec<u8> {
-    use crate::protocol::codec::proto::pulsar::MessageMetadata;
     use prost::Message;
+    use pulsar_lite_proto::codec::proto::pulsar::MessageMetadata;
     MessageMetadata {
         publish_time,
         ..Default::default()

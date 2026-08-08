@@ -1,6 +1,6 @@
 use crate::broker::service::topic::{PartitionedTopic, Topic};
 use crate::broker::service::{Producer, SharedStorage};
-use crate::storage::Storage;
+use pulsar_lite_storage::Storage;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};

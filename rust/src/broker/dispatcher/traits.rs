@@ -6,7 +6,7 @@
 
 use crate::broker::service::topic::SubscriptionType;
 use crate::broker::service::{Consumer, SharedStorage};
-use crate::storage::ManagedLedgerPosition;
+use pulsar_lite_storage_managed_ledger::ManagedLedgerPosition;
 use std::future::Future;
 use std::sync::Arc;
 

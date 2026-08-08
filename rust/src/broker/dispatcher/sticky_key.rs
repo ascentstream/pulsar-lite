@@ -1,5 +1,5 @@
-use crate::protocol::codec::proto::pulsar::MessageMetadata;
 use prost::Message;
+use pulsar_lite_proto::codec::proto::pulsar::MessageMetadata;
 
 const RANGE_SIZE: u32 = 2 << 15;
 

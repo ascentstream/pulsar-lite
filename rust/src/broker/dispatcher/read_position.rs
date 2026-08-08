@@ -1,5 +1,5 @@
 use crate::broker::service::SharedStorage;
-use crate::storage::{ManagedLedgerPosition, MessageId};
+use pulsar_lite_storage_managed_ledger::{ManagedLedgerPosition, MessageId};
 use std::sync::RwLock;
 
 pub type DispatchError = Box<dyn std::error::Error + Send + Sync>;

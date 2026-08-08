@@ -6,9 +6,9 @@
 use crate::broker::broker_service::{SharedBrokerService, TopicRef};
 use crate::broker::service::topic::TopicRuntimeMode;
 use crate::broker::service::Producer;
-use crate::protocol::codec::{proto::pulsar::BaseCommand, PulsarFrame, PulsarFrameCodec};
-use crate::protocol::ServerCommand;
 use futures::SinkExt;
+use pulsar_lite_proto::codec::{proto::pulsar::BaseCommand, PulsarFrame, PulsarFrameCodec};
+use pulsar_lite_proto::ServerCommand;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::codec::Framed;
@@ -97,7 +97,7 @@ where
 pub struct PublishedSend {
     pub producer_id: u64,
     pub sequence_id: u64,
-    pub message_id: crate::storage::MessageId,
+    pub message_id: pulsar_lite_storage_managed_ledger::MessageId,
 }
 
 /// Publish a Send command (storage + dispatch) without writing SendReceipt.

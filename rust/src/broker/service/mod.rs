@@ -4,7 +4,7 @@
  * Inspired by Apache Pulsar's service structure
  */
 
-use crate::storage::Storage;
+use pulsar_lite_storage::Storage;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 

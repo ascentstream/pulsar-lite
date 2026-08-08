@@ -1,5 +1,5 @@
 use crate::broker::service::SharedStorage;
-use crate::storage::ManagedLedgerPosition;
+use pulsar_lite_storage_managed_ledger::ManagedLedgerPosition;
 
 /// Compute the read position a SingleActive dispatcher should rewind to when
 /// the active consumer disconnects.

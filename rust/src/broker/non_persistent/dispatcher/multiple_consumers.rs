@@ -1,6 +1,6 @@
 use crate::broker::service::topic::SubscriptionType;
 use crate::broker::service::Consumer;
-use crate::storage::{MessageId, NonPersistentEntry};
+use pulsar_lite_storage_managed_ledger::{MessageId, NonPersistentEntry};
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -184,8 +184,9 @@ mod tests {
     use super::*;
     use crate::broker::service::topic::Subscription;
     use crate::broker::service::SharedStorage;
-    use crate::storage::{NonPersistentEntry, Storage};
     use bytes::Bytes;
+    use pulsar_lite_storage::Storage;
+    use pulsar_lite_storage_managed_ledger::NonPersistentEntry;
     use std::path::Path;
     use std::sync::Arc;
     use std::time::Instant;

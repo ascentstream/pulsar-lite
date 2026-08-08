@@ -10,10 +10,10 @@ use crate::broker::service::topic::{
 };
 use crate::broker::service::ConnectionWriteState;
 use crate::broker::service::Consumer;
-use crate::protocol::codec::{proto::pulsar::BaseCommand, PulsarFrameCodec};
-use crate::protocol::ServerCommand;
-use crate::storage::{CursorInitOptions, InitialPosition, MessageId};
 use futures::SinkExt;
+use pulsar_lite_proto::codec::{proto::pulsar::BaseCommand, PulsarFrameCodec};
+use pulsar_lite_proto::ServerCommand;
+use pulsar_lite_storage_managed_ledger::{CursorInitOptions, InitialPosition, MessageId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -585,13 +585,13 @@ mod tests {
     use crate::broker::broker_service::{BrokerService, TopicRef};
     use crate::broker::service::topic::{KeySharedMode, TopicRuntimeMode};
     use crate::broker::service::SharedStorage;
-    use crate::protocol::codec::proto::pulsar::{
+    use futures::StreamExt;
+    use prost::Message;
+    use pulsar_lite_proto::codec::proto::pulsar::{
         base_command, CommandAck, CommandSubscribe, IntRange, KeySharedMeta, KeyValue,
         MessageIdData,
     };
-    use crate::storage::Storage;
-    use futures::StreamExt;
-    use prost::Message;
+    use pulsar_lite_storage::Storage;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::duplex;
     use tokio::sync::{Mutex, RwLock};

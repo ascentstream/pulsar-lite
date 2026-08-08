@@ -1,6 +1,7 @@
 use crate::broker::service::SharedStorage;
-use crate::storage::{CursorInitOptions, CursorOpenResult, MessageId, Storage};
 use bytes::Bytes;
+use pulsar_lite_storage::Storage;
+use pulsar_lite_storage_managed_ledger::{CursorInitOptions, CursorOpenResult, MessageId};
 
 #[derive(Debug, Clone)]
 pub(crate) struct PersistentTopicRuntime {

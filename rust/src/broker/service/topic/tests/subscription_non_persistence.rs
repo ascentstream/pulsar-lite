@@ -2,9 +2,9 @@ use crate::broker::service::topic::{
     KeySharedMode, KeySharedPolicy, Subscription, SubscriptionRuntimeMode, SubscriptionType,
 };
 use crate::broker::service::{Consumer, PendingMessage, SharedStorage};
-use crate::storage::MessageId;
-use crate::storage::NonPersistentEntry;
-use crate::storage::Storage;
+use pulsar_lite_storage::Storage;
+use pulsar_lite_storage_managed_ledger::MessageId;
+use pulsar_lite_storage_managed_ledger::NonPersistentEntry;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;

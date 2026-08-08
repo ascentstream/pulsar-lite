@@ -2,6 +2,8 @@ use crate::backend::ManagedLedgerStore;
 use crate::config::{ManagedLedgerBackendConfig, StorageConfig};
 use crate::error::StorageResult;
 use log::{debug, info};
+use prost::Message;
+use pulsar_lite_proto::codec::proto::pulsar::MessageMetadata;
 use pulsar_lite_storage_managed_ledger::{
     CursorInitOptions, CursorOpenResult, ManagedLedgerPosition, ManagedLedgerStorage, MessageId,
     StoredMessage,
@@ -157,6 +159,39 @@ impl Storage {
     ) -> StorageResult<()> {
         self.managed_ledger
             .seek_cursor(topic, subscription, message_id, shared)
+    }
+
+    pub fn decode_publish_time(metadata: &[u8]) -> Option<u64> {
+        if metadata.is_empty() {
+            return None;
+        }
+        MessageMetadata::decode(metadata)
+            .ok()
+            .map(|m| m.publish_time)
+    }
+
+    pub fn find_message_id_by_publish_time(
+        &self,
+        topic: &str,
+        publish_time: u64,
+    ) -> StorageResult<Option<MessageId>> {
+        let entries = self.get_message_entries(topic);
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let mut last_earlier: Option<usize> = None;
+        for (i, entry) in entries.iter().enumerate() {
+            match Self::decode_publish_time(&entry.metadata) {
+                Some(pt) if pt < publish_time => last_earlier = Some(i),
+                Some(_) => break,
+                None => {}
+            }
+        }
+        let target = match last_earlier {
+            None => Some(entries[0].message_id.clone()),
+            Some(i) => entries.get(i + 1).map(|e| e.message_id.clone()),
+        };
+        Ok(target)
     }
 
     pub fn first_unacked_position(

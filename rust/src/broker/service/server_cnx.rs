@@ -18,11 +18,39 @@ use super::{ConnectionWriteState, Consumer, Producer, SharedStorage};
 use crate::broker::broker_service::SharedBrokerService;
 use crate::broker::handler;
 use crate::broker::service::topic::TopicPublishRateExceeded;
-use crate::protocol::codec::{
+use pulsar_lite_proto::codec::{
     proto::pulsar::{base_command, BaseCommand, ProtocolVersion, ServerError},
     PulsarFrame, PulsarFrameCodec,
 };
-use crate::protocol::ServerCommand;
+use pulsar_lite_proto::ServerCommand;
+
+/// Local newtype so the orphan rule accepts the foreign-trait impl: the trait
+/// parameter is now the local type itself (uncovered), not a tuple-wrapped one.
+pub struct ConsumerMessage(pub u64, pub PendingMessage);
+
+/// Adapter impl: the protocol crate only knows raw encode primitives, the
+/// business message type (PendingMessage) lives here in the broker crate.
+impl tokio_util::codec::Encoder<ConsumerMessage> for PulsarFrameCodec {
+    type Error = std::io::Error;
+
+    fn encode(
+        &mut self,
+        item: ConsumerMessage,
+        dst: &mut bytes::BytesMut,
+    ) -> Result<(), Self::Error> {
+        let ConsumerMessage(consumer_id, msg) = item;
+        self.encode_message(
+            consumer_id,
+            msg.message_id.ledger,
+            msg.message_id.entry,
+            msg.message_id.partition,
+            &msg.metadata,
+            &msg.payload,
+            msg.redelivery_count,
+            dst,
+        )
+    }
+}
 
 type CnxError = Box<dyn Error + Send + Sync>;
 type CnxResult<T> = Result<T, CnxError>;
@@ -81,7 +109,7 @@ const DEFAULT_MAX_PERSISTENT_IN_FLIGHT: usize = 1000;
 struct PersistentSendOutcome {
     producer_id: u64,
     sequence_id: u64,
-    result: Result<crate::storage::MessageId, String>,
+    result: Result<pulsar_lite_storage_managed_ledger::MessageId, String>,
 }
 
 /// Runtime context for a single broker connection.
@@ -157,14 +185,14 @@ where
             .observe_buffered_bytes(self.framed.write_buffer().len());
     }
 
-    async fn write_message_batch(&mut self, batch: Vec<(u64, PendingMessage)>) -> CnxResult<()> {
+    async fn write_message_batch(&mut self, batch: Vec<ConsumerMessage>) -> CnxResult<()> {
         for item in batch {
             self.sync_connection_writable_from_framed_buffer();
             self.framed.feed(item).await.map_err(to_cnx_error)?;
             self.sync_connection_writable_from_framed_buffer();
         }
 
-        futures::sink::SinkExt::<(u64, PendingMessage)>::flush(&mut self.framed)
+        futures::sink::SinkExt::<ConsumerMessage>::flush(&mut self.framed)
             .await
             .map_err(to_cnx_error)?;
         self.sync_connection_writable_from_framed_buffer();
@@ -301,9 +329,9 @@ where
                 // into the write buffer with feed(), then flush once for a single
                 // TCP write.  This amortises syscall overhead across many messages.
                 Some((consumer_id, pending_msg)) = self.message_rx.recv() => {
-                    let mut batch = vec![(consumer_id, pending_msg)];
+                    let mut batch = vec![ConsumerMessage(consumer_id, pending_msg)];
                     while let Ok(next) = self.message_rx.try_recv() {
-                        batch.push(next);
+                        batch.push(ConsumerMessage(next.0, next.1));
                         if batch.len() >= 128 {
                             break;
                         }
@@ -379,9 +407,9 @@ where
                 // into the write buffer with feed(), then flush once for a single
                 // TCP write.  This amortises syscall overhead across many messages.
                 Some((consumer_id, pending_msg)) = self.message_rx.recv() => {
-                    let mut batch = vec![(consumer_id, pending_msg)];
+                    let mut batch = vec![ConsumerMessage(consumer_id, pending_msg)];
                     while let Ok(next) = self.message_rx.try_recv() {
-                        batch.push(next);
+                        batch.push(ConsumerMessage(next.0, next.1));
                         if batch.len() >= 128 {
                             break;
                         }
@@ -1087,11 +1115,11 @@ mod tests {
     use super::*;
     use crate::broker::broker_service::{BrokerService, TopicRef};
     use crate::broker::service::{topic::TopicRuntimeMode, Producer};
-    use crate::protocol::codec::proto::pulsar::{
+    use bytes::Bytes;
+    use pulsar_lite_proto::codec::proto::pulsar::{
         base_command, BaseCommand, CommandConnect, CommandPing, CommandSend,
     };
-    use crate::storage::Storage;
-    use bytes::Bytes;
+    use pulsar_lite_storage::Storage;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::io::{duplex, DuplexStream};
@@ -1377,7 +1405,7 @@ mod tests {
         assert_eq!(send_error.sequence_id, 11);
         assert_eq!(
             send_error.error,
-            crate::protocol::codec::proto::pulsar::ServerError::NotAllowedError as i32
+            pulsar_lite_proto::codec::proto::pulsar::ServerError::NotAllowedError as i32
         );
         assert!(send_error.message.contains("Exceed maximum message size"));
     }

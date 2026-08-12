@@ -543,11 +543,22 @@ impl Topic {
         Ok(message_id)
     }
 
+    /// Fire-and-forget dispatch: never blocks the caller's connection task.
+    /// The dispatcher's merge-trigger (dispatch_in_progress + should_reschedule
+    /// in dispatcher/shared.rs) coalesces concurrent triggers, so spawning one
+    /// task per completion is safe: no lost wakeups, no duplicate dispatch.
+    pub fn spawn_dispatcher(topic: Arc<RwLock<Topic>>) {
+        tokio::spawn(async move {
+            let topic_guard = topic.read().await;
+            topic_guard.dispatch_to_subscriptions().await;
+        });
+    }
+    
     /// Dispatch messages to all subscriptions (Push mode - Apache Pulsar style)
     ///
     /// This should be called after publish_message() to push messages to consumers.
     /// It triggers the dispatcher for each subscription to deliver pending messages.
-    pub async fn dispatch_to_subscriptions(&mut self) {
+    pub async fn dispatch_to_subscriptions(&self) {
         let subscription_count = self.subscriptions.len();
         match self.runtime_mode {
             TopicRuntimeMode::Persistent => {

@@ -16,7 +16,7 @@ use tokio_util::codec::Framed;
 use super::consumer::PendingMessage;
 use super::{ConnectionWriteState, Consumer, Producer, SharedStorage};
 use crate::broker::broker_service::SharedBrokerService;
-use crate::broker::handler;
+use crate::broker::{Topic, handler};
 use crate::broker::service::topic::TopicPublishRateExceeded;
 use pulsar_lite_proto::codec::{
     proto::pulsar::{base_command, BaseCommand, ProtocolVersion, ServerError},
@@ -762,9 +762,7 @@ where
                     .await
                     .map_err(to_cnx_error)?;
                 if let Some(producer) = self.producers.get(&outcome.producer_id) {
-                    let topic = producer.get_topic();
-                    let mut topic_guard = topic.write().await;
-                    topic_guard.dispatch_to_subscriptions().await;
+                    Topic::spawn_dispatcher(producer.get_topic());
                 }
             }
             Err(message) => {

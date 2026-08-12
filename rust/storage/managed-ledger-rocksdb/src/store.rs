@@ -5,7 +5,7 @@ use super::keys;
 use super::write_queue::WriteQueue;
 use crate::cursor::first_position;
 use anyhow::{anyhow, Result};
-use rocksdb::{Options, DB};
+use rocksdb::{BlockBasedOptions, Cache, Options, DB};
 use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -110,6 +110,14 @@ impl RocksDbManagedLedgerStorage {
     pub fn open(path: &Path) -> Result<Self> {
         let mut options = Options::default();
         options.create_if_missing(true);
+        options.set_max_open_files(512);
+        let mut block_opts = BlockBasedOptions::default();
+        block_opts.set_block_cache(&Cache::new_lru_cache(256 * 1024 * 1024));
+        block_opts.set_cache_index_and_filter_blocks(true);
+        options.set_block_based_table_factory(&block_opts);
+        options.set_write_buffer_size(64 * 1024 * 1024);
+        options.set_max_write_buffer_number(2);
+        options.set_max_background_jobs(4);
         let db = Arc::new(DB::open(&options, path)?);
         let entry_log = Arc::new(EntryLogStore::open(path)?);
         let factory = RocksDBManagedLedgerFactory::new(db, entry_log);

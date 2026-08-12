@@ -56,7 +56,7 @@ type CnxError = Box<dyn Error + Send + Sync>;
 type CnxResult<T> = Result<T, CnxError>;
 
 #[cfg(feature = "rocksdb-storage")]
-use pulsar_lite_storage_managed_ledger_rocksdb::ConnAppendResult;
+use pulsar_lite_storage_managed_ledger_rocksdb::{ConnAppendResult, ConcurrentAppender};
 
 fn to_cnx_error(error: impl ToString) -> CnxError {
     Box::new(std::io::Error::other(error.to_string()))
@@ -160,6 +160,10 @@ where
     /// Cap for pipelined persistent Send tasks on this connection.
     #[cfg(feature = "rocksdb-storage")]
     max_persistent_in_flight: usize,
+    /// Write-queue handle cloned once at connection setup so the per-Send hot
+    /// path never takes Mutex<Storage> to obtain an appender.
+    #[cfg(feature = "rocksdb-storage")]
+    persistent_appender: Option<ConcurrentAppender>,
     /// Resume reading threshold (hysteresis = max_pending_publish_requests / 2).
     resume_threshold: usize,
     /// When true, the event loop skips framed.next(), equivalent to Netty auto-read = false.
@@ -214,6 +218,8 @@ where
         broker_service_url: String,
         channel_write_buffer_high_water_mark_bytes: usize,
         channel_write_buffer_low_water_mark_bytes: usize,
+        #[cfg(feature = "rocksdb-storage")]
+        persistent_appender: Option<ConcurrentAppender>,
     ) -> Self {
         let mut framed = Framed::new(socket, PulsarFrameCodec::new());
         framed.set_backpressure_boundary(channel_write_buffer_high_water_mark_bytes);
@@ -249,6 +255,8 @@ where
             max_pending_publish_requests,
             #[cfg(feature = "rocksdb-storage")]
             max_persistent_in_flight: DEFAULT_MAX_PERSISTENT_IN_FLIGHT,
+            #[cfg(feature = "rocksdb-storage")]
+            persistent_appender,
             resume_threshold: max_pending_publish_requests / 2,
             read_paused: false,
             max_message_size,
@@ -878,8 +886,8 @@ where
             let meta_len = frame.metadata.as_ref().map(|m| m.len()).unwrap_or(0);
             let payload_len = frame.payload.len();
 
-            let (topic_name, partition, storage) = {
-                let mut topic_guard = topic.write().await;
+            let (topic_name, partition) = {
+                let topic_guard = topic.read().await;
                 if let Err(error) =
                     topic_guard.validate_publish_rate_public(frame.metadata.as_ref(), payload_len)
                 {
@@ -897,20 +905,12 @@ where
                     }
                     return Err(to_cnx_error(error));
                 }
-                (
-                    topic_guard.name.clone(),
-                    topic_guard.partition,
-                    topic_guard.shared_storage(),
-                )
+                (topic_guard.name.clone(), topic_guard.partition)
             };
 
-            let appender = {
-                let guard = storage.lock().await;
-                guard
-                    .concurrent_appender()
-                    .map_err(|e| to_cnx_error(e.to_string()))?
-            };
-            if let Some(appender) = appender {
+            // Write-queue handle was cloned once at connection setup; the hot
+            // path never locks Mutex<Storage>.
+            if let Some(appender) = self.persistent_appender.clone() {
                 let meta_slice = frame.metadata.as_ref().map(|b| b.as_ref()).unwrap_or(&[]);
                 appender
                     .enqueue_for_connection(
@@ -1090,6 +1090,13 @@ pub async fn handle_connection(
         "conn-{}",
         CONNECTION_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
+    // Clone the write-queue handle once per connection (before storage is
+    // moved into ServerCnx) so the per-Send path never locks Mutex<Storage>.
+    #[cfg(feature = "rocksdb-storage")]
+    let persistent_appender = {
+        let guard = storage.lock().await;
+        guard.concurrent_appender().ok().flatten()
+    };
     let mut server_cnx = ServerCnx::new(
         socket,
         storage,
@@ -1104,6 +1111,8 @@ pub async fn handle_connection(
         broker_service_url,
         channel_write_buffer_high_water_mark_bytes,
         channel_write_buffer_low_water_mark_bytes,
+        #[cfg(feature = "rocksdb-storage")]
+        persistent_appender,
     );
     server_cnx.run().await
 }

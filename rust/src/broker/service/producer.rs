@@ -113,7 +113,7 @@ impl Producer {
 
             if is_persistent {
                 let (name, partition, persistent_runtime) = {
-                    let mut topic = self.topic.write().await;
+                    let topic = self.topic.read().await;
                     topic.validate_publish_rate_public(metadata.as_ref(), payload.len())?;
                     (
                         topic.name.clone(),

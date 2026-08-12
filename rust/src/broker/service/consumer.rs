@@ -357,6 +357,30 @@ impl Consumer {
         M: Into<Bytes>,
         P: Into<Bytes>,
     {
+        // [TEMP DIAG] count dispatches to consumers.
+        {
+            use std::io::Write;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let n = C.fetch_add(1, Ordering::Relaxed);
+            if n % 100_000 == 0 {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/data/dispatch_diag.txt")
+                {
+                    let _ = writeln!(
+                        f,
+                        "{},\tconsumer={},\tmsg={}:{}\tredelivery={}",
+                        n,
+                        self.consumer_id,
+                        message_id.ledger,
+                        message_id.entry,
+                        redelivery_count
+                    );
+                }
+            }
+        }
         let metadata = metadata.into();
         let payload = payload.into();
         let wire_size = pulsar_lite_proto::codec::estimate_message_parts_size(
@@ -684,6 +708,35 @@ impl Consumer {
         ack_type: AckCommandType,
         message_ids: Vec<MessageId>,
     ) -> Result<(), String> {
+        // [TEMP DIAG] count message_acked entries with batch size.
+        {
+            use std::io::Write;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let n = C.fetch_add(1, Ordering::Relaxed);
+            if n % 100 == 0 {
+                let (diag_sub_type, diag_is_persistent) = {
+                    let sub = self.subscription.read().await;
+                    (sub.get_sub_type(), sub.is_persistent())
+                };
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/data/msg_acked_diag.txt")
+                {
+                    let _ = writeln!(
+                        f,
+                        "{},\tconsumer={},\tids={},\tack_type={:?},\tsub_type={:?},\tpersistent={}",
+                        n,
+                        self.consumer_id,
+                        message_ids.len(),
+                        ack_type,
+                        diag_sub_type,
+                        diag_is_persistent
+                    );
+                }
+            }
+        }
         if message_ids.is_empty() {
             return Ok(());
         }
@@ -708,6 +761,8 @@ impl Consumer {
                     let Some((owner, tracked_message_id)) =
                         self.resolve_ack_owner(message_id).await
                     else {
+                        // [TEMP DIAG] ack dropped: no owner found.
+                        diag_ack_drop("no_owner", message_id);
                         log::warn!(
                             "Consumer {} attempted to ack message {}:{} without ownership; ignoring",
                             self.consumer_id,
@@ -718,6 +773,8 @@ impl Consumer {
                     };
 
                     if !owner.remove_pending_ack(&tracked_message_id).await {
+                        // [TEMP DIAG] ack dropped: pending-ack removal failed.
+                        diag_ack_drop("remove_failed", &tracked_message_id);
                         log::warn!(
                             "Consumer {} found owner {} for message {}:{} but pending ack removal failed; ignoring",
                             self.consumer_id,
@@ -805,6 +862,34 @@ impl Consumer {
         }
 
         None
+    }
+}
+
+/// [TEMP DIAG] append one line per 100k dropped acks to /data/ack_drop_diag.txt.
+fn diag_ack_drop(reason: &str, message_id: &MessageId) {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    if n % 100_000 == 0 {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/data/ack_drop_diag.txt")
+        {
+            let _ = writeln!(
+                f,
+                "{},\t{},\t{}:{}\tpartition={}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                reason,
+                message_id.ledger,
+                message_id.entry,
+                message_id.partition
+            );
+        }
     }
 }
 

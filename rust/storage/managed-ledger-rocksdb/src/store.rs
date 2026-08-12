@@ -362,6 +362,22 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         subscription: &str,
         message_id: MessageId,
     ) -> Result<()> {
+        // [TEMP DIAG] count ack entries reaching storage layer (inline).
+        {
+            use std::io::Write;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let n = C.fetch_add(1, Ordering::Relaxed);
+            if n % 100_000 == 0 {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/data/ack_enter_diag.txt")
+                {
+                    let _ = writeln!(f, "{},\tack_message,\t{}", n, n);
+                }
+            }
+        }
         self.with_cursor_lock(|| {
             let cursor_name = keys::encode_cursor_name(subscription);
             let ledger = self.topic_ledger(topic)?;
@@ -376,6 +392,22 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         subscription: &str,
         message_id: MessageId,
     ) -> Result<()> {
+        // [TEMP DIAG] count ack entries reaching storage layer (inline).
+        {
+            use std::io::Write;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let n = C.fetch_add(1, Ordering::Relaxed);
+            if n % 10_000 == 0 {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/data/ack_enter_diag.txt")
+                {
+                    let _ = writeln!(f, "{},\tack_message_shared,\t{}", n, n);
+                }
+            }
+        }
         self.with_cursor_lock(|| {
             let cursor_name = keys::encode_cursor_name(subscription);
             let ledger = self.topic_ledger(topic)?;

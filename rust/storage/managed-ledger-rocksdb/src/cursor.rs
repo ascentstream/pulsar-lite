@@ -43,6 +43,38 @@ impl RocksDBManagedCursor {
     }
 
     pub fn persist_state(&self) -> Result<()> {
+        // [TEMP DIAG] every 100k persists, append cursor state to a CSV file
+        // (bypasses the logging system entirely) to verify whether the
+        // individual-delete range set accumulates while mark_delete stalls.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static DIAG_COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = DIAG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n % 100_000 == 0 {
+            use std::io::Write;
+            let mark_delete = self
+                .state
+                .mark_delete
+                .as_ref()
+                .map(|p| format!("{}:{}", p.ledger_id, p.entry_id))
+                .unwrap_or_else(|| "None".to_string());
+            let line = format!(
+                "{},\t{},\t{},\t{}\n",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                self.name,
+                mark_delete,
+                self.state.individually_deleted_entries.len()
+            );
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/data/cursor_diag.csv")
+            {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
         let key = keys::managed_cursor_key(&self.managedledger_name, &self.name);
         let stored = StoredManagedCursorState::from(self.state.clone());
         self.db.put(key, stored.encode_to_vec())?;

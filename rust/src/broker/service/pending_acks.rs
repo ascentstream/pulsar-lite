@@ -61,7 +61,7 @@ impl PendingAcksMap {
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open("/data/pending_acks_diag.txt")
+                    .open("/tmp/pending_acks_diag.txt")
                 {
                     let _ = writeln!(f, "{},\tinserts={},\tlen={}", n, n, len);
                 }

@@ -678,18 +678,18 @@ impl Subscription {
 
     /// Get total available permits across all consumers
     pub async fn get_total_permits(&self) -> u32 {
-        let mut total = 0;
+        let mut total = 0i32;
         for consumer in self.get_consumers() {
             total += consumer.get_available_permits().await;
         }
-        total
+        total.max(0) as u32
     }
 
     /// Get subscription statistics
     pub async fn get_stats(&self) -> SubscriptionStats {
         let consumers = self.get_consumers();
         let consumer_count = consumers.len();
-        let mut total_permits = 0;
+        let mut total_permits = 0i32;
         for consumer in consumers {
             total_permits += consumer.get_available_permits().await;
         }
@@ -699,7 +699,7 @@ impl Subscription {
             topic: self.topic.clone(),
             sub_type: self.sub_type,
             consumer_count,
-            total_permits,
+            total_permits: total_permits.max(0) as u32,
             received_messages: match self.runtime_mode {
                 SubscriptionRuntimeMode::Persistent => 0,
                 SubscriptionRuntimeMode::NonPersistent => self

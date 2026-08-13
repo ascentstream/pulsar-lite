@@ -212,13 +212,18 @@ pub async fn handle_flow(
     // dispatcher-level aggregates.
     consumer.add_permits(flow_cmd.message_permits).await;
 
-    // Flow permits to dispatcher and trigger dispatch via Subscription
+    // Flow permits to dispatcher and trigger dispatch via Subscription.
+    // Dispatch must run in its own task: a dispatch loop can keep running
+    // while triggers keep arriving (should_reschedule), so awaiting it here
+    // would block this connection's event loop and starve reads/acks
+    // (observed as channel growth + OOM under 8-subscription fanout).
     let consumer_id = consumer.consumer_id;
+    let permits = flow_cmd.message_permits;
     let subscription = consumer.get_subscription();
-    let sub_guard = subscription.read().await;
-    sub_guard
-        .consumer_flow(consumer_id, flow_cmd.message_permits)
-        .await;
+    tokio::spawn(async move {
+        let sub_guard = subscription.read().await;
+        sub_guard.consumer_flow(consumer_id, permits).await;
+    });
     Ok(())
 }
 
@@ -232,28 +237,6 @@ where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let ack_cmd = cmd.ack.as_ref().ok_or("Missing ack command")?;
-    // [TEMP DIAG] count ack command arrivals and parse results.
-    {
-        use std::io::Write;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static C: AtomicU64 = AtomicU64::new(0);
-        let n = C.fetch_add(1, Ordering::Relaxed);
-        if n % 100 == 0 {
-            let mid_count = ack_cmd.message_id.len();
-            let known = consumers.contains_key(&ack_cmd.consumer_id);
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/data/ack_cmd_diag.txt")
-            {
-                let _ = writeln!(
-                    f,
-                    "{},\tconsumer={},\tids={},\tknown={},\tack_type={:?}",
-                    n, ack_cmd.consumer_id, mid_count, known, ack_cmd.ack_type
-                );
-            }
-        }
-    }
     log::debug!(
         "Handling Ack command: consumer_id={}, ack_type={:?}",
         ack_cmd.consumer_id,

@@ -13,7 +13,7 @@ use crate::broker::service::topic::{
 use crate::broker::service::{Consumer, SharedStorage};
 use pulsar_lite_storage_managed_ledger::{ManagedLedgerPosition, MessageId};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
 
 const DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE: u32 = 20;
@@ -29,7 +29,7 @@ pub struct KeySharedDispatcher {
     auto_split_assignments: Vec<(KeySharedHashRange, Arc<Consumer>)>,
     sticky_assignments: Vec<(KeySharedHashRange, Arc<Consumer>)>,
     key_shared_policy: KeySharedPolicy,
-    total_available_permits: AtomicU32,
+    total_available_permits: AtomicI32,
     read_position: RwLock<Option<ManagedLedgerPosition>>,
     redelivery_controller: RwLock<RedeliveryController>,
 }
@@ -47,7 +47,7 @@ impl KeySharedDispatcher {
             auto_split_assignments: Vec::new(),
             sticky_assignments: Vec::new(),
             key_shared_policy,
-            total_available_permits: AtomicU32::new(0),
+            total_available_permits: AtomicI32::new(0),
             read_position: RwLock::new(None),
             redelivery_controller: RwLock::new(RedeliveryController::new(block_hashes)),
         }
@@ -64,7 +64,7 @@ impl KeySharedDispatcher {
         let _ = self.total_available_permits.fetch_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
-            |current| Some(current.saturating_sub(permits)),
+            |current| Some(current.saturating_sub(permits as i32)),
         );
     }
 
@@ -326,12 +326,12 @@ impl KeySharedDispatcher {
         let max_batch = self
             .total_available_permits
             .load(Ordering::Relaxed)
-            .min(DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE);
-        if max_batch == 0 {
+            .min(DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE as i32);
+        if max_batch <= 0 {
             return Ok(0);
         }
 
-        let mut remaining_dispatches = max_batch;
+        let mut remaining_dispatches = max_batch as u32;
         let mut progress = 0u32;
 
         while remaining_dispatches > 0 {
@@ -344,7 +344,8 @@ impl KeySharedDispatcher {
                 let sticky_key_hash = redelivery
                     .sticky_key_hash
                     .unwrap_or_else(|| sticky_key_hash_from_metadata(&entry.metadata));
-                if !consumer.use_permit().await {
+                let batch_count = crate::broker::dispatcher::messages_in_batch(&entry.metadata);
+                if !consumer.try_use_permits(batch_count).await {
                     self.restore_redelivery_message(RedeliveryEntry {
                         sticky_key_hash: Some(sticky_key_hash),
                         ..redelivery
@@ -352,7 +353,7 @@ impl KeySharedDispatcher {
                     break;
                 }
                 remaining_dispatches -= 1;
-                self.subtract_total_permits(1);
+                self.subtract_total_permits(batch_count as u32);
 
                 if consumer
                     .send_message_with_sticky_hash(
@@ -374,11 +375,11 @@ impl KeySharedDispatcher {
                         redelivery_count: redelivery.redelivery_count + 1,
                         sticky_key_hash: Some(sticky_key_hash),
                     });
-                    consumer.add_permits(1).await;
-                    self.total_available_permits.fetch_add(1, Ordering::Relaxed);
+                    consumer.add_permits(batch_count).await;
+                    self.total_available_permits
+                        .fetch_add(batch_count as i32, Ordering::Relaxed);
                     break;
                 }
-                continue;
             }
 
             let Some(candidate) = self
@@ -419,11 +420,12 @@ impl KeySharedDispatcher {
             let Some(consumer) = self.select_consumer_for_hash(sticky_key_hash) else {
                 break;
             };
-            if !consumer.use_permit().await {
+            let batch_count = crate::broker::dispatcher::messages_in_batch(&candidate.metadata);
+            if !consumer.try_use_permits(batch_count).await {
                 break;
             }
             remaining_dispatches -= 1;
-            self.subtract_total_permits(1);
+            self.subtract_total_permits(batch_count as u32);
 
             if consumer
                 .send_message_with_sticky_hash(
@@ -447,8 +449,9 @@ impl KeySharedDispatcher {
                     sticky_key_hash: Some(sticky_key_hash),
                 });
                 commit_read_position(&self.read_position, candidate.next_position);
-                consumer.add_permits(1).await;
-                self.total_available_permits.fetch_add(1, Ordering::Relaxed);
+                consumer.add_permits(batch_count).await;
+                self.total_available_permits
+                    .fetch_add(batch_count as i32, Ordering::Relaxed);
                 break;
             }
         }
@@ -508,7 +511,7 @@ impl Dispatcher for KeySharedDispatcher {
     fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {
         if self.consumers_by_id.contains_key(&consumer_id) {
             self.total_available_permits
-                .fetch_add(additional_permits, Ordering::Relaxed);
+                .fetch_add(additional_permits as i32, Ordering::Relaxed);
         }
     }
 
@@ -527,7 +530,7 @@ impl Dispatcher for KeySharedDispatcher {
             if progress == 0 {
                 break;
             }
-            if self.total_available_permits.load(Ordering::Relaxed) == 0 {
+            if self.total_available_permits.load(Ordering::Relaxed) <= 0 {
                 break;
             }
 

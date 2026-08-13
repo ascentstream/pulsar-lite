@@ -5,7 +5,7 @@
 
 use bytes::Bytes;
 use std::sync::{
-    atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering},
     Arc,
 };
 
@@ -60,7 +60,7 @@ pub struct PendingMessage {
 /// Call `send()` to commit the dispatch. If dropped without sending, all
 /// resources are automatically rolled back (dispatch-or-drop semantics).
 pub struct DispatchReservation {
-    available_permits: Arc<AtomicU32>,
+    available_permits: Arc<AtomicI32>,
     pending_acks: Arc<PendingAcksMap>,
     owned_permit: Option<mpsc::OwnedPermit<(u64, PendingMessage)>>,
     consumer_id: u64,
@@ -119,7 +119,7 @@ pub struct Consumer {
 
     /// Statistics
     stats: Arc<RwLock<ConsumerStats>>,
-    available_permits: Arc<AtomicU32>,
+    available_permits: Arc<AtomicI32>,
 
     /// Message sender channel - sends messages to ServerCnx for delivery
     /// Format: (consumer_id, PendingMessage)
@@ -192,7 +192,7 @@ impl Consumer {
             subscription,
             connection_id,
             stats: Arc::new(RwLock::new(ConsumerStats::default())),
-            available_permits: Arc::new(AtomicU32::new(0)),
+            available_permits: Arc::new(AtomicI32::new(0)),
             message_tx,
             connection_write_state,
             pending_acks: Arc::new(PendingAcksMap::new()),
@@ -205,7 +205,8 @@ impl Consumer {
 
     /// Update permits (flow control)
     pub async fn add_permits(&self, permits: u32) {
-        self.available_permits.fetch_add(permits, Ordering::Relaxed);
+        self.available_permits
+            .fetch_add(permits as i32, Ordering::Relaxed);
     }
 
     /// Instrumentation/gate: dispatched-but-unacked message count for this consumer.
@@ -230,8 +231,33 @@ impl Consumer {
         false
     }
 
+    /// Use `n` permits when dispatching a batch entry.
+    ///
+    /// Permit accounting is per client-visible message (Apache Pulsar
+    /// semantics): a batch entry of N messages consumes N permits. Like Pulsar,
+    /// the balance may briefly go negative when a batch entry is larger than
+    /// the remaining permits — the entry is still delivered and the deficit is
+    /// repaid by the client's next Flow. This keeps the message stream flowing
+    /// (no deadlock where the client waits for messages and the broker waits
+    /// for Flow). Returns false only when there is no permit at all.
+    pub async fn try_use_permits(&self, n: u32) -> bool {
+        let mut current = self.available_permits.load(Ordering::Relaxed);
+        while current > 0 {
+            match self.available_permits.compare_exchange(
+                current,
+                current - n as i32,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+        false
+    }
+
     /// Get available permits
-    pub async fn get_available_permits(&self) -> u32 {
+    pub async fn get_available_permits(&self) -> i32 {
         self.available_permits.load(Ordering::Relaxed)
     }
 
@@ -251,7 +277,7 @@ impl Consumer {
     /// Get current statistics
     pub async fn get_stats(&self) -> ConsumerStats {
         let mut stats = self.stats.read().await.clone();
-        stats.available_permits = self.available_permits.load(Ordering::Relaxed);
+        stats.available_permits = self.available_permits.load(Ordering::Relaxed).max(0) as u32;
         let active_consumer_id = self.active_consumer_id.load(Ordering::Relaxed);
         stats.active_consumer_id = (active_consumer_id >= 0).then_some(active_consumer_id as u64);
         stats.is_active_consumer = self.is_active_consumer.load(Ordering::Relaxed);
@@ -357,32 +383,18 @@ impl Consumer {
         M: Into<Bytes>,
         P: Into<Bytes>,
     {
-        // [TEMP DIAG] count dispatches to consumers.
-        {
-            use std::io::Write;
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static C: AtomicU64 = AtomicU64::new(0);
-            let n = C.fetch_add(1, Ordering::Relaxed);
-            if n % 100_000 == 0 {
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/data/dispatch_diag.txt")
-                {
-                    let _ = writeln!(
-                        f,
-                        "{},\tconsumer={},\tmsg={}:{}\tredelivery={}",
-                        n,
-                        self.consumer_id,
-                        message_id.ledger,
-                        message_id.entry,
-                        redelivery_count
-                    );
-                }
-            }
-        }
         let metadata = metadata.into();
         let payload = payload.into();
+
+        // Backpressure: if this connection's outbound write buffer is backed up
+        // (socket cannot drain fast enough), stop dispatching instead of filling
+        // the message channel. The dispatcher returns the message to its
+        // redelivery queue and restores the permit; dispatch resumes once acks
+        // flow and the buffer drains below the low watermark.
+        if !self.is_writable() {
+            return false;
+        }
+
         let wire_size = pulsar_lite_proto::codec::estimate_message_parts_size(
             self.consumer_id,
             message_id.ledger,
@@ -655,7 +667,7 @@ impl Consumer {
     }
 
     pub fn available_permits_now(&self) -> u32 {
-        self.available_permits.load(Ordering::Relaxed)
+        self.available_permits.load(Ordering::Relaxed).max(0) as u32
     }
 
     pub fn notify_active_consumer_change(&self, active_consumer_id: u64) {
@@ -708,35 +720,6 @@ impl Consumer {
         ack_type: AckCommandType,
         message_ids: Vec<MessageId>,
     ) -> Result<(), String> {
-        // [TEMP DIAG] count message_acked entries with batch size.
-        {
-            use std::io::Write;
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static C: AtomicU64 = AtomicU64::new(0);
-            let n = C.fetch_add(1, Ordering::Relaxed);
-            if n % 100 == 0 {
-                let (diag_sub_type, diag_is_persistent) = {
-                    let sub = self.subscription.read().await;
-                    (sub.get_sub_type(), sub.is_persistent())
-                };
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/data/msg_acked_diag.txt")
-                {
-                    let _ = writeln!(
-                        f,
-                        "{},\tconsumer={},\tids={},\tack_type={:?},\tsub_type={:?},\tpersistent={}",
-                        n,
-                        self.consumer_id,
-                        message_ids.len(),
-                        ack_type,
-                        diag_sub_type,
-                        diag_is_persistent
-                    );
-                }
-            }
-        }
         if message_ids.is_empty() {
             return Ok(());
         }
@@ -761,8 +744,6 @@ impl Consumer {
                     let Some((owner, tracked_message_id)) =
                         self.resolve_ack_owner(message_id).await
                     else {
-                        // [TEMP DIAG] ack dropped: no owner found.
-                        diag_ack_drop("no_owner", message_id);
                         log::warn!(
                             "Consumer {} attempted to ack message {}:{} without ownership; ignoring",
                             self.consumer_id,
@@ -773,8 +754,6 @@ impl Consumer {
                     };
 
                     if !owner.remove_pending_ack(&tracked_message_id).await {
-                        // [TEMP DIAG] ack dropped: pending-ack removal failed.
-                        diag_ack_drop("remove_failed", &tracked_message_id);
                         log::warn!(
                             "Consumer {} found owner {} for message {}:{} but pending ack removal failed; ignoring",
                             self.consumer_id,
@@ -862,34 +841,6 @@ impl Consumer {
         }
 
         None
-    }
-}
-
-/// [TEMP DIAG] append one line per 100k dropped acks to /data/ack_drop_diag.txt.
-fn diag_ack_drop(reason: &str, message_id: &MessageId) {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    if n % 100_000 == 0 {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/data/ack_drop_diag.txt")
-        {
-            let _ = writeln!(
-                f,
-                "{},\t{},\t{}:{}\tpartition={}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-                reason,
-                message_id.ledger,
-                message_id.entry,
-                message_id.partition
-            );
-        }
     }
 }
 

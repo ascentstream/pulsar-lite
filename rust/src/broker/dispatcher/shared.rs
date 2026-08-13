@@ -11,7 +11,7 @@ use crate::broker::service::topic::SubscriptionType;
 use crate::broker::service::{Consumer, SharedStorage};
 use pulsar_lite_storage_managed_ledger::{ManagedLedgerPosition, MessageId};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Consistent with Apache Pulsar: dispatcherMaxRoundRobinBatchSize = 20
@@ -30,8 +30,10 @@ pub struct SharedDispatcher {
     /// Round-Robin index for consumer selection (atomic for thread safety)
     round_robin_index: AtomicUsize,
 
-    /// Total available permits across all consumers (atomic for thread safety)
-    total_available_permits: AtomicU32,
+    /// Total available permits across all consumers (atomic for thread safety).
+    /// i32: the balance may briefly go negative when a batch entry is larger
+    /// than the remaining permits (Apache Pulsar semantics).
+    total_available_permits: AtomicI32,
 
     /// Flag to prevent reentrant dispatching (Pulsar readMoreEntriesInProgress).
     dispatch_in_progress: AtomicBool,
@@ -63,7 +65,7 @@ impl SharedDispatcher {
             consumers: HashMap::new(),
             consumer_order: Vec::new(),
             round_robin_index: AtomicUsize::new(0),
-            total_available_permits: AtomicU32::new(0),
+            total_available_permits: AtomicI32::new(0),
             dispatch_in_progress: AtomicBool::new(false),
             should_reschedule: AtomicBool::new(false),
             max_unacked_messages: DEFAULT_MAX_UNACKED_MESSAGES_PER_CONSUMER,
@@ -183,7 +185,7 @@ impl SharedDispatcher {
         let _ = self.total_available_permits.fetch_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
-            |current| Some(current.saturating_sub(permits)),
+            |current| Some(current.saturating_sub(permits as i32)),
         );
     }
 
@@ -247,7 +249,7 @@ impl SharedDispatcher {
     ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
         // Check if we have permits
         let total_permits = self.total_available_permits.load(Ordering::Relaxed);
-        if total_permits == 0 {
+        if total_permits <= 0 {
             log::debug!("No permits available, skipping dispatch");
             return Ok(0);
         }
@@ -255,7 +257,8 @@ impl SharedDispatcher {
         // Dispatch up to DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE messages
         let mut dispatched = 0u32;
         let mut redelivered = 0u32;
-        let max_batch = std::cmp::min(total_permits, DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE);
+        let max_batch =
+            std::cmp::min(total_permits, DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE as i32) as u32;
 
         log::debug!(
             "Starting batch dispatch: max_batch={}, total_permits={}, consumers={}, redelivery_queue={}",
@@ -294,14 +297,9 @@ impl SharedDispatcher {
                 break;
             }
 
-            // Use one permit
-            if !consumer.use_permit().await {
-                log::warn!("Consumer {} permits exhausted during dispatch", consumer_id);
-                break;
-            }
-
-            // Decrease total permits
-            self.total_available_permits.fetch_sub(1, Ordering::Relaxed);
+            // Permits are consumed per client-visible message after the entry
+            // is fetched (batch entries carry N messages), matching Apache
+            // Pulsar. Nothing is consumed here at the top of the loop.
 
             // 1. Priority: get message from redelivery queue
             if let Some(redelivery) = self.pop_redelivery_message() {
@@ -312,8 +310,6 @@ impl SharedDispatcher {
                     guard.is_acknowledged(&topic, &subscription, &msg_id)?
                 };
                 if already_acked {
-                    consumer.add_permits(1).await;
-                    self.total_available_permits.fetch_add(1, Ordering::Relaxed);
                     log::debug!(
                         "Skipping replay for already-acked message {}:{}",
                         msg_id.ledger,
@@ -329,6 +325,21 @@ impl SharedDispatcher {
                 };
 
                 if let Some(entry) = message_opt {
+                    let batch_count = crate::broker::dispatcher::messages_in_batch(&entry.metadata);
+                    if !consumer.try_use_permits(batch_count).await {
+                        self.restore_redelivery_message(RedeliveryEntry {
+                            message_id: entry.message_id.clone(),
+                            redelivery_count,
+                            sticky_key_hash: redelivery.sticky_key_hash,
+                        });
+                        log::warn!(
+                            "Consumer {} permits insufficient for batch of {} messages, waiting for flow",
+                            consumer_id, batch_count
+                        );
+                        break;
+                    }
+                    self.total_available_permits
+                        .fetch_sub(batch_count as i32, Ordering::Relaxed);
                     if consumer
                         .send_message(
                             entry.message_id.clone(),
@@ -357,17 +368,15 @@ impl SharedDispatcher {
                             redelivery_count: redelivery_count + 1,
                             sticky_key_hash: None,
                         });
-                        consumer.add_permits(1).await;
-                        self.total_available_permits.fetch_add(1, Ordering::Relaxed);
+                        consumer.add_permits(batch_count).await;
+                        self.total_available_permits
+                            .fetch_add(batch_count as i32, Ordering::Relaxed);
                         // Send failed: connection/write path is saturated.
                         // Stop this pass instead of immediately re-reading the
                         // same entry (previous `continue` caused the spin).
                         break;
                     }
                 } else {
-                    // Message no longer exists (may have been deleted), restore permit
-                    consumer.add_permits(1).await;
-                    self.total_available_permits.fetch_add(1, Ordering::Relaxed);
                     log::warn!(
                         "Redelivery message {}:{} not found in storage",
                         msg_id.ledger,
@@ -383,6 +392,16 @@ impl SharedDispatcher {
                 .await?;
 
             if let Some(candidate) = message_opt {
+                let batch_count = crate::broker::dispatcher::messages_in_batch(&candidate.metadata);
+                if !consumer.try_use_permits(batch_count).await {
+                    log::warn!(
+                        "Consumer {} permits insufficient for batch of {} messages, waiting for flow",
+                        consumer_id, batch_count
+                    );
+                    break;
+                }
+                self.total_available_permits
+                    .fetch_sub(batch_count as i32, Ordering::Relaxed);
                 if consumer
                     .send_message(
                         candidate.message_id.clone(),
@@ -406,17 +425,15 @@ impl SharedDispatcher {
                 } else {
                     self.add_to_redelivery_queue(vec![(candidate.message_id, 1)]);
                     commit_read_position(&self.read_position, candidate.next_position);
-                    consumer.add_permits(1).await;
-                    self.total_available_permits.fetch_add(1, Ordering::Relaxed);
+                    consumer.add_permits(batch_count).await;
+                    self.total_available_permits
+                        .fetch_add(batch_count as i32, Ordering::Relaxed);
                     // Send failed: connection/write path is saturated. Stop
                     // this pass rather than queueing the whole batch for
                     // redelivery and re-reading in a tight loop.
                     break;
                 }
             } else {
-                // No more messages, restore permit
-                consumer.add_permits(1).await;
-                self.total_available_permits.fetch_add(1, Ordering::Relaxed);
                 log::debug!("No more dispatchable messages");
                 break;
             }
@@ -652,7 +669,7 @@ impl Dispatcher for SharedDispatcher {
         // Consumer-local permit state is updated by the flow handler before it
         // triggers dispatch. The dispatcher only tracks the aggregate count.
         self.total_available_permits
-            .fetch_add(additional_permits, Ordering::Relaxed);
+            .fetch_add(additional_permits as i32, Ordering::Relaxed);
 
         log::info!(
             "Consumer {} flowed {} permits, total={}",

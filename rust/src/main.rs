@@ -79,9 +79,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.max_connections_per_ip
     );
     log::info!(
-        "Non-persistent limits: max_concurrent_per_connection={}, max_pending_publish={}, max_message_size={}B",
+        "Non-persistent limits: max_concurrent_per_connection={}, max_pending_publish={}, max_pending_publish_bytes={}MiB, max_message_size={}B",
         config.max_concurrent_non_persistent_messages_per_connection,
         config.max_pending_publish_requests_per_connection,
+        config.max_pending_publish_bytes_per_connection / (1024 * 1024),
         config.max_message_size_bytes
     );
     log::info!(
@@ -159,6 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 connection_liveness_check_timeout,
                 config.max_concurrent_non_persistent_messages_per_connection,
                 config.max_pending_publish_requests_per_connection,
+                config.max_pending_publish_bytes_per_connection,
                 config.max_message_size_bytes,
                 advertised_broker_url,
                 config.pulsar_channel_write_buffer_high_water_mark_bytes,

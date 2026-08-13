@@ -50,23 +50,6 @@ impl PendingAcksMap {
                 sticky_key_hash,
             },
         );
-        // [TEMP DIAG] log pending-acks size every 100k inserts.
-        {
-            use std::io::Write;
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static C: AtomicU64 = AtomicU64::new(0);
-            let n = C.fetch_add(1, Ordering::Relaxed);
-            if n % 100_000 == 0 {
-                let len = inner.len();
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/pending_acks_diag.txt")
-                {
-                    let _ = writeln!(f, "{},\tinserts={},\tlen={}", n, n, len);
-                }
-            }
-        }
         true
     }
 

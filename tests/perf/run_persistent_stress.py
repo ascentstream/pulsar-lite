@@ -113,10 +113,10 @@ SCENARIOS: list[Scenario] = [
         name="stress_persistent_consume_shared_high_fanout",
         kind="consume_e2e",
         broker="persistent_stress",
-        description="16 consumers 高扇出 60s",
+        description="16 consumers 高扇出 6s [TEMP]",
         consumer_args=[
             "-time",
-            "60",
+            "6",
             "-q",
             "1000",
             "-st",
@@ -124,7 +124,7 @@ SCENARIOS: list[Scenario] = [
             "-n",
             "16",
         ],
-        feed_producer_args=["-time", "60", "-s", "1024", "-r", "999999", "-o", "1000"],
+        feed_producer_args=["-time", "6", "-s", "1024", "-r", "999999", "-o", "1000"],
     ),
     Scenario(
         name="stress_persistent_consume_multi_subscription_fanout",

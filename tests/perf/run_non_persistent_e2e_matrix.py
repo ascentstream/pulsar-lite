@@ -10,7 +10,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib import ROOT
-from lib.broker import BrokerConfig, BrokerProcess
+from lib.broker import BrokerConfig, BrokerProcess, ExternalBrokerProcess
 from lib.parsing import parse_consumer_output, parse_producer_output
 from lib.perf_cmd import (
     ensure_prereqs,
@@ -335,6 +335,33 @@ def scenario_topic(run_id: str, scenario: Scenario) -> str:
 
 
 def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Run non-persistent e2e matrix scenarios for pulsar-lite"
+    )
+    parser.add_argument(
+        "--broker-backend",
+        choices=["local", "external"],
+        default="local",
+        help="local starts rust/target/release/pulsar-lite per broker profile; "
+        "external targets an already-running broker via --external-url "
+        "(e.g. Apache Pulsar standalone); no broker lifecycle management.",
+    )
+    parser.add_argument(
+        "--external-url",
+        default="pulsar://127.0.0.1:6650",
+        help="Service URL of the external broker for --broker-backend=external.",
+    )
+    parser.add_argument(
+        "--external-unit",
+        default=None,
+        help="systemd unit name of the external broker (e.g. pulsar-standalone or "
+        "pulsar-lite) to sample CPU/memory via 'systemctl show <unit> -p MainPID' "
+        "+ /proc. Leave unset to disable broker metrics for external backends.",
+    )
+    args = parser.parse_args()
+
     ensure_prereqs()
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     run_id = time.strftime("%Y%m%d-%H%M%S")
@@ -346,13 +373,30 @@ def main() -> int:
 
     broker_metrics_by_name: dict[str, dict[str, float]] = {}
     for broker_name, broker_cfg in BROKERS.items():
-        broker = BrokerProcess(broker_cfg)
+        if args.broker_backend == "external":
+            from urllib.parse import urlparse
+
+            parsed = urlparse(args.external_url)
+            if parsed.scheme != "pulsar" or not parsed.hostname:
+                raise ValueError(
+                    f"--external-url must be pulsar://host:port, got {args.external_url!r}"
+                )
+            broker = ExternalBrokerProcess(
+                BrokerConfig("external", parsed.port or 6650, 0),
+                unit=args.external_unit,
+            )
+        else:
+            broker = BrokerProcess(broker_cfg)
         print(
             f"==> starting broker {broker_name} on {broker_cfg.port} (default_partitions={broker_cfg.default_partitions})",
             flush=True,
         )
         broker.start()
-        service_url = f"pulsar://127.0.0.1:{broker_cfg.port}"
+        service_url = (
+            args.external_url
+            if args.broker_backend == "external"
+            else f"pulsar://127.0.0.1:{broker_cfg.port}"
+        )
         try:
             for scenario in [s for s in SCENARIOS if s.broker == broker_name]:
                 topic = scenario_topic(run_id, scenario)

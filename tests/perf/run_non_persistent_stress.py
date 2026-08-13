@@ -23,7 +23,12 @@ from pathlib import Path
 # --- lib imports (run from repo root or with sys.path adjusted) ---
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib import ROOT
-from lib.broker import BrokerConfig, BrokerProcess, DockerBrokerProcess
+from lib.broker import (
+    BrokerConfig,
+    BrokerProcess,
+    DockerBrokerProcess,
+    ExternalBrokerProcess,
+)
 from lib.docker_image import build_broker_image
 from lib.observability import PerfCollector
 from lib.parsing import parse_consumer_output, parse_producer_output
@@ -204,9 +209,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--broker-backend",
-        choices=["local", "docker"],
+        choices=["local", "docker", "external"],
         default="local",
-        help="Broker launch backend. local uses rust/target/release/pulsar-lite; docker builds and runs a constrained broker container.",
+        help="Broker launch backend. local uses rust/target/release/pulsar-lite; docker builds and runs a constrained broker container; external targets an already-running broker via --external-url.",
+    )
+    parser.add_argument(
+        "--external-url",
+        default="pulsar://127.0.0.1:6650",
+        help="Service URL of the external broker for --broker-backend=external.",
+    )
+    parser.add_argument(
+        "--external-unit",
+        default=None,
+        help="systemd unit name of the external broker (e.g. pulsar-standalone or pulsar-lite) to sample CPU/memory via 'systemctl show <unit> -p MainPID' + /proc.",
     )
 
     parser.add_argument(
@@ -256,7 +271,9 @@ def _topic_for(run_id: str, scenario: StressScenario) -> str:
     return f"non-persistent://public/default/{run_id}-{scenario.name}"
 
 
-def _service_url_for(scenario: StressScenario) -> str:
+def _service_url_for(scenario: StressScenario, external_url: str | None = None) -> str:
+    if external_url:
+        return external_url
     cfg = BROKERS[scenario.broker]
     return f"pulsar://127.0.0.1:{cfg.port}"
 
@@ -267,10 +284,11 @@ def _run_produce_scenario(
     scenario_dir: Path,
     broker_proc: BrokerProcess,
     perf_collector: PerfCollector | None,
+    external_url: str | None = None,
 ) -> dict:
     """Execute a single producer-only stress scenario."""
     topic = _topic_for(run_id, scenario)
-    service_url = _service_url_for(scenario)
+    service_url = _service_url_for(scenario, external_url)
     timeout = scenario.estimated_duration + 120
 
     histogram_path = scenario_dir / "producer_histogram.log"
@@ -320,10 +338,11 @@ def _run_consume_e2e_scenario(
     scenario_dir: Path,
     broker_proc: BrokerProcess,
     perf_collector: PerfCollector | None,
+    external_url: str | None = None,
 ) -> dict:
     """Execute a single consumer e2e stress scenario (feed-producer + consumer)."""
     topic = _topic_for(run_id, scenario)
-    service_url = _service_url_for(scenario)
+    service_url = _service_url_for(scenario, external_url)
     timeout = scenario.estimated_duration + 120
 
     consumer_args = scenario.consumer_args or []
@@ -461,6 +480,18 @@ def main(argv: list[str] | None = None) -> None:
                 cpuset_cpus=args.docker_cpuset,
                 memory=args.docker_memory,
             )
+        elif args.broker_backend == "external":
+            from urllib.parse import urlparse
+
+            parsed = urlparse(args.external_url)
+            if parsed.scheme != "pulsar" or not parsed.hostname:
+                raise ValueError(
+                    f"--external-url must be pulsar://host:port, got {args.external_url!r}"
+                )
+            bp = ExternalBrokerProcess(
+                BrokerConfig("external", parsed.port or 6650, 0),
+                unit=args.external_unit,
+            )
         else:
             bp = BrokerProcess(cfg)
         bp.start()
@@ -480,8 +511,9 @@ def main(argv: list[str] | None = None) -> None:
             scenario_dir.mkdir(parents=True, exist_ok=True)
 
             # Restart broker between scenarios to clear residual topics/subscriptions
-            print(f"  restarting broker [{scenario.broker}] ...", file=sys.stderr)
-            broker_proc.restart()
+            if args.broker_backend != "external":
+                print(f"  restarting broker [{scenario.broker}] ...", file=sys.stderr)
+                broker_proc.restart()
 
             # Start perf recording (must be after restart to capture the new PID)
             perf_data_path = scenario_dir / "perf.data"
@@ -504,6 +536,7 @@ def main(argv: list[str] | None = None) -> None:
                         scenario_dir,
                         broker_proc,
                         perf_collector,
+                        args.external_url if args.broker_backend == "external" else None,
                     )
                 elif scenario.kind == "consume_e2e":
                     result = _run_consume_e2e_scenario(
@@ -512,6 +545,7 @@ def main(argv: list[str] | None = None) -> None:
                         scenario_dir,
                         broker_proc,
                         perf_collector,
+                        args.external_url if args.broker_backend == "external" else None,
                     )
                 else:
                     print(f"  UNKNOWN kind: {scenario.kind}, skipping", file=sys.stderr)
@@ -524,7 +558,10 @@ def main(argv: list[str] | None = None) -> None:
                     "name": scenario.name,
                     "kind": scenario.kind,
                     "broker_profile": scenario.broker,
-                    "service_url": _service_url_for(scenario),
+                    "service_url": _service_url_for(
+                        scenario,
+                        args.external_url if args.broker_backend == "external" else None,
+                    ),
                     "description": scenario.description,
                     "topic": _topic_for(run_id, scenario),
                     "started_at": datetime.now(timezone.utc).isoformat(),

@@ -129,6 +129,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
+        // Request-response protocol (Send -> SendReceipt, Ping -> Pong): Nagle
+        // delays small replies until the previous segment is ACKed, adding
+        // millisecond-scale RTT. Disable it like Netty (tcpNoDelay=true default).
+        if let Err(e) = socket.set_nodelay(true) {
+            log::warn!("Failed to set TCP_NODELAY for {}: {}", peer_addr, e);
+        }
+
         log::info!("New connection from {}", peer_addr);
 
         let permit = match connection_limiter.try_acquire(peer_addr.ip()) {

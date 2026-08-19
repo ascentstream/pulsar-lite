@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: pulsar-lite
+    metrics_path: /metrics
+    static_configs:
+      # The broker's metrics endpoint (default 0.0.0.0:8080, same model as
+      # native Pulsar's web service port). host.docker.internal resolves to
+      # the host via the compose extra_hosts entry.
+      - targets: ["host.docker.internal:8080"]

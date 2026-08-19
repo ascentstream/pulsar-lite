@@ -1,0 +1,223 @@
+{
+  "uid": "pulsar-lite-broker",
+  "title": "Pulsar Lite / Broker",
+  "tags": ["pulsar-lite"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "cluster",
+        "label": "Cluster",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(pulsar_broker_rate_in, cluster)",
+        "refresh": 2,
+        "includeAll": false,
+        "multi": false,
+        "current": { "text": "pulsar-lite", "value": "pulsar-lite" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Broker message rate (in / out)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "pulsar_broker_rate_in{cluster=\"$cluster\"}",
+          "legendFormat": "in"
+        },
+        {
+          "expr": "pulsar_broker_rate_out{cluster=\"$cluster\"}",
+          "legendFormat": "out"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Broker throughput (bytes/s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "pulsar_broker_throughput_in{cluster=\"$cluster\"}",
+          "legendFormat": "in"
+        },
+        {
+          "expr": "pulsar_broker_throughput_out{cluster=\"$cluster\"}",
+          "legendFormat": "out"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Accepted / delivered totals (rate over counters)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "rate(pulsar_broker_in_messages_total{cluster=\"$cluster\"}[1m])",
+          "legendFormat": "published msg/s"
+        },
+        {
+          "expr": "rate(pulsar_broker_out_messages_total{cluster=\"$cluster\"}[1m])",
+          "legendFormat": "delivered msg/s"
+        },
+        {
+          "expr": "rate(pulsar_broker_in_bytes_total{cluster=\"$cluster\"}[1m])",
+          "legendFormat": "published B/s"
+        },
+        {
+          "expr": "rate(pulsar_broker_out_bytes_total{cluster=\"$cluster\"}[1m])",
+          "legendFormat": "delivered B/s"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Entity counts",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "pulsar_broker_topics_count{cluster=\"$cluster\"}",
+          "legendFormat": "topics"
+        },
+        {
+          "expr": "pulsar_broker_subscriptions_count{cluster=\"$cluster\"}",
+          "legendFormat": "subscriptions"
+        },
+        {
+          "expr": "pulsar_broker_producers_count{cluster=\"$cluster\"}",
+          "legendFormat": "producers"
+        },
+        {
+          "expr": "pulsar_broker_consumers_count{cluster=\"$cluster\"}",
+          "legendFormat": "consumers"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Connections",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 8 },
+      "targets": [
+        {
+          "expr": "pulsar_active_connections{cluster=\"$cluster\"}",
+          "legendFormat": "active"
+        },
+        {
+          "expr": "rate(pulsar_connection_created_total_count{cluster=\"$cluster\"}[5m])",
+          "legendFormat": "created /s"
+        },
+        {
+          "expr": "rate(pulsar_connection_closed_total_count{cluster=\"$cluster\"}[5m])",
+          "legendFormat": "closed /s"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Rejections by reason (/s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(pulsar_lite_broker_errors_total{cluster=\"$cluster\"}[5m]))",
+          "legendFormat": "{{reason}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Backlog + storage size",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 16 },
+      "targets": [
+        {
+          "expr": "pulsar_broker_msg_backlog{cluster=\"$cluster\"}",
+          "legendFormat": "backlog entries"
+        },
+        {
+          "expr": "pulsar_broker_storage_size{cluster=\"$cluster\"}",
+          "legendFormat": "stored bytes"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Publish rate-limit rejections (/s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum by (topic) (rate(pulsar_publish_rate_limit_times{cluster=\"$cluster\"}[5m]))",
+          "legendFormat": "{{topic}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Write-queue batch size (avg / P99)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 24 },
+      "targets": [
+        {
+          "expr": "rate(pulsar_lite_write_queue_batch_messages_total[1m]) / rate(pulsar_lite_write_queue_batches_total[1m])",
+          "legendFormat": "avg batch"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(pulsar_lite_write_queue_batch_size_bucket[5m])))",
+          "legendFormat": "P99 batch"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Broker RSS",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 24 },
+      "fieldConfig": {
+        "defaults": { "unit": "bytes" },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "process_resident_memory_bytes",
+          "legendFormat": "RSS"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Broker CPU (seconds/s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 24 },
+      "targets": [
+        {
+          "expr": "rate(process_cpu_seconds_total[1m])",
+          "legendFormat": "cpu"
+        }
+      ]
+    }
+  ]
+}

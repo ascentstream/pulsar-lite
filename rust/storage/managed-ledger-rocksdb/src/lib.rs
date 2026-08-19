@@ -10,6 +10,7 @@ mod write_queue;
 
 pub use store::{ConcurrentAppender, RocksDbManagedLedgerStorage};
 pub use write_queue::ConnAppendResult;
+pub use pulsar_lite_metrics::PublishCommitObserver;
 
 /// Internal types exposed for integration tests in `tests/`.
 #[doc(hidden)]

@@ -17,6 +17,7 @@ pulsar-lite-proto = { path = "../../proto" }
 anyhow.workspace = true
 log.workspace = true
 prost = "0.13"
+prometheus.workspace = true
 
 [dev-dependencies]
 tempfile = "3.9"

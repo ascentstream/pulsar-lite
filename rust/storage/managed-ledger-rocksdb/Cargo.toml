@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+pulsar-lite-metrics = { path = "../../metrics" }
 pulsar-lite-storage-managed-ledger = { path = "../managed-ledger" }
 anyhow.workspace = true
 rocksdb = "0.24"

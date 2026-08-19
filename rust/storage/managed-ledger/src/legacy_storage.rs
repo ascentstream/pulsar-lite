@@ -143,6 +143,19 @@ pub trait ManagedLedgerStorage: Send + Sync {
         subscription: &str,
         message_id: &MessageId,
     ) -> bool;
-
     fn get_mark_delete_position(&self, topic: &str, subscription: &str) -> Option<u64>;
+
+    /// Number of stored entries not yet acknowledged by `subscription`
+    /// (ledger-aware across rollovers). `None` when the topic/cursor is
+    /// unknown to the backend.
+    fn backlog_entries(&self, topic: &str, subscription: &str) -> Option<u64> {
+        let _ = (topic, subscription);
+        None
+    }
+
+    /// Bytes durably stored for `topic` (sum of ledger sizes).
+    fn stored_bytes(&self, topic: &str) -> u64 {
+        let _ = topic;
+        0
+    }
 }

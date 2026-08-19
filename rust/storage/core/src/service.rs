@@ -312,4 +312,14 @@ impl Storage {
         self.managed_ledger
             .get_mark_delete_position(topic, subscription)
     }
+
+    /// Ledger-aware unacked entry count for a subscription cursor.
+    pub fn backlog_entries(&self, topic: &str, subscription: &str) -> Option<u64> {
+        self.managed_ledger.backlog_entries(topic, subscription)
+    }
+
+    /// Bytes durably stored for `topic`.
+    pub fn stored_bytes(&self, topic: &str) -> u64 {
+        self.managed_ledger.stored_bytes(topic)
+    }
 }

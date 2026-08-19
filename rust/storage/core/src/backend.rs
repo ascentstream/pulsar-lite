@@ -277,4 +277,20 @@ impl ManagedLedgerStorage for ManagedLedgerStore {
             Self::RocksDb(inner) => inner.get_mark_delete_position(topic, subscription),
         }
     }
+
+    fn backlog_entries(&self, topic: &str, subscription: &str) -> Option<u64> {
+        match self {
+            Self::Memory(inner) => inner.backlog_entries(topic, subscription),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(inner) => inner.backlog_entries(topic, subscription),
+        }
+    }
+
+    fn stored_bytes(&self, topic: &str) -> u64 {
+        match self {
+            Self::Memory(inner) => inner.stored_bytes(topic),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(inner) => inner.stored_bytes(topic),
+        }
+    }
 }

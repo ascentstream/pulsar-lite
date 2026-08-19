@@ -1,7 +1,9 @@
 use crate::factory::{RocksDBManagedLedgerFactory, SharedLedger};
 use crate::keys;
+use pulsar_lite_metrics::PublishCommitObserver;
 use pulsar_lite_storage_managed_ledger::MessageId;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -59,6 +61,10 @@ pub(crate) struct WriteReq {
     partition: i32,
     metadata: Vec<u8>,
     payload: Vec<u8>,
+    observer: Option<Arc<dyn PublishCommitObserver>>,
+    /// Set on the connection path; anchors the end-to-end publish latency
+    /// histogram (enqueue → committed batch).
+    enqueued_at: Option<Instant>,
     reply: WriteReply,
 }
 
@@ -93,16 +99,8 @@ impl WriteQueue {
         // Same Arc instances as store reads (singleton per ledger name).
         let mut ledgers: HashMap<String, SharedLedger> = HashMap::new();
 
-        // Batch-size metrics (aggregated to avoid log spam under stress).
-        let mut metric_batches: u64 = 0;
-        let mut metric_msgs: u64 = 0;
-        let mut metric_max_batch: usize = 0;
-        let mut metric_batch_eq1: u64 = 0;
-        let mut metric_group_ops: u64 = 0;
-        let mut metric_group_msgs: u64 = 0;
-        let mut metric_max_group: usize = 0;
-        let mut metric_group_eq1: u64 = 0;
-        let mut metric_window_started = Instant::now();
+        // Prometheus families (no-op before metrics::init).
+        let metrics = pulsar_lite_metrics::storage_metrics();
 
         loop {
             let first = match rx.recv() {
@@ -149,12 +147,7 @@ impl WriteQueue {
             }
 
             let queue_batch_len = batch.len();
-            metric_batches += 1;
-            metric_msgs += queue_batch_len as u64;
-            metric_max_batch = metric_max_batch.max(queue_batch_len);
-            if queue_batch_len == 1 {
-                metric_batch_eq1 += 1;
-            }
+            metrics.observe_batch(queue_batch_len as u64);
 
             // Group by ledger so one rocksdb write covers many entries of the same topic.
             let mut order: Vec<String> = Vec::new();
@@ -173,13 +166,6 @@ impl WriteQueue {
                     _ => continue,
                 };
 
-                let group_len = reqs.len();
-                metric_group_ops += 1;
-                metric_group_msgs += group_len as u64;
-                metric_max_group = metric_max_group.max(group_len);
-                if group_len == 1 {
-                    metric_group_eq1 += 1;
-                }
 
                 if !ledgers.contains_key(&ledger_name) {
                     match factory.open_ledger(&ledger_name) {
@@ -212,8 +198,36 @@ impl WriteQueue {
 
                 // Append publishes meta then LAC only after durable OK;
                 // complete only after that returns Ok.
-                match ledger.add_entries_with_partition_and_metadata(&inputs) {
+                let append_started = Instant::now();
+                let append_result =
+                    ledger.add_entries_with_partition_and_metadata(&inputs);
+                metrics.observe_ledger_write_latency(append_started.elapsed().as_secs_f64());
+                match append_result {
                     Ok(positions) => {
+                        // One observer call per committed group: all reqs in
+                        // a group share the topic, so the first req's observer
+                        // already targets the right counters.
+                        let mut committed_messages: u64 = 0;
+                        let mut committed_bytes: u64 = 0;
+                        let mut observer: Option<Arc<dyn PublishCommitObserver>> = None;
+                        let committed_at = Instant::now();
+                        for req in &reqs {
+                            committed_messages += 1;
+                            let req_bytes = (req.metadata.len() + req.payload.len()) as u64;
+                            committed_bytes += req_bytes;
+                            metrics.observe_entry_size(req_bytes as f64);
+                            if let Some(enqueued_at) = req.enqueued_at {
+                                metrics.observe_write_latency(
+                                    committed_at.duration_since(enqueued_at).as_secs_f64(),
+                                );
+                            }
+                            if observer.is_none() {
+                                observer = req.observer.clone();
+                            }
+                        }
+                        if let Some(observer) = observer {
+                            observer.on_commit(committed_messages, committed_bytes);
+                        }
                         for (req, position) in reqs.into_iter().zip(positions) {
                             req.reply.complete(Ok(MessageId::from(position)));
                         }
@@ -227,53 +241,6 @@ impl WriteQueue {
                 }
             }
 
-            // Emit ~1Hz summary so stress runs stay readable.
-            if metric_window_started.elapsed() >= Duration::from_secs(1) {
-                let avg_queue = if metric_batches == 0 {
-                    0.0
-                } else {
-                    metric_msgs as f64 / metric_batches as f64
-                };
-                let avg_group = if metric_group_ops == 0 {
-                    0.0
-                } else {
-                    metric_group_msgs as f64 / metric_group_ops as f64
-                };
-                let pct_queue_eq1 = if metric_batches == 0 {
-                    0.0
-                } else {
-                    100.0 * metric_batch_eq1 as f64 / metric_batches as f64
-                };
-                let pct_group_eq1 = if metric_group_ops == 0 {
-                    0.0
-                } else {
-                    100.0 * metric_group_eq1 as f64 / metric_group_ops as f64
-                };
-
-                log::info!(
-                    "write_queue metrics: queue_batches={} queue_msgs={} queue_batch_avg={:.2} queue_batch_max={} queue_batch_eq1={:.1}% group_ops={} group_msgs={} group_avg={:.2} group_max={} group_eq1={:.1}%",
-                    metric_batches,
-                    metric_msgs,
-                    avg_queue,
-                    metric_max_batch,
-                    pct_queue_eq1,
-                    metric_group_ops,
-                    metric_group_msgs,
-                    avg_group,
-                    metric_max_group,
-                    pct_group_eq1,
-                );
-
-                metric_batches = 0;
-                metric_msgs = 0;
-                metric_max_batch = 0;
-                metric_batch_eq1 = 0;
-                metric_group_ops = 0;
-                metric_group_msgs = 0;
-                metric_max_group = 0;
-                metric_group_eq1 = 0;
-                metric_window_started = Instant::now();
-            }
         }
     }
 
@@ -298,13 +265,14 @@ impl WriteQueue {
             partition,
             metadata: metadata.to_vec(),
             payload: payload.to_vec(),
+            observer: None,
+            enqueued_at: None,
             reply: WriteReply::Oneshot(reply_tx),
         })
         .map_err(|_| "write queue worker disconnected".to_string())?;
         Ok(reply_rx)
     }
 
-    /// Enqueue for a broker connection: returns immediately; completion is pushed to `completion_tx`.
     pub(crate) fn enqueue_for_connection(
         tx: &mpsc::Sender<WriteReq>,
         topic: &str,
@@ -313,6 +281,7 @@ impl WriteQueue {
         payload: &[u8],
         producer_id: u64,
         sequence_id: u64,
+        observer: Option<Arc<dyn PublishCommitObserver>>,
         completion_tx: tokio::sync::mpsc::Sender<ConnAppendResult>,
     ) -> Result<(), String> {
         tx.send(WriteReq {
@@ -320,6 +289,8 @@ impl WriteQueue {
             partition,
             metadata: metadata.to_vec(),
             payload: payload.to_vec(),
+            observer,
+            enqueued_at: Some(Instant::now()),
             reply: WriteReply::Conn {
                 producer_id,
                 sequence_id,

@@ -99,12 +99,15 @@ impl Producer {
         // - Producer state validation (is_closed)
 
         // Record statistics before publishing
+        let published_bytes =
+            (metadata.as_ref().map(|value| value.len()).unwrap_or(0) + payload.len()) as u64;
         self.record_message_sent(payload.len()).await;
 
         // Persistent path: keep topic write lock off the storage IO wait so multiple
         // producers can enqueue into the write queue concurrently.
         // Non-persistent path still needs &mut Topic for in-memory publish/dispatch.
         let topic_name;
+        let topic_metrics;
         let message_id = {
             let is_persistent = {
                 let topic = self.topic.read().await;
@@ -112,25 +115,32 @@ impl Producer {
             };
 
             if is_persistent {
-                let (name, partition, persistent_runtime) = {
+                let (name, partition, persistent_runtime, metrics) = {
                     let topic = self.topic.read().await;
                     topic.validate_publish_rate_public(metadata.as_ref(), payload.len())?;
                     (
                         topic.name.clone(),
                         topic.partition,
                         topic.persistent_runtime_handle(),
+                        topic.metrics.clone(),
                     )
                 };
                 topic_name = name.clone();
+                topic_metrics = metrics;
                 persistent_runtime
                     .publish_message(&name, partition, metadata, payload)
                     .await?
             } else {
                 let mut topic = self.topic.write().await;
                 topic_name = topic.name.clone();
+                topic_metrics = topic.metrics.clone();
                 topic.publish_message(metadata, payload).await?
             }
         };
+        // This path serves the memory backend and in-process callers; the
+        // RocksDB connection path counts durable batches at the write-queue
+        // worker instead, so there is no double counting.
+        topic_metrics.record_publish(1, published_bytes);
 
         log::debug!(
             "Producer {} published message {}:{} to topic '{}'",

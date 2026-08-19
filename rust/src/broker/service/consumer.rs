@@ -137,6 +137,11 @@ pub struct Consumer {
     /// Failover active-consumer view, updated by dispatcher notifications.
     active_consumer_id: AtomicI64,
     is_active_consumer: AtomicBool,
+    /// Pre-resolved subscription metrics. Resolved lazily via `try_read`
+    /// (never `.read().await`): the dispatch path may run while the
+    /// subscription lock is contended, and awaiting a read here can queue
+    /// behind a pending writer and deadlock the connection.
+    sub_metrics: std::sync::OnceLock<Arc<crate::broker::stats::SubscriptionMetrics>>,
 }
 
 impl std::fmt::Debug for Consumer {
@@ -200,6 +205,7 @@ impl Consumer {
             key_shared_policy,
             active_consumer_id: AtomicI64::new(-1),
             is_active_consumer: AtomicBool::new(false),
+            sub_metrics: std::sync::OnceLock::new(),
         }
     }
 
@@ -261,17 +267,42 @@ impl Consumer {
         self.available_permits.load(Ordering::Relaxed)
     }
 
+    /// Returns the subscription metrics handle, resolving it once via a
+    /// non-blocking `try_read`. `None` only while the subscription lock is
+    /// continuously write-held; the next call retries.
+    fn subscription_metrics(&self) -> Option<&Arc<crate::broker::stats::SubscriptionMetrics>> {
+        if let Some(metrics) = self.sub_metrics.get() {
+            return Some(metrics);
+        }
+        let guard = self.subscription.try_read().ok()?;
+        let _ = self.sub_metrics.set(Arc::clone(&guard.metrics));
+        drop(guard);
+        self.sub_metrics.get()
+    }
+
     /// Record message dispatched to this consumer
     pub async fn record_message_dispatched(&self, message_size: usize) {
-        let mut stats = self.stats.write().await;
-        stats.messages_received += 1;
-        stats.bytes_received += message_size as u64;
+        {
+            let mut stats = self.stats.write().await;
+            stats.messages_received += 1;
+            stats.bytes_received += message_size as u64;
+        }
+        // Fold into subscription-level counters via the cached handle;
+        // never awaits the subscription lock from the dispatch path.
+        if let Some(metrics) = self.subscription_metrics() {
+            metrics.record_dispatched(message_size as u64);
+        }
     }
 
     /// Record message acknowledged
     pub async fn record_message_acked(&self) {
-        let mut stats = self.stats.write().await;
-        stats.messages_acked += 1;
+        {
+            let mut stats = self.stats.write().await;
+            stats.messages_acked += 1;
+        }
+        if let Some(metrics) = self.subscription_metrics() {
+            metrics.record_acked();
+        }
     }
 
     /// Get current statistics

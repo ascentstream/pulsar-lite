@@ -10,6 +10,7 @@ mod key_shared;
 mod read_position;
 pub mod redelivery_controller;
 mod shared;
+pub(crate) use shared::DEFAULT_MAX_UNACKED_MESSAGES_PER_CONSUMER;
 mod single_active;
 pub(crate) mod sticky_key;
 mod traits;

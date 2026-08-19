@@ -91,6 +91,8 @@ pub struct Subscription {
     persistent_runtime: Option<PersistentSubscriptionRuntime>,
     /// Storage backend for reading messages
     storage: SharedStorage,
+    /// Pre-resolved Prometheus handles (label lookup happens once here).
+    pub(crate) metrics: Arc<crate::broker::stats::SubscriptionMetrics>,
 }
 
 impl std::fmt::Debug for Subscription {
@@ -173,6 +175,9 @@ impl Subscription {
             None
         };
 
+        let metrics = Arc::new(crate::broker::stats::SubscriptionMetrics::new(
+            &topic, &name,
+        ));
         Self {
             name,
             topic,
@@ -183,6 +188,7 @@ impl Subscription {
             non_persistent_runtime: None,
             persistent_runtime,
             storage,
+            metrics,
         }
     }
 
@@ -595,6 +601,7 @@ impl Subscription {
         }
 
         if let Some(runtime) = self.persistent_runtime.as_mut() {
+            self.metrics.record_redelivered(dispatchable.len() as u64);
             runtime.redeliver_messages(dispatchable).await;
         }
 
@@ -769,7 +776,7 @@ impl Subscription {
                     let dispatched = runtime.dispatched_messages();
                     let dropped = runtime.dropped_messages();
                     if recv > 0 && recv % 100_000 < 50 {
-                        log::info!(
+                        log::debug!(
                             "[dispatch-metrics] sub='{}' received={} dispatched={} dropped={} drop_rate={:.1}%",
                             self.name, recv, dispatched, dropped,
                             if recv > 0 { dropped as f64 / recv as f64 * 100.0 } else { 0.0 }
@@ -795,6 +802,7 @@ impl Subscription {
             if let Some(runtime) = self.non_persistent_runtime.as_ref() {
                 runtime.record_drop(count);
             }
+            self.metrics.record_dropped_n(count);
         }
     }
 

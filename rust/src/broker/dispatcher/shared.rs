@@ -56,7 +56,7 @@ pub struct SharedDispatcher {
 }
 
 /// Aligns with Apache Pulsar broker.conf maxUnackedMessagesPerConsumer default.
-const DEFAULT_MAX_UNACKED_MESSAGES_PER_CONSUMER: usize = 50_000;
+pub(crate) const DEFAULT_MAX_UNACKED_MESSAGES_PER_CONSUMER: usize = 50_000;
 
 impl SharedDispatcher {
     /// Create a new SharedDispatcher

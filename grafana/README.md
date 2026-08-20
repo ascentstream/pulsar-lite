@@ -27,6 +27,24 @@ Dashboards are provisioned automatically (folder `Pulsar Lite`):
   window-gauge views), connections and rejection reasons, backlog and
   storage totals, write-queue batch sizes, process RSS/CPU.
 
+## Live view during perf tests
+
+The perf harness (`tests/perf/`) starts real brokers, each with a private
+metrics port derived from its protocol port (6651/6652 → 8081/8082,
+6661/6662 → 8091/8092, 6671/6672 → 8101/8102, bound on `0.0.0.0`). This
+stack scrapes all of them (`job="pulsar-lite-perf"`), so with the stack up
+you can watch a run live:
+
+```bash
+docker compose up -d                    # once
+python tests/perf/run_persistent_stress.py ...   # then run any scenario
+# Grafana http://localhost:3000 — dashboards show the running broker's series
+```
+
+Perf targets show DOWN in Prometheus `/targets` while no run is active —
+that is expected. Docker-backed perf runs use `--network host`, so the same
+ports apply.
+
 ## Metric naming conventions
 
 - `pulsar_*` families reproduce native Apache Pulsar names and label sets

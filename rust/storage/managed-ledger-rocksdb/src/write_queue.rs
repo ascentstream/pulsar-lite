@@ -1,6 +1,5 @@
 use crate::factory::RocksDBManagedLedgerFactory;
 use crate::keys;
-use crate::ledger::RocksDBManagedLedger;
 use pulsar_lite_storage_managed_ledger::MessageId;
 use std::collections::HashMap;
 use std::sync::mpsc;
@@ -91,9 +90,6 @@ impl WriteQueue {
     }
 
     fn worker_loop(factory: RocksDBManagedLedgerFactory, rx: mpsc::Receiver<WriteReq>) {
-        // ledger cache that belongs solely to this worker thread; no redundant Arc/Mutex
-        let mut ledgers: HashMap<String, RocksDBManagedLedger> = HashMap::new();
-
         // Batch-size metrics (aggregated to avoid log spam under stress).
         let mut metric_batches: u64 = 0;
         let mut metric_msgs: u64 = 0;
@@ -182,27 +178,26 @@ impl WriteQueue {
                     metric_group_eq1 += 1;
                 }
 
-                if !ledgers.contains_key(&ledger_name) {
-                    match factory.open_owned_ledger(&ledger_name) {
-                        Ok(ledger) => {
-                            ledgers.insert(ledger_name.clone(), ledger);
+                // Route the batch through the factory's SHARED ledger cache:
+                // the worker-owned ledger keeps its runtime state (LAC,
+                // entry counters) private in memory, so appends committed
+                // through it were invisible to readers using the shared
+                // ledger until the LAC-ArcSwap rework. Locking the shared
+                // ledger unifies the in-memory state; batching (one entrylog
+                // flush + one RocksDB write per group) is preserved.
+                let shared = match factory.open_ledger(&ledger_name) {
+                    Ok(shared) => shared,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        for req in reqs {
+                            req.reply.complete(Err(msg.clone()));
                         }
-                        Err(e) => {
-                            let msg = e.to_string();
-                            for req in reqs {
-                                req.reply.complete(Err(msg.clone()));
-                            }
-                            continue;
-                        }
+                        continue;
                     }
-                }
-
-                let Some(ledger) = ledgers.get_mut(&ledger_name) else {
-                    for req in reqs {
-                        req.reply
-                            .complete(Err("ledger missing from worker cache".to_string()));
-                    }
-                    continue;
+                };
+                let mut ledger = match shared.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
                 };
 
                 // Borrow metadata/payload only while reqs is still alive.

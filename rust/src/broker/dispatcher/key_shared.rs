@@ -353,7 +353,7 @@ impl KeySharedDispatcher {
                     break;
                 }
                 remaining_dispatches -= 1;
-                self.subtract_total_permits(batch_count as u32);
+                self.subtract_total_permits(batch_count);
 
                 if consumer
                     .send_message_with_sticky_hash(
@@ -425,7 +425,7 @@ impl KeySharedDispatcher {
                 break;
             }
             remaining_dispatches -= 1;
-            self.subtract_total_permits(batch_count as u32);
+            self.subtract_total_permits(batch_count);
 
             if consumer
                 .send_message_with_sticky_hash(

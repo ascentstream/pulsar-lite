@@ -1193,6 +1193,8 @@ mod tests {
             "pulsar://127.0.0.1:6650".to_string(),
             64 * 1024,
             32 * 1024,
+            #[cfg(feature = "rocksdb-storage")]
+            None,
         );
         let client_framed = Framed::new(client, PulsarFrameCodec::new());
         (server_cnx, client_framed, test_dir)

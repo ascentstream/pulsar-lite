@@ -213,7 +213,7 @@ impl WriteQueue {
 
                 match ledger.add_entries_with_partition_and_metadata(&inputs) {
                     Ok(positions) => {
-                        for (req, position) in reqs.into_iter().zip(positions.into_iter()) {
+                        for (req, position) in reqs.into_iter().zip(positions) {
                             req.reply.complete(Ok(MessageId::from(position)));
                         }
                     }

@@ -309,7 +309,7 @@ impl RocksDBManagedLedger {
 
         // Pass 3: one RocksDB WriteBatch for locations + ledger info.
         let mut batch = WriteBatch::default();
-        for (position, entry_index) in positions.iter().zip(indices.into_iter()) {
+        for (position, entry_index) in positions.iter().zip(indices) {
             let stored_entry_location = StoredEntryLocation::from(entry_index);
             batch.put(
                 keys::managed_entry_key(position.ledger_id, position.entry_id),

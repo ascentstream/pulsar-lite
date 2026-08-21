@@ -335,18 +335,49 @@ where
                 }
 
                 // Durable append completions from write-queue → SendReceipt / SendError.
+                // Batched: drain all pending completions, feed each receipt into the
+                // write buffer, then flush once so a batch of receipts leaves as a
+                // single large TCP write. With TCP_NODELAY enabled, flushing per
+                // receipt would emit one small segment per message (~200k pkt/s at
+                // max produce rate), which is what regressed bulk persistent produce.
                 Some(append) = self.conn_append_rx.recv() => {
-                    let outcome = PersistentSendOutcome {
-                        producer_id: append.producer_id,
-                        sequence_id: append.sequence_id,
-                        result: append.result,
-                    };
-                    if let Err(e) = self.complete_persistent_send(outcome).await {
+                    let mut batch = vec![append];
+                    while let Ok(next) = self.conn_append_rx.try_recv() {
+                        batch.push(next);
+                        if batch.len() >= 128 {
+                            break;
+                        }
+                    }
+
+                    let mut send_error: Option<CnxError> = None;
+                    for append in batch {
+                        let outcome = PersistentSendOutcome {
+                            producer_id: append.producer_id,
+                            sequence_id: append.sequence_id,
+                            result: append.result,
+                        };
+                        if let Err(e) = self.complete_persistent_send(outcome).await {
+                            send_error = Some(e);
+                            break;
+                        }
+                    }
+                    // Single flush for the whole batch (complete_persistent_send only feeds).
+                    if send_error.is_none() {
+                        if let Err(e) =
+                            futures::sink::SinkExt::<ServerCommand>::flush(&mut self.framed)
+                                .await
+                                .map_err(to_cnx_error)
+                        {
+                            send_error = Some(e);
+                        }
+                    }
+                    self.sync_connection_writable_from_framed_buffer();
+
+                    if let Some(e) = send_error {
                         self.set_failed(CloseReason::ProtocolError(e.to_string()));
                         log::error!("Error completing persistent send: {}", e);
                         break Err(e);
                     }
-                    self.sync_connection_writable_from_framed_buffer();
                 }
 
                 // Outbound broker messages are batched: drain all pending, encode
@@ -789,8 +820,10 @@ where
 
         match outcome.result {
             Ok(message_id) => {
+                // Feed only: the caller batches completions and flushes once per
+                // batch (see the conn_append_rx arm in the connection loop).
                 self.framed
-                    .send(ServerCommand::SendReceipt {
+                    .feed(ServerCommand::SendReceipt {
                         producer_id: outcome.producer_id,
                         sequence_id: outcome.sequence_id,
                         ledger_id: message_id.ledger,
@@ -912,6 +945,11 @@ where
                 };
                 self.complete_persistent_send(outcome).await?;
             }
+            // complete_persistent_send only feeds the write buffer; flush the
+            // receipts drained above before enqueueing more work.
+            futures::sink::SinkExt::<ServerCommand>::flush(&mut self.framed)
+                .await
+                .map_err(to_cnx_error)?;
 
             let meta_len = frame.metadata.as_ref().map(|m| m.len()).unwrap_or(0);
             let payload_len = frame.payload.len();
@@ -1304,6 +1342,11 @@ mod tests {
                     break;
                 }
             }
+            // complete_persistent_send only feeds the write buffer; flush so
+            // test clients can observe the receipts.
+            futures::sink::SinkExt::<ServerCommand>::flush(&mut server_cnx.framed)
+                .await
+                .expect("flush persistent receipts");
         }
         let _ = server_cnx;
     }

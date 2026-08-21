@@ -49,7 +49,7 @@ pub async fn next_unacked_candidate(
 
         let Some((entry, next_position, already_acked)) = ({
             let guard = storage.lock().await;
-            // TODO: 
+            // TODO:
             let batch = guard.read_entries_from(topic, &pos, 1)?;
 
             if let Some(entry) = batch.into_iter().next() {

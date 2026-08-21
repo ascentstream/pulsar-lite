@@ -684,7 +684,11 @@ impl Dispatcher for SharedDispatcher {
                 // One pass: dispatch batches while we make progress and have permits.
                 loop {
                     let dispatcher = self
-                        .dispatch_messages_batch(storage.clone(), topic.clone(), subscription.clone())
+                        .dispatch_messages_batch(
+                            storage.clone(),
+                            topic.clone(),
+                            subscription.clone(),
+                        )
                         .await?;
                     if dispatcher == 0 {
                         break;
@@ -783,7 +787,14 @@ mod tests {
         // Fill the delivered-but-unacked set past the budget (3 > 2).
         for i in 0..3u64 {
             consumer
-                .track_message_dispatched(&MessageId { ledger: 0, entry: i, partition: -1 }, 0)
+                .track_message_dispatched(
+                    &MessageId {
+                        ledger: 0,
+                        entry: i,
+                        partition: -1,
+                    },
+                    0,
+                )
                 .await;
         }
 
@@ -794,10 +805,14 @@ mod tests {
                 "test-sub".to_string(),
             )
             .await;
-        assert!(result.is_ok(), "dispatch should not error when budget exceeded");
+        assert!(
+            result.is_ok(),
+            "dispatch should not error when budget exceeded"
+        );
 
         // Budget exceeded -> dispatch paused: nothing should be delivered.
-        let delivered = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+        let delivered =
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
         assert!(
             delivered.is_err(),
             "dispatch must pause when unacked budget is exceeded"

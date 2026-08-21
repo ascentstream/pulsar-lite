@@ -25,7 +25,7 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./dashboards:/var/lib/grafana/dashboards:ro
     ports:
-      - "3000:3000"
+      - "7070:3000"
     depends_on:
       - prometheus
     restart: unless-stopped

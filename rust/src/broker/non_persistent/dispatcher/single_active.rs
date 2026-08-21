@@ -103,8 +103,7 @@ impl NonPersistentDispatcherExclusive {
             let metadata = entry.metadata_bytes();
             let payload = entry.payload_bytes();
 
-            let batch_count =
-                crate::broker::dispatcher::messages_in_batch(entry.metadata());
+            let batch_count = crate::broker::dispatcher::messages_in_batch(entry.metadata());
             if let Some(reservation) = consumer
                 .try_reserve_dispatch(&message_id, metadata, payload, 0, batch_count)
                 .await
@@ -380,8 +379,7 @@ impl NonPersistentDispatcherFailover {
             let metadata = entry.metadata_bytes();
             let payload = entry.payload_bytes();
 
-            let batch_count =
-                crate::broker::dispatcher::messages_in_batch(entry.metadata());
+            let batch_count = crate::broker::dispatcher::messages_in_batch(entry.metadata());
             if let Some(reservation) = active_consumer
                 .try_reserve_dispatch(&message_id, metadata, payload, 0, batch_count)
                 .await

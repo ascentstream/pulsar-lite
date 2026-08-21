@@ -171,11 +171,8 @@ impl TopicMetrics {
         if elapsed >= 1.0 {
             self.rate_in.set(d_messages as f64 / elapsed);
             self.throughput_in.set(d_bytes as f64 / elapsed);
-            self.average_msg_size.set(if d_messages > 0 {
-                (d_bytes / d_messages) as i64
-            } else {
-                0
-            });
+            self.average_msg_size
+                .set(d_bytes.checked_div(d_messages).unwrap_or(0) as i64);
         }
         (d_messages, d_bytes)
     }

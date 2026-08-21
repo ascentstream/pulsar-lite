@@ -147,8 +147,7 @@ impl NonPersistentDispatcherMultipleConsumers {
             let metadata = entry.metadata_bytes();
             let payload = entry.payload_bytes();
 
-            let batch_count =
-                crate::broker::dispatcher::messages_in_batch(entry.metadata());
+            let batch_count = crate::broker::dispatcher::messages_in_batch(entry.metadata());
             let mut delivered = false;
             for offset in 0..self.ordered_consumers.len() {
                 let consumer =

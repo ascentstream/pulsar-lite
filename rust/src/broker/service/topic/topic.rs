@@ -203,7 +203,7 @@ impl Topic {
     pub(crate) fn persistent_runtime_handle(&self) -> PersistentTopicRuntime {
         self.persistent_runtime.clone()
     }
-    
+
     #[cfg(feature = "rocksdb-storage")]
     pub(crate) fn shared_storage(&self) -> SharedStorage {
         self.storage.clone()

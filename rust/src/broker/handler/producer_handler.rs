@@ -192,7 +192,6 @@ pub async fn publish_persistent_send(
     })
 }
 
-
 /// Handle Send command (Push mode - Apache Pulsar style)
 ///
 /// This handler:
@@ -217,10 +216,7 @@ where
         partition: published.message_id.partition,
     };
     framed.send(response).await?;
-    log::debug!(
-        "Sent SendReceipt for sequence {}",
-        published.sequence_id
-    );
+    log::debug!("Sent SendReceipt for sequence {}", published.sequence_id);
     Ok(())
 }
 

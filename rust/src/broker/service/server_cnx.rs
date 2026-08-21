@@ -250,7 +250,6 @@ where
         }
     }
 
-
     pub async fn run(&mut self) -> CnxResult<()> {
         let mut keep_alive_tick = tokio::time::interval(self.keep_alive_interval);
         keep_alive_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -836,7 +835,7 @@ where
         }
 
         #[cfg(feature = "rocksdb-storage")]
-        {   
+        {
             // Persistent path (BK logAddEntry style): enqueue only; completion via channel.
             while self.pending_send_requests >= self.max_persistent_in_flight {
                 let Some(append) = self.conn_append_rx.recv().await else {
@@ -849,10 +848,10 @@ where
                 };
                 self.complete_persistent_send(outcome).await?;
             }
-    
+
             let meta_len = frame.metadata.as_ref().map(|m| m.len()).unwrap_or(0);
             let payload_len = frame.payload.len();
-    
+
             let (topic_name, partition, storage) = {
                 let mut topic_guard = topic.write().await;
                 if let Err(error) =
@@ -878,7 +877,7 @@ where
                     topic_guard.shared_storage(),
                 )
             };
-            
+
             let appender = {
                 let guard = storage.lock().await;
                 guard
@@ -886,11 +885,7 @@ where
                     .map_err(|e| to_cnx_error(e.to_string()))?
             };
             if let Some(appender) = appender {
-                let meta_slice = frame
-                    .metadata
-                    .as_ref()
-                    .map(|b| b.as_ref())
-                    .unwrap_or(&[]);
+                let meta_slice = frame.metadata.as_ref().map(|b| b.as_ref()).unwrap_or(&[]);
                 appender
                     .enqueue_for_connection(
                         &topic_name,
@@ -1238,7 +1233,6 @@ mod tests {
         }
         let _ = server_cnx;
     }
-
 
     #[tokio::test]
     async fn connect_transitions_to_connected_and_records_protocol_version() {
@@ -1608,5 +1602,4 @@ mod tests {
         assert_eq!(server_cnx.pending_send_requests, 0);
         assert!(server_cnx.producers.is_empty());
     }
-
 }

@@ -105,8 +105,7 @@ impl Producer {
         let message_id = {
             let is_persistent = {
                 let topic = self.topic.read().await;
-                topic.runtime_mode()
-                    == crate::broker::service::topic::TopicRuntimeMode::Persistent
+                topic.runtime_mode() == crate::broker::service::topic::TopicRuntimeMode::Persistent
             };
 
             if is_persistent {

@@ -213,28 +213,25 @@ impl PersistentSubscriptionRuntime {
         }
     }
 
-    pub(crate) async fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {
+    /// Apply a Flow's permits to the dispatcher aggregate without triggering
+    /// dispatch. Used by the flow handler, which applies both permit layers
+    /// synchronously under the subscription read lock and triggers dispatch
+    /// separately off the connection event loop.
+    pub(crate) fn apply_flow_permits(&self, consumer_id: u64, additional_permits: u32) {
         if let Some(dispatcher) = self.dispatcher.as_ref() {
-            log::debug!(
-                "Subscription '{}' received flow from consumer {}, permits={}",
-                self.name,
-                consumer_id,
-                additional_permits
-            );
             dispatcher.consumer_flow(consumer_id, additional_permits);
+        }
+    }
 
-            if let Err(e) = dispatcher
-                .dispatch_messages(self.storage.clone(), self.topic.clone(), self.name.clone())
-                .await
-            {
-                log::error!(
-                    "Failed to dispatch messages for subscription '{}': {}",
-                    self.name,
-                    e
-                );
-            }
-        } else {
-            log::warn!("No dispatcher found for subscription '{}'", self.name);
+    pub(crate) async fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {
+        self.apply_flow_permits(consumer_id, additional_permits);
+
+        if let Err(e) = self.dispatch_messages().await {
+            log::error!(
+                "Failed to dispatch messages for subscription '{}': {}",
+                self.name,
+                e
+            );
         }
     }
 }

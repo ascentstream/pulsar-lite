@@ -207,23 +207,38 @@ pub async fn handle_flow(
         .ok_or_else(|| format!("Unknown consumer ID: {}", flow_cmd.consumer_id))?;
 
     // Native Pulsar updates permits on the consumer and then notifies the
-    // dispatcher/subscription path. Non-persistent single-active dispatchers
-    // read consumer-local permits directly, while shared variants also keep
-    // dispatcher-level aggregates.
-    consumer.add_permits(flow_cmd.message_permits).await;
-
-    // Flow permits to dispatcher and trigger dispatch via Subscription.
-    // Dispatch must run in its own task: a dispatch loop can keep running
-    // while triggers keep arriving (should_reschedule), so awaiting it here
-    // would block this connection's event loop and starve reads/acks
-    // (observed as channel growth + OOM under 8-subscription fanout).
+    // dispatcher/subscription path. Both accounting layers (consumer-local
+    // and dispatcher aggregate) must be applied synchronously under the
+    // subscription read lock: remove_consumer_with_recovery subtracts the
+    // consumer-local balance from the aggregate, and non-persistent dispatch
+    // gates on permits from other connections, so a half-applied Flow (one
+    // layer updated, the other still queued in a task) either zeroed the
+    // aggregate on consumer removal or dropped entries a consumer actually
+    // had permits for. Readers share this lock; only subscribe/close writers
+    // can briefly delay it.
     let consumer_id = consumer.consumer_id;
     let permits = flow_cmd.message_permits;
     let subscription = consumer.get_subscription();
-    tokio::spawn(async move {
+    let needs_dispatch_trigger = {
         let sub_guard = subscription.read().await;
-        sub_guard.consumer_flow(consumer_id, permits).await;
-    });
+        consumer.add_permits(permits).await;
+        sub_guard.apply_flow_permits(consumer_id, permits);
+        sub_guard.is_persistent()
+    };
+
+    // Dispatch runs in its own task: a dispatch loop can keep running while
+    // triggers keep arriving (should_reschedule), so awaiting it here would
+    // block this connection's event loop and starve reads/acks (observed as
+    // channel growth + OOM under 8-subscription fanout).
+    if needs_dispatch_trigger {
+        let subscription = subscription.clone();
+        tokio::spawn(async move {
+            let sub_guard = subscription.read().await;
+            if let Err(e) = sub_guard.dispatch_messages().await {
+                log::error!("Flow-triggered dispatch failed: {}", e);
+            }
+        });
+    }
     Ok(())
 }
 

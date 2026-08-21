@@ -798,6 +798,35 @@ impl Subscription {
         }
     }
 
+    /// Apply a Flow's permits to both accounting layers (consumer-local via
+    /// the handler, dispatcher aggregate here) without triggering dispatch.
+    /// Runs synchronously under the subscription read lock so a concurrent
+    /// consumer removal (write lock) never observes a half-applied Flow.
+    pub fn apply_flow_permits(&self, consumer_id: u64, additional_permits: u32) {
+        match self.runtime_mode {
+            SubscriptionRuntimeMode::Persistent => {
+                if let Some(runtime) = self.persistent_runtime.as_ref() {
+                    runtime.apply_flow_permits(consumer_id, additional_permits);
+                } else {
+                    log::warn!(
+                        "No persistent runtime available for subscription '{}'",
+                        self.name
+                    );
+                }
+            }
+            SubscriptionRuntimeMode::NonPersistent => {
+                if let Some(ref runtime) = self.non_persistent_runtime {
+                    runtime.consumer_flow(consumer_id, additional_permits);
+                } else {
+                    log::warn!(
+                        "No non-persistent runtime available for subscription '{}'",
+                        self.name
+                    );
+                }
+            }
+        }
+    }
+
     /// Handle consumer flow command (Apache Pulsar style)
     pub async fn consumer_flow(&self, consumer_id: u64, additional_permits: u32) {
         match self.runtime_mode {

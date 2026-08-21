@@ -123,19 +123,13 @@ impl NonPersistentDispatcherMultipleConsumers {
         let entry_count = entries.len() as u64;
         self.received_messages
             .fetch_add(entry_count, Ordering::Relaxed);
-        let mut pending_entries = entries.into_iter();
-        while let Some(entry) = pending_entries.next() {
-            if self.total_available_permits.load(Ordering::Relaxed) == 0 {
-                log::debug!("Dropping non-persistent shared entry due to zero aggregate permits");
-                self.record_drop(1);
-                entry.release();
-                for remaining in pending_entries.by_ref() {
-                    self.record_drop(1);
-                    remaining.release();
-                }
-                continue;
-            }
-
+        for entry in entries {
+            // No aggregate-permit gate here: the aggregate can momentarily
+            // read zero while a Flow's permit update is still being applied
+            // by its spawned task, and dropping on that stale snapshot lost
+            // messages a consumer actually had permits for. Per-consumer
+            // reservations are the authority; genuine permit exhaustion
+            // fails `use_permit` immediately and drops below as before.
             let Some(start) = self.next_consumer_start_index() else {
                 log::debug!("Dropping non-persistent shared entry due to no connected consumer");
                 self.record_drop(1);
@@ -170,7 +164,9 @@ impl NonPersistentDispatcherMultipleConsumers {
             }
 
             if !delivered {
-                log::debug!("Dropping non-persistent shared entry due to no writable consumer");
+                log::debug!(
+                    "Dropping non-persistent shared entry: no consumer with permits or writability"
+                );
                 self.record_drop(1);
             }
             entry.release();
@@ -297,12 +293,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_dispatcher_limits_batch_by_aggregate_permits() {
+    async fn shared_dispatcher_uses_consumer_permits_when_aggregate_stale() {
         let subscription = create_test_subscription();
         let (consumer, mut rx) = create_test_consumer(1, subscription);
         let mut dispatcher = NonPersistentDispatcherMultipleConsumers::new();
         dispatcher.add_consumer(consumer.clone()).unwrap();
 
+        // Reproduce the flow-application skew: consumer-local permits
+        // applied, dispatcher aggregate still stale. Deliveries must follow
+        // the consumer-local authority, not the stale aggregate.
         consumer.add_permits(2).await;
         dispatcher.consumer_flow(consumer.consumer_id, 1);
 
@@ -316,9 +315,11 @@ mod tests {
 
         let first = rx.recv().await.expect("first message should be delivered");
         assert_eq!(first.1.payload, b"first".to_vec());
+        let second = rx.recv().await.expect("second message should be delivered");
+        assert_eq!(second.1.payload, b"second".to_vec());
         assert!(rx.try_recv().is_err());
-        assert_eq!(dispatcher.dropped_messages(), 1);
-        assert_eq!(consumer.get_available_permits().await, 1);
+        assert_eq!(dispatcher.dropped_messages(), 0);
+        assert_eq!(consumer.get_available_permits().await, 0);
     }
 
     #[tokio::test]

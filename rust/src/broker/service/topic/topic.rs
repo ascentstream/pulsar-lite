@@ -562,7 +562,7 @@ impl Topic {
             topic_guard.dispatch_to_subscriptions().await;
         });
     }
-    
+
     /// Dispatch messages to all subscriptions (Push mode - Apache Pulsar style)
     ///
     /// This should be called after publish_message() to push messages to consumers.

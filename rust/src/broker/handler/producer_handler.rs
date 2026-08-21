@@ -3,10 +3,10 @@
  * Handles producer-related commands: Producer, Send, CloseProducer
  */
 
-use crate::broker::Topic;
 use crate::broker::broker_service::{SharedBrokerService, TopicRef};
 use crate::broker::service::topic::TopicRuntimeMode;
 use crate::broker::service::Producer;
+use crate::broker::Topic;
 use futures::SinkExt;
 use pulsar_lite_proto::codec::{proto::pulsar::BaseCommand, PulsarFrame, PulsarFrameCodec};
 use pulsar_lite_proto::ServerCommand;

@@ -34,9 +34,9 @@ fn murmur3_32(bytes: &[u8], seed: u32) -> u32 {
     const C2: u32 = 0x1b873593;
 
     let mut hash = seed;
-    let mut chunks = bytes.chunks_exact(4);
+    let (chunks, tail) = bytes.as_chunks::<4>();
 
-    for chunk in &mut chunks {
+    for chunk in chunks {
         let mut k = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         k = k.wrapping_mul(C1);
         k = k.rotate_left(15);
@@ -47,7 +47,6 @@ fn murmur3_32(bytes: &[u8], seed: u32) -> u32 {
         hash = hash.wrapping_mul(5).wrapping_add(0xe6546b64);
     }
 
-    let tail = chunks.remainder();
     let mut k1 = 0u32;
     match tail.len() {
         3 => {

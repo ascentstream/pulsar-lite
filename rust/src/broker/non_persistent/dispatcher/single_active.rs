@@ -86,7 +86,9 @@ impl NonPersistentDispatcherExclusive {
             .fetch_add(entries.len() as u64, Ordering::Relaxed);
         let Some(consumer) = &self.consumer else {
             for entry in entries {
-                self.record_drop(1);
+                self.record_drop(
+                    crate::broker::dispatcher::messages_in_batch(entry.metadata()) as u64,
+                );
                 entry.release();
             }
             return Ok(());
@@ -101,15 +103,19 @@ impl NonPersistentDispatcherExclusive {
             let metadata = entry.metadata_bytes();
             let payload = entry.payload_bytes();
 
+            let batch_count =
+                crate::broker::dispatcher::messages_in_batch(entry.metadata());
             if let Some(reservation) = consumer
-                .try_reserve_dispatch(&message_id, metadata, payload, 0)
+                .try_reserve_dispatch(&message_id, metadata, payload, 0, batch_count)
                 .await
             {
                 reservation.send();
-                self.record_dispatched(1);
-                consumer.record_message_dispatched(entry.len()).await;
+                self.record_dispatched(batch_count as u64);
+                consumer
+                    .record_message_dispatched(batch_count, entry.len())
+                    .await;
             } else {
-                self.record_drop(1);
+                self.record_drop(batch_count as u64);
             }
             entry.release();
         }
@@ -357,7 +363,9 @@ impl NonPersistentDispatcherFailover {
             .fetch_add(entries.len() as u64, Ordering::Relaxed);
         let Some(active_consumer) = self.get_active_consumer() else {
             for entry in entries {
-                self.record_drop(1);
+                self.record_drop(
+                    crate::broker::dispatcher::messages_in_batch(entry.metadata()) as u64,
+                );
                 entry.release();
             }
             return Ok(());
@@ -372,15 +380,19 @@ impl NonPersistentDispatcherFailover {
             let metadata = entry.metadata_bytes();
             let payload = entry.payload_bytes();
 
+            let batch_count =
+                crate::broker::dispatcher::messages_in_batch(entry.metadata());
             if let Some(reservation) = active_consumer
-                .try_reserve_dispatch(&message_id, metadata, payload, 0)
+                .try_reserve_dispatch(&message_id, metadata, payload, 0, batch_count)
                 .await
             {
                 reservation.send();
-                self.record_dispatched(1);
-                active_consumer.record_message_dispatched(entry.len()).await;
+                self.record_dispatched(batch_count as u64);
+                active_consumer
+                    .record_message_dispatched(batch_count, entry.len())
+                    .await;
             } else {
-                self.record_drop(1);
+                self.record_drop(batch_count as u64);
             }
             entry.release();
         }

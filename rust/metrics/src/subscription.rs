@@ -84,11 +84,11 @@ impl SubscriptionMetrics {
         }
     }
 
-    /// Records a message dispatched to a consumer of this subscription.
-    pub fn record_dispatched(&self, bytes: u64) {
-        self.out_messages.inc();
+    /// Records dispatched messages (batch-aware count) and their bytes.
+    pub fn record_dispatched(&self, messages: u64, bytes: u64) {
+        self.out_messages.inc_by(messages);
         self.out_bytes.inc_by(bytes);
-        self.broker.broker_out_messages.inc();
+        self.broker.broker_out_messages.inc_by(messages);
         self.broker.broker_out_bytes.inc_by(bytes);
         self.last_consumed_timestamp.set(unix_epoch_seconds());
     }
@@ -197,8 +197,8 @@ mod tests {
     fn dispatched_acked_and_liveness_tick() {
         let metrics =
             SubscriptionMetrics::new("persistent://public/subns/sub-topic", "sub-unit-test");
-        metrics.record_dispatched(120);
-        metrics.record_dispatched(30);
+        metrics.record_dispatched(1, 120);
+        metrics.record_dispatched(1, 30);
         metrics.record_acked();
         metrics.record_redelivered(2);
         metrics.record_dropped();

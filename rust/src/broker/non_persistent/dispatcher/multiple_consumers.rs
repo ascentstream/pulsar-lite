@@ -132,7 +132,9 @@ impl NonPersistentDispatcherMultipleConsumers {
             // fails `use_permit` immediately and drops below as before.
             let Some(start) = self.next_consumer_start_index() else {
                 log::debug!("Dropping non-persistent shared entry due to no connected consumer");
-                self.record_drop(1);
+                self.record_drop(
+                    crate::broker::dispatcher::messages_in_batch(entry.metadata()) as u64,
+                );
                 entry.release();
                 continue;
             };
@@ -145,19 +147,29 @@ impl NonPersistentDispatcherMultipleConsumers {
             let metadata = entry.metadata_bytes();
             let payload = entry.payload_bytes();
 
+            let batch_count =
+                crate::broker::dispatcher::messages_in_batch(entry.metadata());
             let mut delivered = false;
             for offset in 0..self.ordered_consumers.len() {
                 let consumer =
                     self.ordered_consumers[(start + offset) % self.ordered_consumers.len()].clone();
 
                 if let Some(reservation) = consumer
-                    .try_reserve_dispatch(&message_id, metadata.clone(), payload.clone(), 0)
+                    .try_reserve_dispatch(
+                        &message_id,
+                        metadata.clone(),
+                        payload.clone(),
+                        0,
+                        batch_count,
+                    )
                     .await
                 {
                     reservation.send();
-                    self.record_dispatched(1);
-                    self.subtract_total_permits(1);
-                    consumer.record_message_dispatched(entry.len()).await;
+                    self.record_dispatched(batch_count as u64);
+                    self.subtract_total_permits(batch_count);
+                    consumer
+                        .record_message_dispatched(batch_count, entry.len())
+                        .await;
                     delivered = true;
                     break;
                 }
@@ -167,7 +179,7 @@ impl NonPersistentDispatcherMultipleConsumers {
                 log::debug!(
                     "Dropping non-persistent shared entry: no consumer with permits or writability"
                 );
-                self.record_drop(1);
+                self.record_drop(batch_count as u64);
             }
             entry.release();
         }

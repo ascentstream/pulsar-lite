@@ -335,6 +335,19 @@ impl PulsarFrameCodec {
     }
 }
 
+/// Number of client-visible messages carried by one entry's metadata.
+/// Client-visible semantics (Apache Pulsar): a batch entry of N messages
+/// counts as N messages for permit, rate, and counter accounting. Entries
+/// without batch metadata (or undecodable metadata) count as one message.
+pub fn messages_in_batch(metadata: &[u8]) -> u32 {
+    proto::pulsar::MessageMetadata::decode(metadata)
+        .ok()
+        .and_then(|m| m.num_messages_in_batch)
+        .filter(|n| *n > 0)
+        .map(|n| n as u32)
+        .unwrap_or(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

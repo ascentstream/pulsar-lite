@@ -274,6 +274,8 @@ impl Dispatcher for FailoverDispatcher {
                 .await?;
 
                 if let Some(candidate) = candidate {
+                    let batch_count =
+                        crate::broker::dispatcher::messages_in_batch(&candidate.metadata);
                     if primary_consumer
                         .enqueue_message(
                             candidate.message_id,
@@ -284,7 +286,7 @@ impl Dispatcher for FailoverDispatcher {
                     {
                         commit_read_position(&self.read_position, candidate.next_position);
                         primary_consumer
-                            .record_message_dispatched(candidate.payload.len())
+                            .record_message_dispatched(batch_count, candidate.payload.len())
                             .await;
                         dispatched += 1;
                     } else {

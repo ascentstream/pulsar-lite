@@ -138,6 +138,8 @@ impl Dispatcher for ExclusiveDispatcher {
                     .await?;
 
                     if let Some(candidate) = candidate {
+                        let batch_count =
+                            crate::broker::dispatcher::messages_in_batch(&candidate.metadata);
                         if consumer
                             .enqueue_message(
                                 candidate.message_id,
@@ -148,7 +150,7 @@ impl Dispatcher for ExclusiveDispatcher {
                         {
                             commit_read_position(&self.read_position, candidate.next_position);
                             consumer
-                                .record_message_dispatched(candidate.payload.len())
+                                .record_message_dispatched(batch_count, candidate.payload.len())
                                 .await;
                             dispatched += 1;
                         } else {

@@ -350,7 +350,7 @@ impl SharedDispatcher {
                         .await
                     {
                         consumer
-                            .record_message_dispatched(entry.payload.len())
+                            .record_message_dispatched(batch_count, entry.payload.len())
                             .await;
                         dispatched += 1;
                         redelivered += 1;
@@ -413,7 +413,7 @@ impl SharedDispatcher {
                 {
                     commit_read_position(&self.read_position, candidate.next_position);
                     consumer
-                        .record_message_dispatched(candidate.payload.len())
+                        .record_message_dispatched(batch_count, candidate.payload.len())
                         .await;
                     dispatched += 1;
 

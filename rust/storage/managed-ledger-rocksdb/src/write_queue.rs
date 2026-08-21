@@ -212,7 +212,12 @@ impl WriteQueue {
                         let mut observer: Option<Arc<dyn PublishCommitObserver>> = None;
                         let committed_at = Instant::now();
                         for req in &reqs {
-                            committed_messages += 1;
+                            // Batched producers pack N client-visible messages
+                            // into one request; counters must fold N, not 1
+                            // (bytes already fold the full payload).
+                            committed_messages +=
+                                pulsar_lite_proto::codec::messages_in_batch(&req.metadata)
+                                    as u64;
                             let req_bytes = (req.metadata.len() + req.payload.len()) as u64;
                             committed_bytes += req_bytes;
                             metrics.observe_entry_size(req_bytes as f64);

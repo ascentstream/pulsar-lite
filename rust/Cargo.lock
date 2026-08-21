@@ -1070,6 +1070,7 @@ dependencies = [
  "prost",
  "prost-build",
  "pulsar-lite-metrics",
+ "pulsar-lite-proto",
  "pulsar-lite-storage-managed-ledger",
  "rocksdb",
  "serde",

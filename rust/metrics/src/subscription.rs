@@ -166,9 +166,19 @@ impl SubscriptionMetrics {
         (d_out, d_bytes)
     }
 
-    /// Scrape task: state gauges for this subscription.
-    pub fn set_state(&self, back_log: i64, unacked: i64, blocked: bool, consumers: i64) {
-        self.back_log.set(back_log);
+    /// Scrape task: state gauges for this subscription. `back_log: None`
+    /// means "unknown this round" (busy storage lock) and keeps the previous
+    /// value instead of reporting a spurious zero.
+    pub fn set_state(
+        &self,
+        back_log: Option<i64>,
+        unacked: i64,
+        blocked: bool,
+        consumers: i64,
+    ) {
+        if let Some(back_log) = back_log {
+            self.back_log.set(back_log);
+        }
         self.unacked_messages.set(unacked);
         self.blocked_on_unacked.set(blocked as i64);
         self.consumers_count.set(consumers);
@@ -207,7 +217,7 @@ mod tests {
         assert_eq!(d_out, 2);
         assert_eq!(d_bytes, 150);
 
-        metrics.set_state(3, 1, true, 2);
+        metrics.set_state(Some(3), 1, true, 2);
         // State gauges are read through the registry in integration checks;
         // here we only assert the counters did not panic and rates reported.
     }

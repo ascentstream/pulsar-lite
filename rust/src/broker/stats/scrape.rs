@@ -96,8 +96,14 @@ async fn aggregate(
     metrics.broker_subscriptions_count.set(totals.subscriptions);
     metrics.broker_producers_count.set(totals.producers);
     metrics.broker_consumers_count.set(totals.consumers);
-    metrics.broker_msg_backlog.set(totals.backlog);
-    metrics.broker_storage_size.set(totals.stored_bytes as i64);
+    // A skipped entity means "unknown", not zero: hold the previous broker
+    // total instead of reporting a spurious dip under storage contention.
+    if !totals.backlog_skipped {
+        metrics.broker_msg_backlog.set(totals.backlog);
+    }
+    if !totals.storage_skipped {
+        metrics.broker_storage_size.set(totals.stored_bytes as i64);
+    }
     let window_secs = rate_window_secs.max(1) as f64;
     metrics
         .broker_rate_in
@@ -120,7 +126,11 @@ struct WalkTotals {
     producers: i64,
     consumers: i64,
     backlog: i64,
+    /// True when any subscription's backlog read hit a busy lock this round.
+    backlog_skipped: bool,
     stored_bytes: u64,
+    /// True when any topic's stored-bytes read hit a busy lock this round.
+    storage_skipped: bool,
     window_messages: u64,
     window_bytes: u64,
     window_out_messages: u64,
@@ -193,14 +203,17 @@ async fn walk_topic(
     totals.window_bytes += d_bytes;
 
     // Phase 2 (no broker locks held): storage queries and per-consumer
-    // awaits. Storage uses try_lock per query so a busy backend skips the
-    // round instead of queueing behind publish paths.
-    let stored_bytes = match storage.try_lock() {
-        Ok(storage_guard) => storage_guard.stored_bytes(&topic_name),
-        Err(_) => 0,
-    };
-    topic_metrics.set_storage_size(stored_bytes as i64);
-    totals.stored_bytes += stored_bytes;
+    // awaits. Storage uses try_lock per query; a busy lock means "unknown
+    // this round", so gauges keep their previous value instead of dipping
+    // to zero under publish-path contention.
+    match storage.try_lock() {
+        Ok(storage_guard) => {
+            let stored_bytes = storage_guard.stored_bytes(&topic_name);
+            topic_metrics.set_storage_size(stored_bytes as i64);
+            totals.stored_bytes += stored_bytes;
+        }
+        Err(_) => totals.storage_skipped = true,
+    }
 
     for subscription in subscriptions {
         let mut unacked: i64 = 0;
@@ -214,14 +227,13 @@ async fn walk_topic(
         }
 
         let backlog = if subscription.persistent {
-            match storage.try_lock() {
-                Ok(storage_guard) => storage_guard
+            storage.try_lock().ok().map(|storage_guard| {
+                storage_guard
                     .backlog_entries(&topic_name, &subscription.name)
-                    .unwrap_or(0) as i64,
-                Err(_) => 0,
-            }
+                    .unwrap_or(0) as i64
+            })
         } else {
-            0
+            Some(0)
         };
 
         let (d_out, d_out_bytes) = subscription.metrics.update_rates(rate_window_secs);
@@ -232,7 +244,10 @@ async fn walk_topic(
             subscription.consumers.len() as i64,
         );
 
-        totals.backlog += backlog;
+        match backlog {
+            Some(backlog) => totals.backlog += backlog,
+            None => totals.backlog_skipped = true,
+        }
         totals.window_out_messages += d_out;
         totals.window_out_bytes += d_out_bytes;
     }

@@ -92,6 +92,106 @@ where
     Ok(())
 }
 
+/// Result of publishing a Send without writing the receipt to the connection.
+#[derive(Debug, Clone)]
+pub struct PublishedSend {
+    pub producer_id: u64,
+    pub sequence_id: u64,
+    pub message_id: crate::storage::MessageId,
+}
+
+/// Publish a Send command (storage + dispatch) without writing SendReceipt.
+///
+/// Used by ServerCnx persistent pipelining so the connection can keep reading
+/// while appends complete asynchronously.
+pub async fn publish_send(
+    cmd: BaseCommand,
+    frame: PulsarFrame,
+    producers: &HashMap<u64, Arc<Producer>>,
+) -> Result<PublishedSend, Box<dyn std::error::Error + Send + Sync>> {
+    let send_cmd = cmd.send.as_ref().ok_or("Missing send command")?;
+    log::debug!(
+        "Publishing Send command: producer_id={}, sequence_id={}",
+        send_cmd.producer_id,
+        send_cmd.sequence_id
+    );
+
+    let producer = producers
+        .get(&send_cmd.producer_id)
+        .ok_or_else(|| format!("Unknown producer ID: {}", send_cmd.producer_id))?
+        .clone();
+
+    let topic = producer.get_topic();
+    let is_non_persistent = {
+        let topic_guard = topic.read().await;
+        topic_guard.runtime_mode() == TopicRuntimeMode::NonPersistent
+    };
+
+    let message_id = if is_non_persistent {
+        producer.record_message_sent(frame.payload.len()).await;
+        let publish = {
+            let mut topic_guard = topic.write().await;
+            topic_guard.prepare_non_persistent_publish(frame.metadata, frame.payload)?
+        };
+        let message_id = publish.message_id();
+        publish.dispatch_sequential().await;
+        message_id
+    } else {
+        let message_id = producer
+            .publish_message(frame.metadata, frame.payload)
+            .await?;
+
+        log::debug!(
+            "Stored message {}:{}:{} for topic '{}'",
+            message_id.ledger,
+            message_id.entry,
+            message_id.partition,
+            producer.get_topic_name()
+        );
+
+        {
+            let topic = producer.get_topic();
+            let mut topic_guard = topic.write().await;
+            topic_guard.dispatch_to_subscriptions().await;
+        }
+        message_id
+    };
+
+    Ok(PublishedSend {
+        producer_id: send_cmd.producer_id,
+        sequence_id: send_cmd.sequence_id,
+        message_id,
+    })
+}
+
+/// Persistent publish + dispatch for an already-resolved producer.
+pub async fn publish_persistent_send(
+    producer: Arc<Producer>,
+    producer_id: u64,
+    sequence_id: u64,
+    metadata: Option<bytes::Bytes>,
+    payload: bytes::Bytes,
+) -> Result<PublishedSend, Box<dyn std::error::Error + Send + Sync>> {
+    let message_id = producer.publish_message(metadata, payload).await?;
+    log::debug!(
+        "Stored message {}:{}:{} for topic '{}'",
+        message_id.ledger,
+        message_id.entry,
+        message_id.partition,
+        producer.get_topic_name()
+    );
+    {
+        let topic = producer.get_topic();
+        let mut topic_guard = topic.write().await;
+        topic_guard.dispatch_to_subscriptions().await;
+    }
+    Ok(PublishedSend {
+        producer_id,
+        sequence_id,
+        message_id,
+    })
+}
+
 /// Handle Send command (Push mode - Apache Pulsar style)
 ///
 /// This handler:
@@ -107,80 +207,16 @@ pub async fn handle_send<T>(
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let send_cmd = cmd.send.as_ref().ok_or("Missing send command")?;
-    log::debug!(
-        "Handling Send command: producer_id={}, sequence_id={}",
-        send_cmd.producer_id,
-        send_cmd.sequence_id
-    );
-
-    let producer = producers
-        .get(&send_cmd.producer_id)
-        .ok_or_else(|| format!("Unknown producer ID: {}", send_cmd.producer_id))?
-        .clone();
-
-    // Publish and dispatch
-    let topic = producer.get_topic();
-    let is_non_persistent = {
-        let topic_guard = topic.read().await;
-        topic_guard.runtime_mode() == TopicRuntimeMode::NonPersistent
+    let published = publish_send(cmd, frame, producers).await?;
+    let response = ServerCommand::SendReceipt {
+        producer_id: published.producer_id,
+        sequence_id: published.sequence_id,
+        ledger_id: published.message_id.ledger,
+        entry_id: published.message_id.entry,
+        partition: published.message_id.partition,
     };
-
-    if is_non_persistent {
-        // Non-persistent path: publish dispatches immediately at topic level,
-        // following Pulsar's dispatch-or-drop semantics.
-        producer.record_message_sent(frame.payload.len()).await;
-
-        let publish = {
-            let mut topic_guard = topic.write().await;
-            topic_guard.prepare_non_persistent_publish(frame.metadata, frame.payload)?
-        };
-        let message_id = publish.message_id();
-        publish.dispatch_sequential().await;
-
-        // Send SendReceipt response
-        let response = ServerCommand::SendReceipt {
-            producer_id: send_cmd.producer_id,
-            sequence_id: send_cmd.sequence_id,
-            ledger_id: message_id.ledger,
-            entry_id: message_id.entry,
-            partition: message_id.partition,
-        };
-        framed.send(response).await?;
-    } else {
-        // Persistent path: keep existing publish + dispatch flow
-        let message_id = producer
-            .publish_message(frame.metadata, frame.payload)
-            .await?;
-
-        log::debug!(
-            "Stored message {}:{}:{} for topic '{}'",
-            message_id.ledger,
-            message_id.entry,
-            message_id.partition,
-            producer.get_topic_name()
-        );
-
-        // Push mode: Dispatch message to all subscriptions immediately
-        {
-            let topic = producer.get_topic();
-            let mut topic_guard = topic.write().await;
-            topic_guard.dispatch_to_subscriptions().await;
-        }
-
-        // Send SendReceipt response
-        let response = ServerCommand::SendReceipt {
-            producer_id: send_cmd.producer_id,
-            sequence_id: send_cmd.sequence_id,
-            ledger_id: message_id.ledger,
-            entry_id: message_id.entry,
-            partition: message_id.partition,
-        };
-        framed.send(response).await?;
-    }
-
-    log::debug!("Sent SendReceipt for sequence {}", send_cmd.sequence_id);
-
+    framed.send(response).await?;
+    log::debug!("Sent SendReceipt for sequence {}", published.sequence_id);
     Ok(())
 }
 

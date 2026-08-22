@@ -4,7 +4,9 @@ use pulsar_lite_storage_managed_ledger::{
     ManagedLedgerStorage, MessageId, StoredMessage,
 };
 #[cfg(feature = "rocksdb-storage")]
-use pulsar_lite_storage_managed_ledger_rocksdb::RocksDbManagedLedgerStorage;
+use pulsar_lite_storage_managed_ledger_rocksdb::{
+    ConcurrentAppender, RocksDbManagedLedgerStorage,
+};
 #[cfg(feature = "rocksdb-storage")]
 use std::path::Path;
 
@@ -27,6 +29,21 @@ impl ManagedLedgerStore {
     #[cfg(feature = "rocksdb-storage")]
     pub fn rocksdb(path: &Path) -> StorageResult<Self> {
         Ok(Self::RocksDb(RocksDbManagedLedgerStorage::open(path)?))
+    }
+
+    /// Returns a lock-free append handle when the backend supports it (RocksDB write queue).
+    #[cfg(feature = "rocksdb-storage")]
+    pub fn concurrent_appender(&self) -> StorageResult<Option<ConcurrentAppender>> {
+        match self {
+            Self::Memory(_) => Ok(None),
+            Self::RocksDb(inner) => Ok(Some(inner.concurrent_appender()?)),
+        }
+    }
+
+    #[cfg(not(feature = "rocksdb-storage"))]
+    pub fn concurrent_appender(&self) -> StorageResult<Option<()>> {
+        let _ = self;
+        Ok(None)
     }
 }
 

@@ -98,16 +98,43 @@ impl Producer {
         // Record statistics before publishing
         self.record_message_sent(payload.len()).await;
 
-        // Lock topic and publish (Apache Pulsar style)
-        let mut topic = self.topic.write().await;
-        let message_id = topic.publish_message(metadata, payload).await?;
+        // Persistent path: keep topic write lock off the storage IO wait so multiple
+        // producers can enqueue into the write queue concurrently.
+        // Non-persistent path still needs &mut Topic for in-memory publish/dispatch.
+        let topic_name;
+        let message_id = {
+            let is_persistent = {
+                let topic = self.topic.read().await;
+                topic.runtime_mode() == crate::broker::service::topic::TopicRuntimeMode::Persistent
+            };
+
+            if is_persistent {
+                let (name, partition, persistent_runtime) = {
+                    let mut topic = self.topic.write().await;
+                    topic.validate_publish_rate_public(metadata.as_ref(), payload.len())?;
+                    (
+                        topic.name.clone(),
+                        topic.partition,
+                        topic.persistent_runtime_handle(),
+                    )
+                };
+                topic_name = name.clone();
+                persistent_runtime
+                    .publish_message(&name, partition, metadata, payload)
+                    .await?
+            } else {
+                let mut topic = self.topic.write().await;
+                topic_name = topic.name.clone();
+                topic.publish_message(metadata, payload).await?
+            }
+        };
 
         log::debug!(
             "Producer {} published message {}:{} to topic '{}'",
             self.producer_id,
             message_id.ledger,
             message_id.entry,
-            topic.name
+            topic_name
         );
 
         Ok(message_id)

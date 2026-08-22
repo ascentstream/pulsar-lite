@@ -20,13 +20,27 @@ const DEFAULT_LOG_SIZE_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_BATCH: usize = 64;
 const BATCH_WINDOW: Duration = Duration::from_micros(200);
 
+/// One entry to append through the entrylog writer (batch or single).
+#[derive(Debug, Clone)]
+pub struct EntryToAppend {
+    pub ledger_id: u64,
+    pub entry_id: u64,
+    pub partition: i32,
+    pub metadata: Vec<u8>,
+    pub payload: Vec<u8>,
+}
+
 struct WriteRequest {
-    ledger_id: u64,
-    entry_id: u64,
-    partition: i32,
-    metadata: Vec<u8>,
-    payload: Vec<u8>,
+    entry: EntryToAppend,
     reply: mpsc::Sender<Result<EntryIndex>>,
+}
+
+enum WriterMsg {
+    One(WriteRequest),
+    Batch {
+        entries: Vec<EntryToAppend>,
+        reply: mpsc::Sender<Result<Vec<EntryIndex>>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -51,7 +65,7 @@ pub struct EntryRecord {
 #[derive(Debug)]
 pub struct EntryLogStore {
     dir: Arc<PathBuf>,
-    sender: Option<mpsc::Sender<WriteRequest>>,
+    sender: Option<mpsc::Sender<WriterMsg>>,
     _thread: Option<JoinHandle<()>>,
 }
 
@@ -110,15 +124,16 @@ impl WriteState {
     }
 
     // Writes a batch of entries to the log, returning a vector of results indicating success or failure.
-    fn write_batch(&mut self, batch: &[WriteRequest]) -> Vec<Result<EntryIndex>> {
+    // One call performs a single write_all + flush for the whole batch.
+    fn write_batch(&mut self, batch: &[EntryToAppend]) -> Vec<Result<EntryIndex>> {
         let mut results = Vec::with_capacity(batch.len());
         if batch.is_empty() {
             return results;
         }
         let mut batch_len = 0;
-        for req in batch {
+        for entry in batch {
             batch_len +=
-                ENTRY_HEADER_LEN as u64 + req.metadata.len() as u64 + req.payload.len() as u64;
+                ENTRY_HEADER_LEN as u64 + entry.metadata.len() as u64 + entry.payload.len() as u64;
         }
         if self.active_offset > 0 && self.active_offset + batch_len > self.log_size_limit {
             self.active_file_id += 1;
@@ -145,33 +160,34 @@ impl WriteState {
         let mut pending = Vec::with_capacity(batch.len());
         let mut cursor = self.active_offset;
 
-        for req in batch {
-            let checksum = EntryLogStore::checksum(&[&req.metadata, &req.payload]);
-            let metadata_len = req.metadata.len() as u32;
-            let payload_len = req.payload.len() as u32;
-            let len =
-                ENTRY_HEADER_LEN as u64 + req.metadata.len() as u64 + req.payload.len() as u64;
+        for entry in batch {
+            let checksum = EntryLogStore::checksum(&[&entry.metadata, &entry.payload]);
+            let metadata_len = entry.metadata.len() as u32;
+            let payload_len = entry.payload.len() as u32;
+            let len = ENTRY_HEADER_LEN as u64
+                + entry.metadata.len() as u64
+                + entry.payload.len() as u64;
 
             pending.push(EntryIndex {
-                ledger_id: req.ledger_id,
-                entry_id: req.entry_id,
+                ledger_id: entry.ledger_id,
+                entry_id: entry.entry_id,
                 file_id: self.active_file_id,
                 offset: cursor,
                 len,
                 checksum,
-                partition: req.partition,
+                partition: entry.partition,
             });
             buf.extend_from_slice(&ENTRY_MAGIC.to_le_bytes());
             buf.extend_from_slice(&ENTRY_VERSION.to_le_bytes());
             buf.extend_from_slice(&ENTRY_HEADER_LEN.to_le_bytes());
-            buf.extend_from_slice(&req.ledger_id.to_le_bytes());
-            buf.extend_from_slice(&req.entry_id.to_le_bytes());
-            buf.extend_from_slice(&req.partition.to_le_bytes());
+            buf.extend_from_slice(&entry.ledger_id.to_le_bytes());
+            buf.extend_from_slice(&entry.entry_id.to_le_bytes());
+            buf.extend_from_slice(&entry.partition.to_le_bytes());
             buf.extend_from_slice(&metadata_len.to_le_bytes());
             buf.extend_from_slice(&payload_len.to_le_bytes());
             buf.extend_from_slice(&checksum.to_le_bytes());
-            buf.extend_from_slice(&req.metadata);
-            buf.extend_from_slice(&req.payload);
+            buf.extend_from_slice(&entry.metadata);
+            buf.extend_from_slice(&entry.payload);
             cursor += len;
         }
 
@@ -211,7 +227,7 @@ impl EntryLogStore {
         let dir = Arc::new(root.join("entrylog"));
         fs::create_dir_all(dir.as_ref())?;
 
-        let (sender, receiver) = mpsc::channel::<WriteRequest>();
+        let (sender, receiver) = mpsc::channel::<WriterMsg>();
 
         let dir_for_writer = Arc::clone(&dir);
         let handle = thread::Builder::new()
@@ -226,45 +242,77 @@ impl EntryLogStore {
         })
     }
 
-    fn write_loop(dir: Arc<PathBuf>, log_size_limit: u64, receiver: mpsc::Receiver<WriteRequest>) {
+    fn write_loop(dir: Arc<PathBuf>, log_size_limit: u64, receiver: mpsc::Receiver<WriterMsg>) {
         let mut state = match WriteState::open(dir, log_size_limit) {
             Ok(s) => s,
             Err(e) => {
                 let err = format!("{e:#}");
-                while let Ok(req) = receiver.recv() {
-                    let _ = req.reply.send(Err(anyhow!(err.clone())));
+                while let Ok(msg) = receiver.recv() {
+                    match msg {
+                        WriterMsg::One(req) => {
+                            let _ = req.reply.send(Err(anyhow!(err.clone())));
+                        }
+                        WriterMsg::Batch { reply, .. } => {
+                            let _ = reply.send(Err(anyhow!(err.clone())));
+                        }
+                    }
                 }
                 return;
             }
         };
 
         loop {
-            // first, wait for the first request
             let first = match receiver.recv() {
-                Ok(req) => req,
+                Ok(msg) => msg,
                 Err(_) => break,
             };
-            let mut batch = vec![first];
 
-            // second, try to accumulate as much as possible within the batch window.
-            let deadline = Instant::now() + BATCH_WINDOW;
-            while batch.len() < MAX_BATCH {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
+            match first {
+                WriterMsg::Batch { entries, reply } => {
+                    // One client batch → one write_all + one flush (no per-entry RPC).
+                    let results = state.write_batch(&entries);
+                    let aggregated: Result<Vec<EntryIndex>> = results.into_iter().collect();
+                    let _ = reply.send(aggregated);
                 }
-                match receiver.recv_timeout(remaining) {
-                    Ok(req) => batch.push(req),
-                    Err(mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                WriterMsg::One(first_req) => {
+                    let mut ones: Vec<WriteRequest> = vec![first_req];
+                    // Coalesce additional One messages in the batch window.
+                    let deadline = Instant::now() + BATCH_WINDOW;
+                    while ones.len() < MAX_BATCH {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        match receiver.recv_timeout(remaining) {
+                            Ok(WriterMsg::One(req)) => ones.push(req),
+                            Ok(WriterMsg::Batch { entries, reply }) => {
+                                // Flush pending Ones first, then the Batch, to preserve arrival order.
+                                let entries_one: Vec<EntryToAppend> =
+                                    ones.iter().map(|r| r.entry.clone()).collect();
+                                let results = state.write_batch(&entries_one);
+                                for (req, result) in ones.into_iter().zip(results) {
+                                    let _ = req.reply.send(result);
+                                }
+                                ones = Vec::new();
+                                let results = state.write_batch(&entries);
+                                let aggregated: Result<Vec<EntryIndex>> =
+                                    results.into_iter().collect();
+                                let _ = reply.send(aggregated);
+                                break;
+                            }
+                            Err(mpsc::RecvTimeoutError::Timeout) => break,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                    if !ones.is_empty() {
+                        let entries: Vec<EntryToAppend> =
+                            ones.iter().map(|r| r.entry.clone()).collect();
+                        let results = state.write_batch(&entries);
+                        for (req, result) in ones.into_iter().zip(results) {
+                            let _ = req.reply.send(result);
+                        }
+                    }
                 }
-            }
-
-            // third, write the batch to disk
-            let results = state.write_batch(&batch);
-
-            for (req, result) in batch.into_iter().zip(results) {
-                let _ = req.reply.send(result);
             }
         }
     }
@@ -304,19 +352,42 @@ impl EntryLogStore {
         metadata: &[u8],
         payload: &[u8],
     ) -> Result<EntryIndex> {
+        // Single-entry path uses WriterMsg::One so concurrent singles can still
+        // coalesce in the writer BATCH_WINDOW. Multi-entry callers use append_batch.
         let (tx, rx) = mpsc::channel();
         let sender = self
             .sender
             .as_ref()
             .ok_or_else(|| anyhow!("entrylog writer is closed"))?;
-
         sender
-            .send(WriteRequest {
-                ledger_id,
-                entry_id,
-                partition,
-                metadata: metadata.to_vec(),
-                payload: payload.to_vec(),
+            .send(WriterMsg::One(WriteRequest {
+                entry: EntryToAppend {
+                    ledger_id,
+                    entry_id,
+                    partition,
+                    metadata: metadata.to_vec(),
+                    payload: payload.to_vec(),
+                },
+                reply: tx,
+            }))
+            .map_err(|_| anyhow!("entrylog writer disconnected"))?;
+        rx.recv()
+            .map_err(|_| anyhow!("entrylog writer disconnected"))?
+    }
+
+    /// Append many entries in one writer batch (one write_all + one flush).
+    pub fn append_batch(&self, entries: Vec<EntryToAppend>) -> Result<Vec<EntryIndex>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (tx, rx) = mpsc::channel();
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or_else(|| anyhow!("entrylog writer is closed"))?;
+        sender
+            .send(WriterMsg::Batch {
+                entries,
                 reply: tx,
             })
             .map_err(|_| anyhow!("entrylog writer disconnected"))?;

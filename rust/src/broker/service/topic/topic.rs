@@ -199,6 +199,26 @@ impl Topic {
         self.publish_rate_limiter.set_limits(limits);
     }
 
+    /// Clone the persistent runtime handle for lock-free storage IO waits.
+    pub(crate) fn persistent_runtime_handle(&self) -> PersistentTopicRuntime {
+        self.persistent_runtime.clone()
+    }
+
+    #[cfg(feature = "rocksdb-storage")]
+    pub(crate) fn shared_storage(&self) -> SharedStorage {
+        self.storage.clone()
+    }
+
+    /// Rate-limit check used by producers that release the topic write lock
+    /// before waiting on storage IO.
+    pub(crate) fn validate_publish_rate_public(
+        &mut self,
+        metadata: Option<&Bytes>,
+        payload_len: usize,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.validate_publish_rate(metadata, payload_len)
+    }
+
     fn build_non_persistent_publish(
         &self,
         metadata: Option<Bytes>,

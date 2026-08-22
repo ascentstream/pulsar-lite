@@ -1,8 +1,9 @@
 //! Entry-log append/read/rollover integration tests.
 
-use pulsar_lite_storage_managed_ledger_rocksdb::test_support::EntryLogStore;
+use pulsar_lite_storage_managed_ledger_rocksdb::test_support::{EntryLogStore, EntryToAppend};
 use std::fs;
 use tempfile::tempdir;
+
 
 #[test]
 fn entrylog_appends_and_reads_entry_payload() {
@@ -205,3 +206,94 @@ fn entrylog_handles_concurrent_appends() {
         );
     }
 }
+
+#[test]
+fn entrylog_append_batch_empty_returns_empty() {
+    let dir = tempdir().unwrap();
+    let store = EntryLogStore::open(dir.path()).unwrap();
+    let indices = store.append_batch(Vec::new()).unwrap();
+    assert!(indices.is_empty());
+}
+
+#[test]
+fn entrylog_append_batch_writes_stable_offsets_and_reads_back() {
+    let dir = tempdir().unwrap();
+    let store = EntryLogStore::open(dir.path()).unwrap();
+
+    let entries = vec![
+        EntryToAppend {
+            ledger_id: 7,
+            entry_id: 0,
+            partition: -1,
+            metadata: b"m0".to_vec(),
+            payload: b"first".to_vec(),
+        },
+        EntryToAppend {
+            ledger_id: 7,
+            entry_id: 1,
+            partition: 2,
+            metadata: b"m1".to_vec(),
+            payload: b"second".to_vec(),
+        },
+        EntryToAppend {
+            ledger_id: 8,
+            entry_id: 0,
+            partition: -1,
+            metadata: Vec::new(),
+            payload: b"third".to_vec(),
+        },
+    ];
+
+    let indices = store.append_batch(entries).unwrap();
+    assert_eq!(indices.len(), 3);
+
+    assert_eq!(indices[0].ledger_id, 7);
+    assert_eq!(indices[0].entry_id, 0);
+    assert_eq!(indices[0].offset, 0);
+    assert_eq!(indices[0].file_id, indices[1].file_id);
+    assert_eq!(indices[1].offset, indices[0].offset + indices[0].len);
+    assert_eq!(indices[2].offset, indices[1].offset + indices[1].len);
+
+    let e0 = store.read(&indices[0]).unwrap();
+    assert_eq!(e0.metadata, b"m0");
+    assert_eq!(e0.payload, b"first");
+
+    let e1 = store.read(&indices[1]).unwrap();
+    assert_eq!(e1.partition, 2);
+    assert_eq!(e1.metadata, b"m1");
+    assert_eq!(e1.payload, b"second");
+
+    let e2 = store.read(&indices[2]).unwrap();
+    assert_eq!(e2.payload, b"third");
+}
+
+#[test]
+fn entrylog_append_batch_then_single_append_continues_offsets() {
+    let dir = tempdir().unwrap();
+    let store = EntryLogStore::open(dir.path()).unwrap();
+
+    let batch = store
+        .append_batch(vec![
+            EntryToAppend {
+                ledger_id: 1,
+                entry_id: 0,
+                partition: -1,
+                metadata: Vec::new(),
+                payload: b"a".to_vec(),
+            },
+            EntryToAppend {
+                ledger_id: 1,
+                entry_id: 1,
+                partition: -1,
+                metadata: Vec::new(),
+                payload: b"b".to_vec(),
+            },
+        ])
+        .unwrap();
+    let single = store.append(1, 2, -1, b"c").unwrap();
+
+    assert_eq!(single.file_id, batch[0].file_id);
+    assert_eq!(single.offset, batch[1].offset + batch[1].len);
+    assert_eq!(store.read(&single).unwrap().payload, b"c");
+}
+

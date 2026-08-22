@@ -3,9 +3,11 @@ use super::entrylog::EntryLogStore;
 use super::factory::{RocksDBManagedLedgerFactory, SharedLedger};
 use super::keys;
 use super::ledger::RocksDBManagedLedger;
+use super::write_queue::WriteQueue;
 use crate::cursor::first_position;
 use anyhow::{anyhow, Result};
 use rocksdb::{Options, DB};
+use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, MutexGuard};
 
@@ -14,10 +16,93 @@ use pulsar_lite_storage_managed_ledger::{
     ManagedLedgerPosition, ManagedLedgerStorage, MessageId, StoredMessage,
 };
 
+/// Cloned handle that can append without holding `Mutex<Storage>`.
+#[derive(Clone)]
+pub struct ConcurrentAppender {
+    tx: std::sync::mpsc::Sender<super::write_queue::WriteReq>,
+}
+
+impl ConcurrentAppender {
+    /// Async append that waits via oneshot (does not block the Tokio worker thread).
+    pub async fn append_message_with_metadata(
+        &self,
+        topic: &str,
+        partition: i32,
+        metadata: &[u8],
+        payload: &[u8],
+    ) -> Result<MessageId> {
+        WriteQueue::submit_with_tx(&self.tx, topic, partition, metadata, payload)
+            .await
+            .map_err(|e| anyhow!(e))
+    }
+
+    pub async fn append_message(
+        &self,
+        topic: &str,
+        partition: i32,
+        data: &[u8],
+    ) -> Result<MessageId> {
+        self.append_message_with_metadata(topic, partition, &[], data)
+            .await
+    }
+
+    /// Blocking helper for non-async callers/tests.
+    pub fn append_message_with_metadata_blocking(
+        &self,
+        topic: &str,
+        partition: i32,
+        metadata: &[u8],
+        payload: &[u8],
+    ) -> Result<MessageId> {
+        WriteQueue::submit_with_tx_blocking(&self.tx, topic, partition, metadata, payload)
+            .map_err(|e| anyhow!(e))
+    }
+
+    /// Enqueue without waiting (BookKeeper logAddEntry style for connections).
+    /// Completion is delivered on `completion_tx` from the write-queue worker thread.
+    pub fn enqueue_for_connection(
+        &self,
+        topic: &str,
+        partition: i32,
+        metadata: &[u8],
+        payload: &[u8],
+        producer_id: u64,
+        sequence_id: u64,
+        completion_tx: tokio::sync::mpsc::Sender<super::write_queue::ConnAppendResult>,
+    ) -> Result<()> {
+        WriteQueue::enqueue_for_connection(
+            &self.tx,
+            topic,
+            partition,
+            metadata,
+            payload,
+            producer_id,
+            sequence_id,
+            completion_tx,
+        )
+        .map_err(|e| anyhow!(e))
+    }
+}
+
+impl fmt::Debug for ConcurrentAppender {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ConcurrentAppender")
+    }
+}
+
 /// RocksDB-backed managed-ledger store for persistent topics.
-#[derive(Debug)]
 pub struct RocksDbManagedLedgerStorage {
     factory: RocksDBManagedLedgerFactory,
+    write_queue: WriteQueue,
+}
+
+impl fmt::Debug for RocksDbManagedLedgerStorage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RocksDbManagedLedgerStorage")
+            .field("factory", &self.factory)
+            .field("write_queue", &"WriteQueue")
+            .finish()
+    }
 }
 
 impl RocksDbManagedLedgerStorage {
@@ -26,9 +111,18 @@ impl RocksDbManagedLedgerStorage {
         options.create_if_missing(true);
         let db = Arc::new(DB::open(&options, path)?);
         let entry_log = Arc::new(EntryLogStore::open(path)?);
+        let factory = RocksDBManagedLedgerFactory::new(db, entry_log);
 
         Ok(Self {
-            factory: RocksDBManagedLedgerFactory::new(db, entry_log),
+            write_queue: WriteQueue::new(factory.clone()),
+            factory,
+        })
+    }
+
+    /// Clone a queue sender so callers can append without holding outer locks.
+    pub fn concurrent_appender(&self) -> Result<ConcurrentAppender> {
+        Ok(ConcurrentAppender {
+            tx: self.write_queue.sender().map_err(|e| anyhow!(e))?,
         })
     }
 
@@ -101,10 +195,9 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
     }
 
     fn append_message(&mut self, topic: &str, partition: i32, data: &[u8]) -> Result<MessageId> {
-        let shared = self.topic_ledger(topic)?;
-        let mut ledger = Self::lock_ledger(&shared)?;
-        let position = ledger.add_entry_with_partition(partition, data)?;
-        Ok(MessageId::from(position))
+        self.write_queue
+            .submit(topic, partition, &[], data)
+            .map_err(|e| anyhow!(e))
     }
 
     fn append_message_with_metadata(
@@ -114,11 +207,9 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         metadata: &[u8],
         payload: &[u8],
     ) -> Result<MessageId> {
-        let shared = self.topic_ledger(topic)?;
-        let mut ledger = Self::lock_ledger(&shared)?;
-        let position =
-            ledger.add_entry_with_partition_and_metadata(partition, metadata, payload)?;
-        Ok(MessageId::from(position))
+        self.write_queue
+            .submit(topic, partition, metadata, payload)
+            .map_err(|e| anyhow!(e))
     }
 
     fn initialize_or_open_cursor(

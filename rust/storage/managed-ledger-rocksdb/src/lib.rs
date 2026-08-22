@@ -6,8 +6,10 @@ mod keys;
 mod ledger;
 mod metadata;
 mod store;
+mod write_queue;
 
-pub use store::RocksDbManagedLedgerStorage;
+pub use store::{ConcurrentAppender, RocksDbManagedLedgerStorage};
+pub use write_queue::ConnAppendResult;
 
 /// Internal types exposed for integration tests in `tests/`.
 #[doc(hidden)]
@@ -15,7 +17,7 @@ pub mod test_support {
     pub use crate::cursor::{
         ack_managed_cursor_shared, is_managed_position_acknowledged, RocksDBManagedCursor,
     };
-    pub use crate::entrylog::EntryLogStore;
+    pub use crate::entrylog::{EntryLogStore, EntryToAppend};
     pub use crate::factory::RocksDBManagedLedgerFactory;
     pub use crate::ledger::RocksDBManagedLedger;
     pub use crate::metadata::{proto, StoredEntryLocation, StoredManagedLedgerInfo};

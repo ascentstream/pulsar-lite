@@ -54,23 +54,23 @@ SCENARIOS: list[Scenario] = [
         name="stress_persistent_producer_max_rate",
         kind="produce",
         broker="persistent_stress",
-        description="单 producer 全速发送 500k 条",
-        producer_args=["-m", "500000", "-s", "1024", "-r", "999999", "-o", "1000"],
+        description="单 producer 全速发送 200w 条",
+        producer_args=["-m", "2000000", "-s", "1024", "-r", "999999", "-o", "1000"],
     ),
     Scenario(
         name="stress_persistent_producer_multi_producer",
         kind="produce",
         broker="persistent_stress",
-        description="4 producers 并发全速发送 100k 条",
+        description="4 producers 并发全速发送 200w 条",
         producer_args=[
             "-m",
-            "100000",
+            "2000000",
             "-s",
             "1024",
             "-r",
             "999999",
             "-n",
-            "4",
+            "1",
             "-threads",
             "4",
             "-c",
@@ -594,7 +594,7 @@ def main(argv: list[str]) -> int:
         broker.start()
 
         try:
-            
+
             for scenario in broker_scenarios:
                 print(f"\n[{scenario.name}] {scenario.description}")
                 scenario_dir = run_artifacts / scenario.name
@@ -640,7 +640,7 @@ def main(argv: list[str]) -> int:
                         result["perf_data_file"] = None
                         result["flamegraph_file"] = None
                         print("  perf data not captured", file=sys.stderr)
-                    
+
                     results["scenarios"].append(
                         {
                             "name": scenario.name,

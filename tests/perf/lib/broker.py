@@ -21,6 +21,15 @@ class BrokerConfig:
     name: str
     port: int
     default_partitions: int
+    # Prometheus /metrics port; derived so existing call sites keep 3-arg
+    # construction. Offset 1430 keeps the base mapping 6650 -> 8080 (default
+    # web service port), giving every perf broker a private metrics port
+    # (6651 -> 8081, 6662 -> 8092, 6672 -> 8102, ...).
+    metrics_port: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.metrics_port is None:
+            self.metrics_port = self.port + 1430
 
 
 class BrokerSampler(threading.Thread):
@@ -97,12 +106,25 @@ class BrokerSampler(threading.Thread):
 
 def _config_text(config: BrokerConfig, db_path: str) -> str:
     config_text = BASE_CONFIG.read_text(encoding="utf-8")
-    config_text = re.sub(
+    # The base config has two `addr` lines: the protocol listener at the top
+    # and the metrics endpoint inside the [metrics] section. Rewrite them
+    # separately so they never collapse onto the same port (both listeners
+    # racing for one bind), and keep metrics on 0.0.0.0 so the compose
+    # Prometheus can scrape it through host.docker.internal.
+    head, sep, metrics_section = config_text.partition("[metrics]")
+    head = re.sub(
         r'^addr\s*=\s*".*"$',
         f'addr = "127.0.0.1:{config.port}"',
-        config_text,
+        head,
         flags=re.MULTILINE,
     )
+    metrics_section = re.sub(
+        r'^addr\s*=\s*".*"$',
+        f'addr = "0.0.0.0:{config.metrics_port}"',
+        metrics_section,
+        flags=re.MULTILINE,
+    )
+    config_text = head + sep + metrics_section
     config_text = re.sub(
         r'^db_path\s*=\s*".*"$',
         f'db_path = "{db_path}"',

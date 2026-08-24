@@ -26,3 +26,12 @@ connection_liveness_check_timeout_secs = 10
 # Connection limits (0 = unlimited)
 max_connections = 0
 max_connections_per_ip = 0
+
+# Prometheus metrics endpoint (GET /metrics)
+[metrics]
+enabled = true
+addr = "0.0.0.0:8080"
+# Value of the `cluster` label on every exported family
+cluster = "pulsar-lite"
+# Window (seconds) for derived rate gauges (pulsar_rate_in etc.)
+rate_window_secs = 60

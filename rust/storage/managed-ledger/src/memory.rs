@@ -306,10 +306,40 @@ impl ManagedLedgerStorage for InMemoryManagedLedgerStorage {
         let cursor_key = format!("{}:{}", topic, subscription);
         is_message_acknowledged(self.subscription_cursors.get(&cursor_key), message_id.entry)
     }
-
     fn get_mark_delete_position(&self, topic: &str, subscription: &str) -> Option<u64> {
         let cursor_key = format!("{}:{}", topic, subscription);
         self.subscription_cursors.get(&cursor_key)?.mark_delete
+    }
+
+    fn backlog_entries(&self, topic: &str, subscription: &str) -> Option<u64> {
+        let cursor_key = format!("{}:{}", topic, subscription);
+        let total = self.messages(topic).len() as u64;
+
+        // Shared subscription: frontier plus individual holes.
+        if let Some(cursor) = self.subscription_cursors.get(&cursor_key) {
+            let acked = cursor.mark_delete.map_or(0, |mark| mark + 1);
+            return Some(total.saturating_sub(acked));
+        }
+
+        // Exclusive/failover: plain u64 frontier; u64::MAX = nothing acked.
+        match self.cursors.get(&cursor_key).copied() {
+            Some(mark) if mark != u64::MAX => Some(total.saturating_sub(mark + 1)),
+            _ => Some(total),
+        }
+    }
+
+    fn stored_bytes(&self, topic: &str) -> u64 {
+        self.messages(topic)
+            .iter()
+            .map(|(message_id, payload)| {
+                let metadata = self
+                    .entry_metadata
+                    .get(message_id)
+                    .map(|value| value.len())
+                    .unwrap_or(0);
+                metadata + payload.len()
+            })
+            .sum::<usize>() as u64
     }
 }
 

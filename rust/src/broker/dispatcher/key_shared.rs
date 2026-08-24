@@ -366,7 +366,7 @@ impl KeySharedDispatcher {
                     .await
                 {
                     consumer
-                        .record_message_dispatched(entry.payload.len())
+                        .record_message_dispatched(batch_count, entry.payload.len())
                         .await;
                     progress += 1;
                 } else {
@@ -439,7 +439,7 @@ impl KeySharedDispatcher {
             {
                 commit_read_position(&self.read_position, candidate.next_position);
                 consumer
-                    .record_message_dispatched(candidate.payload.len())
+                    .record_message_dispatched(batch_count, candidate.payload.len())
                     .await;
                 progress += 1;
             } else {

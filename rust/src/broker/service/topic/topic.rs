@@ -227,6 +227,9 @@ pub struct Topic {
     /// Storage backend
     storage: SharedStorage,
     publish_rate_limiter: TopicPublishRateLimiter,
+    /// Pre-resolved Prometheus handles for this topic (label lookup happens
+    /// once here; publish paths only touch atomic counters).
+    pub(crate) metrics: Arc<crate::broker::stats::TopicMetrics>,
     /// Ordered fan-out queue for non-persistent publishes (lock-free hot path).
     /// Mirrors the persistent write-queue shape: connection tasks enqueue under
     /// a short read lock and return immediately; a single worker drains FIFO,
@@ -260,6 +263,7 @@ impl Topic {
             runtime_mode
         );
         let persistent_runtime = PersistentTopicRuntime::new(storage.clone());
+        let metrics = Arc::new(crate::broker::stats::TopicMetrics::new(&name));
         let mut topic = Self {
             name,
             partition,
@@ -269,6 +273,7 @@ impl Topic {
             persistent_runtime,
             storage,
             publish_rate_limiter: TopicPublishRateLimiter::new(),
+            metrics,
             non_persistent_fanout_tx: None,
         };
         if topic.runtime_mode == TopicRuntimeMode::NonPersistent {
@@ -346,6 +351,7 @@ impl Topic {
             .saturating_add(payload_len as u64);
 
         if !self.publish_rate_limiter.allow_publish(1, total_bytes) {
+            self.metrics.record_rate_limit_reject();
             return Err(Box::new(TopicPublishRateExceeded {
                 topic_name: self.name.clone(),
             }));
@@ -417,13 +423,20 @@ impl Topic {
         metadata: Option<Bytes>,
         payload: Bytes,
     ) -> Result<MessageId, Box<dyn std::error::Error + Send + Sync>> {
-        let (publish, fanout_tx) = {
+        let accepted_bytes =
+            (metadata.as_ref().map(|m| m.len()).unwrap_or(0) + payload.len()) as u64;
+        let (publish, fanout_tx, metrics) = {
             let topic_guard = topic.read().await;
             let publish = topic_guard.prepare_non_persistent_publish(metadata, payload)?;
-            (publish, topic_guard.non_persistent_fanout_tx.clone())
+            (
+                publish,
+                topic_guard.non_persistent_fanout_tx.clone(),
+                topic_guard.metrics.clone(),
+            )
         };
         let message_id = publish.message_id();
         Self::fan_out_non_persistent(publish, fanout_tx).await?;
+        metrics.record_publish(1, accepted_bytes);
         Ok(message_id)
     }
 
@@ -606,6 +619,24 @@ impl Topic {
     /// Get subscription count
     pub fn get_subscription_count(&self) -> usize {
         self.subscriptions.len()
+    }
+
+    /// Lock-free consumer count for the metrics aggregation loop.
+    ///
+    /// Uses `try_read` on each subscription: under churn a busy
+    /// subscription is skipped, which is acceptable for a gauge sampled
+    /// every few seconds.
+    pub fn total_consumer_count_snapshot(&self) -> i64 {
+        self.subscriptions
+            .values()
+            .filter_map(|subscription| subscription.try_read().ok())
+            .map(|guard| guard.get_consumer_count() as i64)
+            .sum()
+    }
+
+    /// Snapshot of subscriptions for the metrics aggregation loop.
+    pub fn get_all_subscriptions(&self) -> Vec<super::SharedSubscription> {
+        self.subscriptions.values().cloned().collect()
     }
 
     /// Check if subscription exists

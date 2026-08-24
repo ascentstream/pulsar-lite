@@ -1,0 +1,253 @@
+{
+  "uid": "pulsar-lite-topics",
+  "title": "Pulsar Lite / Topics",
+  "tags": ["pulsar-lite"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "cluster",
+        "label": "Cluster",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(pulsar_rate_in, cluster)",
+        "refresh": 2,
+        "includeAll": false,
+        "multi": false,
+        "current": { "text": "pulsar-lite", "value": "pulsar-lite" }
+      },
+      {
+        "name": "namespace",
+        "label": "Namespace",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(pulsar_rate_in{cluster=\"$cluster\"}, namespace)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      },
+      {
+        "name": "topic",
+        "label": "Topic",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(pulsar_rate_in{cluster=\"$cluster\", namespace=~\"$namespace\"}, topic)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      },
+      {
+        "name": "subscription",
+        "label": "Subscription",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(pulsar_subscription_msg_rate_out{cluster=\"$cluster\", namespace=~\"$namespace\", topic=~\"$topic\"}, subscription)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Publish rate (msg/s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "pulsar_rate_in{cluster=\"$cluster\", namespace=~\"$namespace\", topic=~\"$topic\"}",
+          "legendFormat": "{{namespace}}/{{topic}} [{{partition}}]"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Publish throughput (bytes/s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "pulsar_throughput_in{cluster=\"$cluster\", namespace=~\"$namespace\", topic=~\"$topic\"}",
+          "legendFormat": "{{namespace}}/{{topic}} [{{partition}}]"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Delivery rate (msg/s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "pulsar_subscription_msg_rate_out{cluster=\"$cluster\", namespace=~\"$namespace\", topic=~\"$topic\", subscription=~\"$subscription\"}",
+          "legendFormat": "{{topic}}/{{subscription}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Delivery throughput (bytes/s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "pulsar_subscription_msg_throughput_out{cluster=\"$cluster\", namespace=~\"$namespace\", topic=~\"$topic\", subscription=~\"$subscription\"}",
+          "legendFormat": "{{topic}}/{{subscription}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Producers / Consumers / Subscriptions",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum(pulsar_producers_count{cluster=\"$cluster\", namespace=~\"$namespace\", topic=~\"$topic\"})",
+          "legendFormat": "producers"
+        },
+        {
+          "expr": "sum(pulsar_consumers_count{cluster=\"$cluster\", namespace=~\"$namespace\", topic=~\"$topic\"})",
+          "legendFormat": "consumers"
+        },
+        {
+          "expr": "sum(pulsar_subscriptions_count{cluster=\"$cluster\", namespace=~\"$namespace\", topic=~\"$topic\"})",
+          "legendFormat": "subscriptions"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Subscription backlog",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "targets": [
+        {
+          "expr": "pulsar_subscription_back_log{cluster=\"$cluster\", namespace=~\"$namespace\", topic=~\"$topic\", subscription=~\"$subscription\"}",
+          "legendFormat": "{{topic}}/{{subscription}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Unacked messages (dispatched, not acked)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "targets": [
+        {
+          "expr": "pulsar_subscription_unacked_messages{cluster=\"$cluster\", namespace=~\"$namespace\", topic=~\"$topic\", subscription=~\"$subscription\"}",
+          "legendFormat": "{{topic}}/{{subscription}}"
+        },
+        {
+          "expr": "pulsar_subscription_blocked_on_unacked_messages{cluster=\"$cluster\", namespace=~\"$namespace\", topic=~\"$topic\", subscription=~\"$subscription\"}",
+          "legendFormat": "{{topic}}/{{subscription}} blocked"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Storage size (bytes)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "targets": [
+        {
+          "expr": "sum(pulsar_storage_size{cluster=\"$cluster\", namespace=~\"$namespace\", topic=~\"$topic\"})",
+          "legendFormat": "stored bytes"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Redelivery rate (msg/s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "targets": [
+        {
+          "expr": "pulsar_subscription_msg_rate_redeliver{cluster=\"$cluster\", namespace=~\"$namespace\", topic=~\"$topic\", subscription=~\"$subscription\"}",
+          "legendFormat": "{{topic}}/{{subscription}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Durable publish latency (e2e, P50/P99)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "fieldConfig": {
+        "defaults": { "unit": "s" },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(pulsar_storage_write_latency_bucket[1m])))",
+          "legendFormat": "P50"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(pulsar_storage_write_latency_bucket[1m])))",
+          "legendFormat": "P99"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Ledger append latency (P50/P99)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 32 },
+      "fieldConfig": {
+        "defaults": { "unit": "s" },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(pulsar_storage_ledger_write_latency_bucket[1m])))",
+          "legendFormat": "P50"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(pulsar_storage_ledger_write_latency_bucket[1m])))",
+          "legendFormat": "P99"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Entry size distribution (P50/P99/max)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 32 },
+      "fieldConfig": {
+        "defaults": { "unit": "bytes" },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(pulsar_entry_size_bucket[5m])))",
+          "legendFormat": "P50"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(pulsar_entry_size_bucket[5m])))",
+          "legendFormat": "P99"
+        }
+      ]
+    }
+  ]
+}

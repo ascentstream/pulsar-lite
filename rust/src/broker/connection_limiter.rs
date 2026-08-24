@@ -63,6 +63,15 @@ impl ConnectionLimiter {
         })
     }
 
+    /// Current number of tracked connections (for the
+    /// `pulsar_active_connections` gauge).
+    pub fn active_connections(&self) -> usize {
+        match self.inner.lock() {
+            Ok(state) => state.total_connections,
+            Err(poisoned) => poisoned.into_inner().total_connections,
+        }
+    }
+
     fn release(&self, ip: IpAddr) {
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 

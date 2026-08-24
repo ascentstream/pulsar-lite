@@ -870,6 +870,9 @@ where
             .unwrap_or(0)
             + frame.payload.len();
         if message_size > self.max_message_size {
+            crate::broker::stats::get()
+                .error_counter("message_too_large")
+                .inc();
             self.framed
                 .send(ServerCommand::SendError {
                     producer_id,
@@ -914,6 +917,9 @@ where
                 Ok(()) => Ok(()),
                 Err(error) => {
                     if let Some(rate_error) = error.downcast_ref::<TopicPublishRateExceeded>() {
+                        crate::broker::stats::get()
+                            .error_counter("non_persistent_rate_exceeded")
+                            .inc();
                         self.framed
                             .send(ServerCommand::SendError {
                                 producer_id,
@@ -954,12 +960,16 @@ where
             let meta_len = frame.metadata.as_ref().map(|m| m.len()).unwrap_or(0);
             let payload_len = frame.payload.len();
 
-            let (topic_name, partition) = {
+            let (topic_name, partition, topic_metrics) = {
                 let topic_guard = topic.read().await;
                 if let Err(error) =
                     topic_guard.validate_publish_rate_public(frame.metadata.as_ref(), payload_len)
                 {
                     if let Some(rate_error) = error.downcast_ref::<TopicPublishRateExceeded>() {
+                        topic_guard.metrics.record_rate_limit_reject();
+                        crate::broker::stats::get()
+                            .error_counter("publish_rate_exceeded")
+                            .inc();
                         self.framed
                             .send(ServerCommand::SendError {
                                 producer_id,
@@ -973,7 +983,11 @@ where
                     }
                     return Err(to_cnx_error(error));
                 }
-                (topic_guard.name.clone(), topic_guard.partition)
+                (
+                    topic_guard.name.clone(),
+                    topic_guard.partition,
+                    topic_guard.metrics.clone(),
+                )
             };
 
             // Write-queue handle was cloned once at connection setup; the hot
@@ -988,6 +1002,7 @@ where
                         frame.payload.as_ref(),
                         producer_id,
                         sequence_id,
+                        Some(topic_metrics),
                         self.conn_append_tx.clone(),
                     )
                     .map_err(to_cnx_error)?;
@@ -1034,6 +1049,9 @@ where
                 }
                 self.maybe_resume_read_after_send();
                 if let Some(rate_error) = error.downcast_ref::<TopicPublishRateExceeded>() {
+                    crate::broker::stats::get()
+                        .error_counter("memory_backend_rate_exceeded")
+                        .inc();
                     self.framed
                         .send(ServerCommand::SendError {
                             producer_id,

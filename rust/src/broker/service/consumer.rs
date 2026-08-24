@@ -137,6 +137,11 @@ pub struct Consumer {
     /// Failover active-consumer view, updated by dispatcher notifications.
     active_consumer_id: AtomicI64,
     is_active_consumer: AtomicBool,
+    /// Pre-resolved subscription metrics. Resolved lazily via `try_read`
+    /// (never `.read().await`): the dispatch path may run while the
+    /// subscription lock is contended, and awaiting a read here can queue
+    /// behind a pending writer and deadlock the connection.
+    sub_metrics: std::sync::OnceLock<Arc<crate::broker::stats::SubscriptionMetrics>>,
 }
 
 impl std::fmt::Debug for Consumer {
@@ -200,6 +205,7 @@ impl Consumer {
             key_shared_policy,
             active_consumer_id: AtomicI64::new(-1),
             is_active_consumer: AtomicBool::new(false),
+            sub_metrics: std::sync::OnceLock::new(),
         }
     }
 
@@ -261,17 +267,44 @@ impl Consumer {
         self.available_permits.load(Ordering::Relaxed)
     }
 
-    /// Record message dispatched to this consumer
-    pub async fn record_message_dispatched(&self, message_size: usize) {
-        let mut stats = self.stats.write().await;
-        stats.messages_received += 1;
-        stats.bytes_received += message_size as u64;
+    /// Returns the subscription metrics handle, resolving it once via a
+    /// non-blocking `try_read`. `None` only while the subscription lock is
+    /// continuously write-held; the next call retries.
+    fn subscription_metrics(&self) -> Option<&Arc<crate::broker::stats::SubscriptionMetrics>> {
+        if let Some(metrics) = self.sub_metrics.get() {
+            return Some(metrics);
+        }
+        let guard = self.subscription.try_read().ok()?;
+        let _ = self.sub_metrics.set(Arc::clone(&guard.metrics));
+        drop(guard);
+        self.sub_metrics.get()
+    }
+
+    /// Record entries dispatched to this consumer. `messages` is the
+    /// client-visible message count (batch-aware; see
+    /// `dispatcher::messages_in_batch`), `message_size` is entry bytes.
+    pub async fn record_message_dispatched(&self, messages: u32, message_size: usize) {
+        {
+            let mut stats = self.stats.write().await;
+            stats.messages_received += messages as u64;
+            stats.bytes_received += message_size as u64;
+        }
+        // Fold into subscription-level counters via the cached handle;
+        // never awaits the subscription lock from the dispatch path.
+        if let Some(metrics) = self.subscription_metrics() {
+            metrics.record_dispatched(messages as u64, message_size as u64);
+        }
     }
 
     /// Record message acknowledged
     pub async fn record_message_acked(&self) {
-        let mut stats = self.stats.write().await;
-        stats.messages_acked += 1;
+        {
+            let mut stats = self.stats.write().await;
+            stats.messages_acked += 1;
+        }
+        if let Some(metrics) = self.subscription_metrics() {
+            metrics.record_acked();
+        }
     }
 
     /// Get current statistics
@@ -465,9 +498,11 @@ impl Consumer {
         metadata: Bytes,
         payload: Bytes,
         redelivery_count: u32,
+        permits: u32,
     ) -> Option<DispatchReservation> {
-        // Step 1: Acquire flow-control permit
-        if !self.use_permit().await {
+        // Step 1: Acquire flow-control permits (per client-visible message;
+        // see `try_use_permits`).
+        if !self.try_use_permits(permits).await {
             return None;
         }
 
@@ -484,7 +519,8 @@ impl Consumer {
 
         // Step 3: Connection must currently be writable.
         if !self.is_writable() {
-            self.available_permits.fetch_add(1, Ordering::Relaxed);
+            self.available_permits
+                .fetch_add(permits as i32, Ordering::Relaxed);
             return None;
         }
 
@@ -492,7 +528,8 @@ impl Consumer {
         let owned_permit = match self.message_tx.clone().try_reserve_owned() {
             Ok(p) => p,
             Err(_) => {
-                self.available_permits.fetch_add(1, Ordering::Relaxed);
+                self.available_permits
+                    .fetch_add(permits as i32, Ordering::Relaxed);
                 return None;
             }
         };
@@ -504,7 +541,8 @@ impl Consumer {
             .track_message_dispatched(message_id, redelivery_count)
             .await
         {
-            self.available_permits.fetch_add(1, Ordering::Relaxed);
+            self.available_permits
+                .fetch_add(permits as i32, Ordering::Relaxed);
             // owned_permit drops here, releasing channel slot
             return None;
         }
@@ -925,7 +963,7 @@ mod tests {
         assert_eq!(consumer.get_available_permits().await, 3);
 
         // Record messages
-        consumer.record_message_dispatched(100).await;
+        consumer.record_message_dispatched(1, 100).await;
         consumer.record_message_acked().await;
 
         let stats = consumer.get_stats().await;

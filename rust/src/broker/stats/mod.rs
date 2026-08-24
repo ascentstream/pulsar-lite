@@ -1,8 +1,11 @@
 /*
  * Broker Stats Module
- * Provides metrics collection and monitoring
+ * Scrape-time aggregation plus re-exports of the metric handles defined in
+ * the `pulsar-lite-metrics` crate.
  */
 
-mod metrics;
+pub mod scrape;
 
-pub use metrics::{BrokerMetrics, SharedMetrics};
+pub use pulsar_lite_metrics::{
+    get, init, parse_topic_labels, BrokerMetrics, SubscriptionMetrics, TopicLabels, TopicMetrics,
+};

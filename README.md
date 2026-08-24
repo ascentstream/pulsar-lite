@@ -39,6 +39,7 @@ local setup cost:
 | Non-persistent topics | Dispatch-or-drop runtime semantics with coverage for flow control, disconnect/reconnect, ordering, dynamic consumers, and KeyShared routing. |
 | Persistent topics | RocksDB-backed managed-ledger style storage is available behind the `rocksdb-storage` feature. |
 | Subscription modes | Shared, Failover, Exclusive, and KeyShared are covered by Rust and Python integration tests. |
+| Monitoring | Prometheus metrics on `GET /metrics` (port 8080): broker/topic/subscription counters, backlog and unacked gauges, storage latency and entry-size histograms, process metrics. Optional Grafana stack under `grafana/`. |
 | Partitioned topics | Default partition metadata and partition topic routing are supported for local testing. |
 | Python package | Provides a small helper SDK that can start and manage a local broker process. |
 
@@ -108,6 +109,39 @@ Stop the broker:
 
 ```bash
 ../rust/pulsar-lite.sh stop
+```
+
+## Monitoring
+
+The broker exposes Prometheus metrics on `GET /metrics` (default
+`0.0.0.0:8080`, same port model as native Pulsar's web service). Metric
+families reuse native Pulsar names and labels (`pulsar_rate_in`,
+`pulsar_subscription_back_log`, `pulsar_storage_write_latency`, ...), so
+existing dashboards and PromQL translate directly; extensions unique to
+Pulsar Lite use the `pulsar_lite_*` prefix.
+
+Quick check:
+
+```bash
+curl -s localhost:8080/metrics | grep -E '^pulsar_(broker|subscription)'
+```
+
+Configuration (`rust/pulsar-lite.toml`):
+
+```toml
+[metrics]
+enabled = true             # false: no listener, no scrape aggregation
+addr = "0.0.0.0:8080"
+cluster = "pulsar-lite"    # `cluster` label value on every family
+rate_window_secs = 60      # window for pulsar_rate_in-style gauges
+```
+
+A ready-to-run Prometheus + Grafana stack (with provisioned dashboards for
+topics and broker overview) lives under [`grafana/`](grafana/README.md):
+
+```bash
+docker compose -f grafana/docker-compose.yml up -d
+# Grafana http://localhost:3000 (admin/admin), Prometheus http://localhost:9090
 ```
 
 ## Embedded Python Usage

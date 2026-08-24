@@ -88,6 +88,60 @@ pub struct Config {
     /// Mirrors Netty's WRITE_BUFFER_LOW_WATER_MARK hysteresis semantics.
     #[serde(default = "default_pulsar_channel_write_buffer_low_water_mark_bytes")]
     pub pulsar_channel_write_buffer_low_water_mark_bytes: usize,
+
+    /// Prometheus metrics endpoint configuration.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+/// Prometheus `/metrics` endpoint settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    /// Serve GET /metrics when true. When false the broker neither binds
+    /// the metrics port nor runs the scrape aggregation task.
+    #[serde(default = "default_metrics_enabled")]
+    pub enabled: bool,
+
+    /// Listen address for the Prometheus scrape endpoint (same 8080 model
+    /// as the native Pulsar web service port).
+    #[serde(default = "default_metrics_addr")]
+    pub addr: String,
+
+    /// Value of the `cluster` label attached to every exported family.
+    #[serde(default = "default_metrics_cluster")]
+    pub cluster: String,
+
+    /// Window (seconds) for scrape-derived rate gauges such as
+    /// pulsar_rate_in, mirroring the native stats period.
+    #[serde(default = "default_metrics_rate_window_secs")]
+    pub rate_window_secs: u64,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_metrics_enabled(),
+            addr: default_metrics_addr(),
+            cluster: default_metrics_cluster(),
+            rate_window_secs: default_metrics_rate_window_secs(),
+        }
+    }
+}
+
+fn default_metrics_enabled() -> bool {
+    true
+}
+
+fn default_metrics_addr() -> String {
+    "0.0.0.0:8080".to_string()
+}
+
+fn default_metrics_cluster() -> String {
+    "pulsar-lite".to_string()
+}
+
+fn default_metrics_rate_window_secs() -> u64 {
+    60
 }
 
 fn default_addr() -> String {
@@ -164,6 +218,7 @@ impl Default for Config {
                 default_pulsar_channel_write_buffer_high_water_mark_bytes(),
             pulsar_channel_write_buffer_low_water_mark_bytes:
                 default_pulsar_channel_write_buffer_low_water_mark_bytes(),
+            metrics: MetricsConfig::default(),
         }
     }
 }
@@ -243,6 +298,29 @@ mod tests {
             config.pulsar_channel_write_buffer_low_water_mark_bytes,
             32 * 1024
         );
+        assert!(config.metrics.enabled);
+        assert_eq!(config.metrics.addr, "0.0.0.0:8080");
+        assert_eq!(config.metrics.cluster, "pulsar-lite");
+        assert_eq!(config.metrics.rate_window_secs, 60);
+    }
+
+    #[test]
+    fn test_metrics_section_overrides_defaults() {
+        let parsed: Config = toml::from_str(
+            r#"
+[metrics]
+enabled = false
+addr = "127.0.0.1:9109"
+cluster = "bench"
+rate_window_secs = 15
+"#,
+        )
+        .unwrap();
+
+        assert!(!parsed.metrics.enabled);
+        assert_eq!(parsed.metrics.addr, "127.0.0.1:9109");
+        assert_eq!(parsed.metrics.cluster, "bench");
+        assert_eq!(parsed.metrics.rate_window_secs, 15);
     }
 
     #[test]
@@ -291,6 +369,7 @@ managed_ledger_store = "rocksdb"
             publish_rate_bytes_per_sec: 456,
             pulsar_channel_write_buffer_high_water_mark_bytes: 96 * 1024,
             pulsar_channel_write_buffer_low_water_mark_bytes: 48 * 1024,
+            metrics: MetricsConfig::default(),
         };
 
         let toml_str = toml::to_string(&config).unwrap();
@@ -359,6 +438,7 @@ managed_ledger_store = "rocksdb"
             publish_rate_bytes_per_sec: 456,
             pulsar_channel_write_buffer_high_water_mark_bytes: 96 * 1024,
             pulsar_channel_write_buffer_low_water_mark_bytes: 48 * 1024,
+            metrics: MetricsConfig::default(),
         };
 
         let overridden = config.with_cli_overrides(

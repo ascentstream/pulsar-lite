@@ -20,4 +20,4 @@ pub use service::topic::{
 };
 pub use service::SharedStorage;
 pub use service::{handle_connection, ConnectionState};
-pub use stats::{BrokerMetrics, SharedMetrics};
+pub use stats::{get, init, BrokerMetrics};

@@ -1,0 +1,27 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: pulsar-lite
+    metrics_path: /metrics
+    static_configs:
+      # The broker's metrics endpoint (default 0.0.0.0:8080, same model as
+      # native Pulsar's web service port). host.docker.internal resolves to
+      # the host via the compose extra_hosts entry.
+      - targets: ["host.docker.internal:8080"]
+
+  # Perf harness brokers (tests/perf/lib/broker.py derives each broker's
+  # metrics port from its protocol port: 6651/6652 -> 8081/8082,
+  # 6661/6662 -> 8091/8092, 6671/6672 -> 8101/8102, bound on 0.0.0.0).
+  # Targets show DOWN while no run is active — expected.
+  - job_name: pulsar-lite-perf
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "host.docker.internal:8081"
+          - "host.docker.internal:8082"
+          - "host.docker.internal:8091"
+          - "host.docker.internal:8092"
+          - "host.docker.internal:8101"
+          - "host.docker.internal:8102"

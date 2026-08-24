@@ -169,8 +169,6 @@ impl BrokerService {
         self.topics.len()
     }
 
-    // ==================== Partitioned Topic Management ====================
-
     /// Get or create a partitioned topic with the specified number of partitions
     ///
     /// This will create the partitioned topic if it doesn't exist

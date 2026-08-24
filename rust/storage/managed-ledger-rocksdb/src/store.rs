@@ -58,7 +58,8 @@ impl ConcurrentAppender {
     }
 
     /// Enqueue without waiting. Completion is delivered on `completion_tx`
-    /// from the write-queue worker thread.
+    /// from the write-queue worker thread; `observer` (when present) is
+    /// invoked once per committed batch group with message/byte totals.
     pub fn enqueue_for_connection(
         &self,
         topic: &str,
@@ -67,6 +68,7 @@ impl ConcurrentAppender {
         payload: &[u8],
         producer_id: u64,
         sequence_id: u64,
+        observer: Option<Arc<dyn pulsar_lite_metrics::PublishCommitObserver>>,
         completion_tx: tokio::sync::mpsc::Sender<super::write_queue::ConnAppendResult>,
     ) -> Result<()> {
         WriteQueue::enqueue_for_connection(
@@ -77,6 +79,7 @@ impl ConcurrentAppender {
             payload,
             producer_id,
             sequence_id,
+            observer,
             completion_tx,
         )
         .map_err(|e| anyhow!(e))
@@ -470,5 +473,44 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
             .mark_delete
             .as_ref()
             .map(|position| position.entry_id)
+    }
+
+    fn backlog_entries(&self, topic: &str, subscription: &str) -> Option<u64> {
+        let _guard = self.cursor_mu.lock().ok()?;
+        let ledger = self.topic_ledger(topic).ok()?;
+        let info = ledger.info_snapshot();
+        let total: u64 = info.ledgers.iter().map(|l| l.entries).sum();
+
+        let cursor = ledger
+            .open_cursor(&keys::encode_cursor_name(subscription))
+            .ok()?;
+        let state = cursor.state();
+        let Some(mark) = state.mark_delete.as_ref() else {
+            // Cursor never advanced: nothing acknowledged yet.
+            return Some(total);
+        };
+        // Acked = everything in fully-retired ledgers below the mark's
+        // ledger, the mark itself, and individually-deleted holes above it.
+        let retired: u64 = info
+            .ledgers
+            .iter()
+            .filter(|l| l.ledger_id < mark.ledger_id)
+            .map(|l| l.entries)
+            .sum();
+        let holes: u64 = state
+            .individually_deleted_entries
+            .iter()
+            .map(|(start, end)| end.entry_id.saturating_sub(start.entry_id) + 1)
+            .sum();
+        let acked = retired + mark.entry_id + 1 + holes;
+        Some(total.saturating_sub(acked))
+    }
+
+    fn stored_bytes(&self, topic: &str) -> u64 {
+        let Ok(ledger) = self.topic_ledger(topic) else {
+            return 0;
+        };
+        let info = ledger.info_snapshot();
+        info.ledgers.iter().map(|l| l.size).sum()
     }
 }

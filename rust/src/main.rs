@@ -7,6 +7,7 @@ use clap::Parser;
 use futures::SinkExt;
 use pulsar_lite::broker::handle_connection;
 use pulsar_lite::broker::service::topic::TopicPublishRate;
+use pulsar_lite::broker::stats;
 use pulsar_lite::broker::{BrokerService, ConnectionLimiter};
 use pulsar_lite::config::Config;
 use pulsar_lite_proto::codec::PulsarFrameCodec;
@@ -91,6 +92,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.publish_rate_bytes_per_sec
     );
 
+    // Prometheus metrics: families always exist (pre-resolved handles keep
+    // hot paths branch-free); `enabled` only controls serving and scraping.
+    stats::init(&config.metrics.cluster);
+    if config.metrics.enabled {
+        match config.metrics.addr.parse::<SocketAddr>() {
+            Ok(metrics_addr) => {
+                let registry = pulsar_lite_metrics::global_registry();
+                tokio::spawn(async move {
+                    // Runs until process exit; serves GET /metrics from the
+                    // shared registry via prometheus-hyper.
+                    if let Err(error) = prometheus_hyper::Server::run(
+                        registry,
+                        metrics_addr,
+                        std::future::pending::<()>(),
+                    )
+                    .await
+                    {
+                        log::error!("Metrics server terminated: {}", error);
+                    }
+                });
+                log::info!(
+                    "Metrics endpoint listening on http://{}/metrics",
+                    metrics_addr
+                );
+            }
+            Err(error) => {
+                log::warn!(
+                    "Invalid metrics address '{}': {} — metrics disabled",
+                    config.metrics.addr,
+                    error
+                );
+            }
+        }
+    }
+
     // Initialize storage
     let storage = Arc::new(Mutex::new(Storage::new(&config.db_path)?));
     let restored_partition_metadata = {
@@ -119,6 +155,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connection_limiter =
         ConnectionLimiter::new(config.max_connections, config.max_connections_per_ip);
 
+    // Scrape-time aggregation (entity counts, derived rates, active gauge).
+    if config.metrics.enabled {
+        stats::scrape::spawn(
+            Arc::clone(&broker_service),
+            Arc::clone(&storage),
+            connection_limiter.clone(),
+            config.metrics.rate_window_secs,
+        );
+    }
     loop {
         let ret = listener.accept().await;
         let (socket, peer_addr) = match ret {
@@ -142,6 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(permit) => permit,
             Err(error) => {
                 log::warn!("Rejecting connection from {}: {}", peer_addr, error);
+                stats::get().error_counter("connection_limit").inc();
                 let mut framed = Framed::new(socket, PulsarFrameCodec::new());
                 let _ = framed
                     .send(ServerCommand::Error {
@@ -152,6 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
         };
+        stats::get().connection_created.inc();
 
         let storage = Arc::clone(&storage);
         let broker_service = Arc::clone(&broker_service);
@@ -178,6 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 log::error!("Connection error from {}: {}", peer_addr, e);
             }
             log::info!("Connection closed from {}", peer_addr);
+            stats::get().connection_closed.inc();
         });
     }
 }

@@ -10,7 +10,7 @@ use super::read_position::{commit_read_position, next_unacked_candidate};
 use crate::broker::dispatcher::Dispatcher;
 use crate::broker::service::topic::SubscriptionType;
 use crate::broker::service::{Consumer, SharedStorage};
-use crate::storage::ManagedLedgerPosition;
+use pulsar_lite_storage_managed_ledger::ManagedLedgerPosition;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 

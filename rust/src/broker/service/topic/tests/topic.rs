@@ -3,12 +3,12 @@ use crate::broker::service::topic::{
     TopicRuntimeMode,
 };
 use crate::broker::service::{Consumer, Producer, SharedStorage};
-use crate::protocol::codec::proto::pulsar::MessageMetadata;
-use crate::storage::Storage;
-#[cfg(feature = "rocksdb-storage")]
-use crate::storage::{CursorInitOptions, InitialPosition};
 use bytes::Bytes;
 use prost::Message;
+use pulsar_lite_proto::codec::proto::pulsar::MessageMetadata;
+use pulsar_lite_storage::Storage;
+#[cfg(feature = "rocksdb-storage")]
+use pulsar_lite_storage_managed_ledger::{CursorInitOptions, InitialPosition};
 use std::path::Path;
 use std::sync::{Arc, Arc as StdArc};
 use std::time::Instant;

@@ -164,9 +164,8 @@ impl WriteState {
             let checksum = EntryLogStore::checksum(&[&entry.metadata, &entry.payload]);
             let metadata_len = entry.metadata.len() as u32;
             let payload_len = entry.payload.len() as u32;
-            let len = ENTRY_HEADER_LEN as u64
-                + entry.metadata.len() as u64
-                + entry.payload.len() as u64;
+            let len =
+                ENTRY_HEADER_LEN as u64 + entry.metadata.len() as u64 + entry.payload.len() as u64;
 
             pending.push(EntryIndex {
                 ledger_id: entry.ledger_id,
@@ -386,10 +385,7 @@ impl EntryLogStore {
             .as_ref()
             .ok_or_else(|| anyhow!("entrylog writer is closed"))?;
         sender
-            .send(WriterMsg::Batch {
-                entries,
-                reply: tx,
-            })
+            .send(WriterMsg::Batch { entries, reply: tx })
             .map_err(|_| anyhow!("entrylog writer disconnected"))?;
         rx.recv()
             .map_err(|_| anyhow!("entrylog writer disconnected"))?

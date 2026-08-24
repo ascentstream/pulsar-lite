@@ -5,7 +5,7 @@ use crate::broker::service::topic::{
     KeySharedHashRange, KeySharedMode, KeySharedPolicy, SubscriptionType,
 };
 use crate::broker::service::Consumer;
-use crate::storage::{MessageId, NonPersistentEntry};
+use pulsar_lite_storage_managed_ledger::{MessageId, NonPersistentEntry};
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicU32, AtomicU64, Ordering},
@@ -263,10 +263,10 @@ impl NonPersistentStickyKeyDispatcher {
 mod tests {
     use super::*;
     use crate::broker::service::topic::{Subscription, SubscriptionRuntimeMode};
-    use crate::protocol::codec::proto::pulsar::MessageMetadata;
-    use crate::storage::Storage;
     use bytes::Bytes;
     use prost::Message;
+    use pulsar_lite_proto::codec::proto::pulsar::MessageMetadata;
+    use pulsar_lite_storage::Storage;
     use std::path::Path;
     use std::time::Instant;
     use tokio::sync::{mpsc, Mutex, RwLock};

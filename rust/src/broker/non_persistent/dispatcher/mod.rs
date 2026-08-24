@@ -11,7 +11,7 @@ mod sticky_key;
 
 use crate::broker::service::topic::{KeySharedPolicy, SubscriptionType};
 use crate::broker::service::Consumer;
-use crate::storage::NonPersistentEntry;
+use pulsar_lite_storage_managed_ledger::NonPersistentEntry;
 use std::sync::Arc;
 
 pub use multiple_consumers::NonPersistentDispatcherMultipleConsumers;

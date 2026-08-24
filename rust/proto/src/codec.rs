@@ -21,7 +21,6 @@ pub mod proto {
 
 // Import ServerCommand from command module
 use super::command::ServerCommand;
-use crate::broker::service::PendingMessage;
 
 /// Magic number for checksum verification (0x0e01)
 const MAGIC_NUMBER: u16 = 0x0e01;
@@ -305,31 +304,9 @@ impl Encoder<ServerCommand> for PulsarFrameCodec {
     }
 }
 
-impl Encoder<(u64, PendingMessage)> for PulsarFrameCodec {
-    type Error = io::Error;
-
-    fn encode(
-        &mut self,
-        item: (u64, PendingMessage),
-        dst: &mut BytesMut,
-    ) -> Result<(), Self::Error> {
-        let (consumer_id, msg) = item;
-        self.encode_message(
-            consumer_id,
-            msg.message_id.ledger,
-            msg.message_id.entry,
-            msg.message_id.partition,
-            &msg.metadata,
-            &msg.payload,
-            msg.redelivery_count,
-            dst,
-        )
-    }
-}
-
 impl PulsarFrameCodec {
     /// Encode a Message command with payload
-    fn encode_message(
+    pub fn encode_message(
         &self,
         consumer_id: u64,
         ledger_id: u64,
@@ -360,9 +337,9 @@ impl PulsarFrameCodec {
 
 #[cfg(test)]
 mod tests {
-    use super::proto::pulsar::{BaseCommand, CompressionType, KeyValue, MessageMetadata};
     use super::*;
-    use crate::protocol::command::ServerCommand;
+    use crate::codec::proto::pulsar::{BaseCommand, CompressionType, KeyValue, MessageMetadata};
+    use crate::command::ServerCommand;
     use bytes::Bytes;
     use prost::Message;
 

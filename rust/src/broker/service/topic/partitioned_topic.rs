@@ -229,7 +229,10 @@ impl PartitionedTopic {
         partition_index: usize,
         metadata: Option<Bytes>,
         payload: Bytes,
-    ) -> Result<crate::storage::MessageId, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<
+        pulsar_lite_storage_managed_ledger::MessageId,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         if partition_index >= self.partition_count {
             return Err(format!("Partition index {} out of bounds", partition_index).into());
         }

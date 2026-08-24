@@ -1,4 +1,4 @@
-use crate::storage::MessageId;
+use pulsar_lite_storage_managed_ledger::MessageId;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;

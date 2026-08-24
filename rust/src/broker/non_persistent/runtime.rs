@@ -9,7 +9,7 @@
 use crate::broker::non_persistent::NonPersistentDispatcherEnum;
 use crate::broker::service::topic::{KeySharedPolicy, SubscriptionType};
 use crate::broker::service::Consumer;
-use crate::storage::NonPersistentEntry;
+use pulsar_lite_storage_managed_ledger::NonPersistentEntry;
 use std::collections::HashMap;
 use std::sync::Arc;
 

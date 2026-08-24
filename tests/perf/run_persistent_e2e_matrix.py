@@ -17,10 +17,22 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib import ROOT
-from lib.broker import BrokerConfig, BrokerProcess, DockerBrokerProcess
+from lib.broker import (
+    BrokerConfig,
+    BrokerProcess,
+    DockerBrokerProcess,
+    ExternalBrokerProcess,
+)
 from lib.docker_image import build_broker_image
 from lib.parsing import parse_consumer_output, parse_producer_output
-from lib.perf_cmd import ensure_prereqs, perf_cmd, run_consumer_then_feed, run_sync
+from lib.perf_cmd import (
+    ensure_prereqs,
+    e2e_success_despite_peer_hang,
+    format_e2e_process_failure,
+    perf_cmd,
+    run_consumer_then_feed,
+    run_sync,
+)
 
 RESULTS_PATH = ROOT / "docs" / "perf" / "data" / "persistent_e2e_matrix_results.json"
 ARTIFACTS_DIR = ROOT / "docs" / "perf" / "data" / "persistent_e2e_matrix_logs"
@@ -317,16 +329,23 @@ def run_consume_e2e_scenario(
     )
     
     start = time.time()
-    consumer_out, producer_out, consumer_rc, producer_rc = run_consumer_then_feed(
+    consumer_out, producer_out, consumer_rc, producer_rc, first_failed = run_consumer_then_feed(
         consumer_cmd, producer_cmd, consumer_log, producer_log,
         consumer_timeout=120.0, producer_timeout=120.0,
     )
     duration = time.time() - start
-    
-    if consumer_rc != 0:
-        raise RuntimeError(f"consumer failed with rc={consumer_rc}: {consumer_out[:500]}")
-    if producer_rc != 0:
-        raise RuntimeError(f"producer failed with rc={producer_rc}: {producer_out[:500]}")
+
+    if consumer_rc != 0 or producer_rc != 0:
+        if not e2e_success_despite_peer_hang(consumer_rc, producer_rc, first_failed):
+            raise RuntimeError(
+                format_e2e_process_failure(
+                    consumer_rc=consumer_rc,
+                    producer_rc=producer_rc,
+                    consumer_out=consumer_out,
+                    producer_out=producer_out,
+                    first_failed=first_failed,
+                )
+            )
     
     consumer_result = parse_consumer_output(consumer_out)
     producer_result = parse_producer_output(producer_out)
@@ -346,6 +365,11 @@ def run_restart_smoke_scenario(
     run_dir: Path,
 ) -> dict[str, Any]:
     """Run restart scenario: produce → restart → consume."""
+    if isinstance(broker, ExternalBrokerProcess):
+        raise RuntimeError(
+            "external broker backend cannot restart the broker; "
+            "use scenarios that do not restart (produce / consume_e2e)"
+        )
     topic = f"persistent://public/default/test-{uuid.uuid4().hex[:8]}"
     
     # Step 1: Produce messages
@@ -435,10 +459,24 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument(
         "--broker-backend",
-        choices=["local","docker"],
+        choices=["local", "docker", "external"],
         default="local",
         help="Broker launch backend. local user rust/target/release/pulsar-lite; "
-        "docker builds and runs a constrained broker container.",
+        "docker builds and runs a constrained broker container; "
+        "external targets an already-running broker via --external-url "
+        "(e.g. Apache Pulsar standalone); no broker lifecycle management.",
+    )
+    parser.add_argument(
+        "--external-url",
+        default="pulsar://127.0.0.1:6650",
+        help="Service URL of the external broker for --broker-backend=external.",
+    )
+    parser.add_argument(
+        "--external-unit",
+        default=None,
+        help="systemd unit name of the external broker (e.g. pulsar-standalone or "
+        "pulsar-lite) to sample CPU/memory via 'systemctl show <unit> -p MainPID' "
+        "+ /proc. Leave unset to disable broker metrics for external backends.",
     )
     parser.add_argument(
         "--docker-cpuset",
@@ -501,6 +539,18 @@ def main(argv: list[str]) -> int:
                 image_tag=docker_image_metadata["docker_image_tag"],
                 cpuset_cpus=args.docker_cpuset,
                 memory=args.docker_memory,
+            )
+        elif args.broker_backend == "external":
+            from urllib.parse import urlparse
+
+            parsed = urlparse(args.external_url)
+            if parsed.scheme != "pulsar" or not parsed.hostname:
+                raise ValueError(
+                    f"--external-url must be pulsar://host:port, got {args.external_url!r}"
+                )
+            broker = ExternalBrokerProcess(
+                BrokerConfig("external", parsed.port or 6650, 0),
+                unit=args.external_unit,
             )
         else:
             broker = BrokerProcess(broker_config)

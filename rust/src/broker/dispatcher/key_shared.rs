@@ -11,7 +11,7 @@ use crate::broker::service::topic::{
     KeySharedHashRange, KeySharedMode, KeySharedPolicy, SubscriptionType,
 };
 use crate::broker::service::{Consumer, SharedStorage};
-use crate::storage::{ManagedLedgerPosition, MessageId};
+use pulsar_lite_storage_managed_ledger::{ManagedLedgerPosition, MessageId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
@@ -20,7 +20,7 @@ const DISPATCHER_MAX_ROUND_ROBIN_BATCH_SIZE: u32 = 20;
 
 type DispatchableRedelivery = Option<(
     RedeliveryEntry,
-    crate::storage::StoredMessage,
+    pulsar_lite_storage_managed_ledger::StoredMessage,
     Arc<Consumer>,
 )>;
 
@@ -154,7 +154,7 @@ impl KeySharedDispatcher {
 
     fn pop_dispatchable_redelivery_message(
         &self,
-        storage: &crate::storage::Storage,
+        storage: &pulsar_lite_storage::Storage,
         topic: &str,
         subscription: &str,
     ) -> Result<DispatchableRedelivery, Box<dyn std::error::Error + Send + Sync>> {
@@ -543,10 +543,11 @@ mod tests {
     use super::*;
     use crate::broker::service::topic::{Subscription, SubscriptionRuntimeMode};
     use crate::broker::service::{ConnectionWriteState, PendingMessage};
-    use crate::protocol::codec::proto::pulsar::MessageMetadata;
-    use crate::storage::{CursorInitOptions, InitialPosition, Storage};
     use bytes::Bytes;
     use prost::Message;
+    use pulsar_lite_proto::codec::proto::pulsar::MessageMetadata;
+    use pulsar_lite_storage::Storage;
+    use pulsar_lite_storage_managed_ledger::{CursorInitOptions, InitialPosition};
     use std::path::Path;
     use std::time::Duration;
     use tokio::sync::{mpsc, Mutex, RwLock};

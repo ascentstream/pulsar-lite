@@ -2,8 +2,10 @@ use super::cursor::{next_position, RocksDBManagedCursor};
 use super::entrylog::{EntryIndex, EntryLogStore, EntryRecord, EntryToAppend};
 use super::keys;
 use super::metadata::{StoredEntryLocation, StoredManagedLedgerInfo};
-use anyhow::{Ok, Result};
+use anyhow::Result;
+use arc_swap::ArcSwap;
 use rocksdb::{WriteBatch, DB};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use pulsar_lite_storage_managed_ledger::{
@@ -12,30 +14,42 @@ use pulsar_lite_storage_managed_ledger::{
 
 const DEFAULT_MAX_ENTRIES_PER_LEDGER: u64 = 50_000;
 
-/// Status of the ManagedLedger that currently working on
-#[derive(Debug, Clone)]
+/// Assignment cursor for the active ledger segment.
+/// Only the managed-ledger write-queue worker updates these fields.
+#[derive(Debug)]
 struct ManagedLedgerRuntimeState {
-    /// The current ledger ID that the ManagedLedger is working on.
-    current_ledger_id: u64,
-
-    /// The number of entries in the current ledger.
-    current_ledger_entries: u64,
-
-    /// The size of the current ledger in bytes.
-    current_ledger_size: u64,
-
-    /// The last confirmed position in the entire managed ledger.
-    last_confirmed_position: Option<ManagedLedgerPosition>,
+    current_ledger_id: AtomicU64,
+    current_ledger_entries: AtomicU64,
+    current_ledger_size: AtomicU64,
 }
 
-#[derive(Debug, Clone)]
+impl ManagedLedgerRuntimeState {
+    fn from_info(info: &StoredManagedLedgerInfo) -> Self {
+        let current = info
+            .ledgers
+            .last()
+            .expect("managed ledger info is initialized");
+        Self {
+            current_ledger_id: AtomicU64::new(current.ledger_id),
+            current_ledger_entries: AtomicU64::new(current.entries),
+            current_ledger_size: AtomicU64::new(current.size),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct RocksDBManagedLedger {
     name: String,
     db: Arc<DB>,
-    pub info: StoredManagedLedgerInfo,
-    runtime: ManagedLedgerRuntimeState,
-    max_entries_per_ledger: u64,
     entry_log: Arc<EntryLogStore>,
+    max_entries_per_ledger: u64,
+
+    /// Published ledger metadata; readers load this snapshot.
+    info: ArcSwap<StoredManagedLedgerInfo>,
+    /// Last durable position readers may observe.
+    lac: ArcSwap<Option<ManagedLedgerPosition>>,
+    /// Write assignment cursor (single-writer: write-queue worker).
+    runtime: ManagedLedgerRuntimeState,
 }
 
 impl RocksDBManagedLedger {
@@ -70,61 +84,43 @@ impl RocksDBManagedLedger {
 
         db.put(&key, info.encode_to_vec())?;
 
-        let runtime = Self::runtime_from_info(&info, &db)?;
+        let lac = Self::lac_from_info_and_db(&info, &db)?;
+        let runtime = ManagedLedgerRuntimeState::from_info(&info);
 
         Ok(Self {
             name: name.to_string(),
             db,
             entry_log,
-            info,
-            runtime,
             max_entries_per_ledger,
+            info: ArcSwap::from_pointee(info),
+            lac: ArcSwap::from_pointee(lac),
+            runtime,
         })
     }
 
-    fn runtime_from_info(
+    fn lac_from_info_and_db(
         info: &StoredManagedLedgerInfo,
         db: &DB,
-    ) -> Result<ManagedLedgerRuntimeState> {
-        let current_ledger = info
-            .ledgers
-            .last()
-            .expect("managed ledger info is initialized");
-
-        let last_confirmed_position =
-            match info.ledgers.iter().rev().find(|ledger| ledger.entries > 0) {
-                Some(last_non_empty_ledger) => {
-                    let entry_id = last_non_empty_ledger.entries - 1;
-
-                    let Some(value) = db.get(keys::managed_entry_key(
-                        last_non_empty_ledger.ledger_id,
-                        entry_id,
-                    ))?
-                    else {
-                        return Ok(ManagedLedgerRuntimeState {
-                            current_ledger_id: current_ledger.ledger_id,
-                            current_ledger_entries: current_ledger.entries,
-                            current_ledger_size: current_ledger.size,
-                            last_confirmed_position: None,
-                        });
-                    };
-
-                    let location: StoredEntryLocation = bincode::deserialize(&value)?;
-                    Some(ManagedLedgerPosition {
-                        ledger_id: last_non_empty_ledger.ledger_id,
-                        entry_id,
-                        partition: location.partition,
-                    })
-                }
-                None => None,
-            };
-
-        Ok(ManagedLedgerRuntimeState {
-            current_ledger_id: current_ledger.ledger_id,
-            current_ledger_entries: current_ledger.entries,
-            current_ledger_size: current_ledger.size,
-            last_confirmed_position,
-        })
+    ) -> Result<Option<ManagedLedgerPosition>> {
+        match info.ledgers.iter().rev().find(|ledger| ledger.entries > 0) {
+            Some(last_non_empty_ledger) => {
+                let entry_id = last_non_empty_ledger.entries - 1;
+                let Some(value) = db.get(keys::managed_entry_key(
+                    last_non_empty_ledger.ledger_id,
+                    entry_id,
+                ))?
+                else {
+                    return Ok(None);
+                };
+                let location: StoredEntryLocation = bincode::deserialize(&value)?;
+                Ok(Some(ManagedLedgerPosition {
+                    ledger_id: last_non_empty_ledger.ledger_id,
+                    entry_id,
+                    partition: location.partition,
+                }))
+            }
+            None => Ok(None),
+        }
     }
 
     fn allocate_ledger_id(db: &DB) -> Result<u64> {
@@ -136,6 +132,69 @@ impl RocksDBManagedLedger {
             .unwrap_or_default();
         db.put(key, bincode::serialize(&(next_ledger_id + 1))?)?;
         Ok(next_ledger_id)
+    }
+
+    pub fn info_snapshot(&self) -> arc_swap::Guard<Arc<StoredManagedLedgerInfo>> {
+        self.info.load()
+    }
+
+    pub fn last_position(&self) -> Result<Option<ManagedLedgerPosition>> {
+        Ok((**self.lac.load()).clone())
+    }
+
+    fn is_visible(
+        &self,
+        pos: &ManagedLedgerPosition,
+        info: &StoredManagedLedgerInfo,
+        lac: &ManagedLedgerPosition,
+    ) -> bool {
+        if pos > lac {
+            return false;
+        }
+        info.ledgers
+            .iter()
+            .any(|l| l.ledger_id == pos.ledger_id && l.entries > pos.entry_id)
+    }
+
+    pub fn read_entries_from(
+        &self,
+        from: &ManagedLedgerPosition,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let lac_guard = self.lac.load();
+        let Some(lac) = lac_guard.as_ref() else {
+            return Ok(Vec::new());
+        };
+        if from > lac {
+            return Ok(Vec::new());
+        }
+
+        let info = self.info.load();
+        let mut out = Vec::with_capacity(limit.min(64));
+        let mut current = Some(from.clone());
+
+        while let Some(pos) = current {
+            if out.len() >= limit || pos > *lac {
+                break;
+            }
+            if self.is_visible(&pos, info.as_ref(), lac) {
+                if let Some((stored, record)) =
+                    self.read_entry_record(pos.ledger_id, pos.entry_id)?
+                {
+                    out.push(StoredMessage {
+                        message_id: MessageId::from(&stored),
+                        metadata: record.metadata,
+                        payload: record.payload,
+                    });
+                }
+            }
+            current = next_position(&pos, info.as_ref());
+        }
+        Ok(out)
     }
 
     fn load_entry_index(&self, ledger_id: u64, entry_id: u64) -> Result<Option<EntryIndex>> {
@@ -171,103 +230,37 @@ impl RocksDBManagedLedger {
         Ok(Some((position, record)))
     }
 
-    pub fn last_position(&self) -> Result<Option<ManagedLedgerPosition>> {
-        Ok(self.runtime.last_confirmed_position.clone())
-    }
-
-    /// Returns true if the given position is visible in the ledger.
-    fn is_visible(&self, pos: &ManagedLedgerPosition) -> bool {
-        self.info
-            .ledgers
-            .iter()
-            .any(|l| l.ledger_id == pos.ledger_id && l.entries > pos.entry_id)
-    }
-
-    /// Reads a batch of entries starting from the given position, up to the specified limit.
-    pub fn read_entries_from(
-        &self,
-        from: &ManagedLedgerPosition,
-        limit: usize,
-    ) -> Result<Vec<StoredMessage>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut out = Vec::with_capacity(limit.min(64));
-        let mut current = Some(from.clone());
-
-        while let Some(pos) = current {
-            if out.len() >= limit {
-                break;
-            }
-
-            if self.is_visible(&pos) {
-                if let Some((stored, record)) =
-                    self.read_entry_record(pos.ledger_id, pos.entry_id)?
-                {
-                    out.push(StoredMessage {
-                        message_id: MessageId::from(&stored),
-                        metadata: record.metadata,
-                        payload: record.payload,
-                    });
-                }
-            }
-            current = next_position(&pos, &self.info);
-        }
-
-        Ok(out)
-    }
-
-    pub fn add_entry_with_partition(
-        &mut self,
-        partition: i32,
-        payload: &[u8],
-    ) -> Result<ManagedLedgerPosition> {
-        self.add_entry_with_partition_and_metadata(partition, &[], payload)
-    }
-
-    pub fn add_entry_with_partition_and_metadata(
-        &mut self,
-        partition: i32,
-        metadata: &[u8],
-        payload: &[u8],
-    ) -> Result<ManagedLedgerPosition> {
-        let mut positions = self.add_entries_with_partition_and_metadata(&[(partition,metadata,payload)])?;
-        positions.pop().ok_or_else(|| anyhow::anyhow!("add_entries returned empty positions"))
-    }
-
-    /// Append many entries with one entrylog flush and one RocksDB WriteBatch.
+    /// Durable batch append. Intended for the write-queue worker only (single writer).
     ///
-    /// - entry_id assignment stays serial (same as single append)
-    /// - entrylog is written once via `append_batch` (one write_all + flush)
-    /// - entry locations + final managed-ledger info are written once
-    /// - runtime state is published only after both durable steps succeed
-    pub fn add_entries_with_partition_and_metadata(
-        &mut self,
+    /// Order: allocate → entrylog + rocks → publish meta → publish LAC.
+    pub(crate) fn add_entries_with_partition_and_metadata(
+        &self,
         items: &[(i32, &[u8], &[u8])],
     ) -> Result<Vec<ManagedLedgerPosition>> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Pass 1: allocate positions and next ledger/runtime state in memory.
-        let mut next_info = self.info.clone();
-        let mut next_runtime = self.runtime.clone();
+        let mut next_info = (**self.info.load()).clone();
+        let mut cur_id = self.runtime.current_ledger_id.load(Ordering::Relaxed);
+        let mut cur_entries = self.runtime.current_ledger_entries.load(Ordering::Relaxed);
+        let mut cur_size = self.runtime.current_ledger_size.load(Ordering::Relaxed);
+
         let mut positions = Vec::with_capacity(items.len());
         let mut to_append = Vec::with_capacity(items.len());
 
         for (partition, metadata, payload) in items {
-            if next_runtime.current_ledger_entries >= self.max_entries_per_ledger {
+            if cur_entries >= self.max_entries_per_ledger {
                 let next_ledger_id = Self::allocate_ledger_id(&self.db)?;
                 next_info.roll_over_current_ledger(next_ledger_id);
-                next_runtime.current_ledger_id = next_ledger_id;
-                next_runtime.current_ledger_entries = 0;
-                next_runtime.current_ledger_size = 0;
+                cur_id = next_ledger_id;
+                cur_entries = 0;
+                cur_size = 0;
             }
 
             let position = ManagedLedgerPosition {
-                ledger_id: next_runtime.current_ledger_id,
-                entry_id: next_runtime.current_ledger_entries,
+                ledger_id: cur_id,
+                entry_id: cur_entries,
                 partition: *partition,
             };
 
@@ -275,16 +268,15 @@ impl RocksDBManagedLedger {
             let message_size = metadata.len() as u64 + payload.len() as u64;
             current_ledger.entries += 1;
             current_ledger.size += message_size;
-            next_runtime.current_ledger_entries += 1;
-            next_runtime.current_ledger_size += message_size;
-            next_runtime.last_confirmed_position = Some(position.clone());
+            cur_entries += 1;
+            cur_size += message_size;
 
-            if next_runtime.current_ledger_entries >= self.max_entries_per_ledger {
+            if cur_entries >= self.max_entries_per_ledger {
                 let next_ledger_id = Self::allocate_ledger_id(&self.db)?;
                 next_info.roll_over_current_ledger(next_ledger_id);
-                next_runtime.current_ledger_entries = 0;
-                next_runtime.current_ledger_size = 0;
-                next_runtime.current_ledger_id = next_ledger_id;
+                cur_id = next_ledger_id;
+                cur_entries = 0;
+                cur_size = 0;
             }
 
             to_append.push(EntryToAppend {
@@ -297,7 +289,8 @@ impl RocksDBManagedLedger {
             positions.push(position);
         }
 
-        // Pass 2: one entrylog IO for the whole batch.
+        let last_pos = positions.last().cloned();
+
         let indices = self.entry_log.append_batch(to_append)?;
         if indices.len() != positions.len() {
             anyhow::bail!(
@@ -307,7 +300,6 @@ impl RocksDBManagedLedger {
             );
         }
 
-        // Pass 3: one RocksDB WriteBatch for locations + ledger info.
         let mut batch = WriteBatch::default();
         for (position, entry_index) in positions.iter().zip(indices) {
             let stored_entry_location = StoredEntryLocation::from(entry_index);
@@ -322,21 +314,21 @@ impl RocksDBManagedLedger {
         );
         self.db.write(batch)?;
 
-        // Pass 4: publish in-memory state only after durable writes succeed.
-        self.info = next_info;
-        self.runtime = next_runtime;
+        self.info.store(Arc::new(next_info));
+        self.runtime
+            .current_ledger_id
+            .store(cur_id, Ordering::Relaxed);
+        self.runtime
+            .current_ledger_entries
+            .store(cur_entries, Ordering::Relaxed);
+        self.runtime
+            .current_ledger_size
+            .store(cur_size, Ordering::Relaxed);
+        self.lac.store(Arc::new(last_pos));
+
         Ok(positions)
     }
-    
-    #[allow(dead_code)]
-    pub fn ledger_info(&self) -> &StoredManagedLedgerInfo {
-        &self.info
-    }
 
-    /// Position immediately before `position` in ledger/entry order.
-    /// - entry_id > 0  -> same ledger, entry_id - 1
-    /// - entry_id == 0 -> last entry of the previous non-empty ledger
-    /// - no previous   -> None ("before first entry", i.e. seek to earliest)
     pub fn previous_position(
         &self,
         position: &ManagedLedgerPosition,
@@ -348,8 +340,8 @@ impl RocksDBManagedLedger {
                 partition: position.partition,
             });
         }
-        let prev = self
-            .info
+        let info = self.info.load();
+        let prev = info
             .ledgers
             .iter()
             .filter(|l| l.ledger_id < position.ledger_id && l.entries > 0)
@@ -361,17 +353,31 @@ impl RocksDBManagedLedger {
         })
     }
 
+    pub fn open_cursor(&self, name: &str) -> Result<RocksDBManagedCursor> {
+        RocksDBManagedCursor::open(&self.name, name, Arc::clone(&self.db))
+    }
+
     pub fn get_message_by_id(&self, message_id: &MessageId) -> Option<(MessageId, Vec<u8>)> {
         self.get_message_entry_by_id(message_id)
             .map(|entry| (entry.message_id, entry.payload))
     }
 
     pub fn get_message_entry_by_id(&self, message_id: &MessageId) -> Option<StoredMessage> {
-        let (position, record) = self
+        let pos = ManagedLedgerPosition::from(message_id);
+        let lac_guard = self.lac.load();
+        let lac = lac_guard.as_ref().as_ref()?;
+        if &pos > lac {
+            return None;
+        }
+        let info = self.info.load();
+        if !self.is_visible(&pos, info.as_ref(), lac) {
+            return None;
+        }
+        let (stored, record) = self
             .read_entry_record(message_id.ledger, message_id.entry)
             .ok()
             .flatten()?;
-        if position.partition != message_id.partition {
+        if stored.partition != message_id.partition {
             return None;
         }
         Some(StoredMessage::new(
@@ -389,11 +395,10 @@ impl RocksDBManagedLedger {
             .collect())
     }
 
-    /// TODO: A temporary global scanning interface. Subsequently, all related global scanning codes will be gradually migrated.
     pub fn message_entries(&self) -> Result<Vec<StoredMessage>> {
+        let info = self.info.load();
         let Some(from) =
-            self.info
-                .ledgers
+            info.ledgers
                 .iter()
                 .find(|l| l.entries > 0)
                 .map(|l| ManagedLedgerPosition {
@@ -402,16 +407,9 @@ impl RocksDBManagedLedger {
                     partition: -1,
                 })
         else {
-            return Ok(vec![]);
+            return Ok(Vec::new());
         };
-
-        let total = self
-            .info
-            .ledgers
-            .iter()
-            .map(|l| l.entries as usize)
-            .sum::<usize>();
-
+        let total: usize = info.ledgers.iter().map(|l| l.entries as usize).sum();
         self.read_entries_from(&from, total)
     }
 }
@@ -423,8 +421,10 @@ impl ManagedLedger for RocksDBManagedLedger {
         &self.name
     }
 
-    fn add_entry(&mut self, payload: &[u8]) -> Result<ManagedLedgerPosition> {
-        self.add_entry_with_partition(-1, payload)
+    fn add_entry(&mut self, _payload: &[u8]) -> Result<ManagedLedgerPosition> {
+        anyhow::bail!(
+            "RocksDB managed-ledger appends must go through WriteQueue; direct add_entry is disabled"
+        )
     }
 
     fn open_cursor(&mut self, name: &str) -> Result<Self::Cursor> {
@@ -432,6 +432,15 @@ impl ManagedLedger for RocksDBManagedLedger {
     }
 
     fn read_entry(&self, position: &ManagedLedgerPosition) -> Option<Vec<u8>> {
+        let lac_guard = self.lac.load();
+        let lac = lac_guard.as_ref().as_ref()?;
+        if position > lac {
+            return None;
+        }
+        let info = self.info.load();
+        if !self.is_visible(position, info.as_ref(), lac) {
+            return None;
+        }
         let (stored, record) = self
             .read_entry_record(position.ledger_id, position.entry_id)
             .ok()

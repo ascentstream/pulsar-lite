@@ -4,9 +4,7 @@ use pulsar_lite_storage_managed_ledger::{
     ManagedLedgerStorage, MessageId, StoredMessage,
 };
 #[cfg(feature = "rocksdb-storage")]
-use pulsar_lite_storage_managed_ledger_rocksdb::{
-    ConcurrentAppender, RocksDbManagedLedgerStorage,
-};
+use pulsar_lite_storage_managed_ledger_rocksdb::{ConcurrentAppender, RocksDbManagedLedgerStorage};
 #[cfg(feature = "rocksdb-storage")]
 use std::path::Path;
 

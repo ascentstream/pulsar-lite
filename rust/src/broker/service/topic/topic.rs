@@ -9,7 +9,9 @@ use super::{
 
 use crate::broker::service::persistent::PersistentTopicRuntime;
 use crate::broker::service::{Consumer, Producer, SharedStorage};
-use crate::storage::{parse_topic_name, CursorInitOptions, MessageId, NonPersistentEntry};
+use pulsar_lite_storage_managed_ledger::{CursorInitOptions, MessageId, NonPersistentEntry};
+use pulsar_lite_storage_metadata::parse_topic_name;
+
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::fmt;
@@ -502,7 +504,10 @@ impl Topic {
         &mut self,
         metadata: Option<Bytes>,
         payload: Bytes,
-    ) -> Result<crate::storage::MessageId, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<
+        pulsar_lite_storage_managed_ledger::MessageId,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         log::debug!(
             "Publishing message to topic '{}' partition '{}' (metadata={} bytes, payload={} bytes)",
             self.name,
@@ -613,7 +618,9 @@ impl Topic {
         self.producers.is_empty() && self.get_total_consumer_count().await == 0
     }
 
-    pub async fn get_last_message_id(&self) -> Result<Option<crate::storage::MessageId>, String> {
+    pub async fn get_last_message_id(
+        &self,
+    ) -> Result<Option<pulsar_lite_storage_managed_ledger::MessageId>, String> {
         match self.runtime_mode {
             TopicRuntimeMode::Persistent => {
                 self.persistent_runtime

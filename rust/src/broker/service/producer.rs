@@ -80,7 +80,10 @@ impl Producer {
         &self,
         metadata: Option<Bytes>,
         payload: Bytes,
-    ) -> Result<crate::storage::MessageId, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<
+        pulsar_lite_storage_managed_ledger::MessageId,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         log::debug!(
             "Producer {} publishing message (metadata={} bytes, payload={} bytes)",
             self.producer_id,
@@ -189,7 +192,7 @@ impl std::hash::Hash for Producer {
 mod tests {
     use super::super::topic::Topic;
     use super::*;
-    use crate::storage::Storage;
+    use pulsar_lite_storage::Storage;
     use std::path::Path;
     use std::sync::Arc as StdArc;
     use tokio::sync::Mutex;

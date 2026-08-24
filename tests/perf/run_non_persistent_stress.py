@@ -23,12 +23,18 @@ from pathlib import Path
 # --- lib imports (run from repo root or with sys.path adjusted) ---
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib import ROOT
-from lib.broker import BrokerConfig, BrokerProcess, DockerBrokerProcess
+from lib.broker import (
+    BrokerConfig,
+    BrokerProcess,
+    DockerBrokerProcess,
+    ExternalBrokerProcess,
+)
 from lib.docker_image import build_broker_image
 from lib.observability import PerfCollector
 from lib.parsing import parse_consumer_output, parse_producer_output
 from lib.perf_cmd import (
     ensure_prereqs,
+    format_e2e_process_failure,
     perf_cmd,
     run_consumer_then_feed,
     run_sync,
@@ -63,19 +69,20 @@ class StressScenario:
 
 STRESS_SCENARIOS: list[StressScenario] = [
     # --- Producer stress ---
+    # Aligned with persistent stress on -r / -o / -c / consumer -q where comparable.
     StressScenario(
         name="stress_producer_max_rate",
         kind="produce",
         broker="nonpartitioned",
-        description="单 producer 1M msg/s offered load 吞吐 ceiling",
-        producer_args=["-time", "60", "-r", "999999", "-s", "1024"],
+        description="单 producer 全速 60s（-r/-o 对齐 persistent）",
+        producer_args=["-time", "60", "-r", "999999", "-s", "1024", "-o", "1000"],
         estimated_duration=60,
     ),
     StressScenario(
         name="stress_producer_max_rate_multi_producer",
         kind="produce",
         broker="nonpartitioned",
-        description="4 producers 1M msg/s aggregate offered load 并发吞吐 ceiling",
+        description="4 producers 并发全速 60s（-r/-o 对齐 persistent）",
         producer_args=[
             "-time",
             "60",
@@ -84,11 +91,13 @@ STRESS_SCENARIOS: list[StressScenario] = [
             "-s",
             "1024",
             "-n",
-            "4",
+            "1",
             "-threads",
             "4",
             "-c",
             "4",
+            "-o",
+            "1000",
         ],
         estimated_duration=60,
     ),
@@ -96,8 +105,8 @@ STRESS_SCENARIOS: list[StressScenario] = [
         name="stress_producer_large_payload",
         kind="produce",
         broker="nonpartitioned",
-        description="100KiB payload 1M msg/s offered load 带宽瓶颈",
-        producer_args=["-time", "60", "-r", "999999", "-s", "102400"],
+        description="100KiB payload 全速 60s（-o 对齐 persistent）",
+        producer_args=["-time", "60", "-r", "999999", "-s", "102400", "-o", "1000"],
         estimated_duration=60,
     ),
     StressScenario(
@@ -105,7 +114,7 @@ STRESS_SCENARIOS: list[StressScenario] = [
         kind="produce",
         broker="nonpartitioned",
         description="5 分钟持续发送稳定性",
-        producer_args=["-time", "300", "-r", "999999", "-s", "1024"],
+        producer_args=["-time", "300", "-r", "999999", "-s", "1024", "-o", "1000"],
         estimated_duration=300,
     ),
     # --- Consumer / E2E stress ---
@@ -113,67 +122,48 @@ STRESS_SCENARIOS: list[StressScenario] = [
         name="stress_consume_shared_max_rate",
         kind="consume_e2e",
         broker="nonpartitioned",
-        description="Shared 单 consumer 1M msg/s offered load 吞吐 ceiling",
+        description="Shared 单 consumer 全速 60s（-q/-o 对齐 persistent）",
         producer_args=[],
-        consumer_args=["-time", "60", "-q", "10000", "-st", "Shared"],
-        feed_producer_args=["-time", "60", "-r", "999999", "-s", "1024"],
+        consumer_args=["-time", "60", "-q", "1000", "-st", "Shared"],
+        feed_producer_args=["-time", "60", "-r", "999999", "-s", "1024", "-o", "1000"],
         estimated_duration=60,
     ),
     StressScenario(
         name="stress_consume_shared_high_fanout",
         kind="consume_e2e",
         broker="nonpartitioned",
-        description="Shared 16 consumers 1M msg/s offered load 高 fanout",
+        description="Shared 16 consumers 高扇出 60s（-q 对齐，去掉 -c）",
         producer_args=[],
         consumer_args=[
             "-time",
             "60",
             "-q",
-            "10000",
+            "1000",
             "-st",
             "Shared",
             "-n",
             "16",
-            "-c",
-            "4",
         ],
-        feed_producer_args=["-time", "60", "-r", "999999", "-s", "1024", "-c", "4"],
+        feed_producer_args=["-time", "60", "-r", "999999", "-s", "1024", "-o", "1000"],
         estimated_duration=60,
     ),
     StressScenario(
         name="stress_consume_multi_subscription_fanout",
         kind="consume_e2e",
         broker="nonpartitioned",
-        description="8 subscriptions 1M msg/s offered load 高 fanout",
+        description="8 subscriptions 扇出 60s（-q/-o 对齐，去掉 -c/memory-limit）",
         producer_args=[],
         consumer_args=[
             "-time",
             "60",
             "-q",
-            "10000",
+            "1000",
             "-st",
             "Shared",
             "-ns",
             "8",
-            "-c",
-            "4",
         ],
-        feed_producer_args=[
-            "-time",
-            "60",
-            "-r",
-            "999999",
-            "-s",
-            "1024",
-            "-c",
-            "4",
-            "--memory-limit",
-            "268435456",
-            "--max-outstanding",
-            "4096",
-            "--max-outstanding-across-partitions",
-            "16384",
-        ],
+        feed_producer_args=["-time", "60", "-r", "999999", "-s", "1024", "-o", "1000"],
         estimated_duration=60,
     ),
     StressScenario(
@@ -182,29 +172,27 @@ STRESS_SCENARIOS: list[StressScenario] = [
         broker="nonpartitioned",
         description="5 分钟持续消费稳定性",
         producer_args=[],
-        consumer_args=["-time", "300", "-q", "10000", "-st", "Shared", "-c", "4"],
-        feed_producer_args=["-time", "300", "-r", "999999", "-s", "1024", "-c", "4"],
+        consumer_args=["-time", "300", "-q", "1000", "-st", "Shared"],
+        feed_producer_args=["-time", "300", "-r", "999999", "-s", "1024", "-o", "1000"],
         estimated_duration=300,
     ),
     StressScenario(
         name="stress_consume_partitioned_max_rate",
         kind="consume_e2e",
         broker="nonpersistent_partitioned",
-        description="Partitioned 4 partitions Shared 4 consumers 1M msg/s offered load",
+        description="Partitioned 4 partitions Shared 4 consumers 60s（-q 对齐，去掉 -c）",
         producer_args=[],
         consumer_args=[
             "-time",
             "60",
             "-q",
-            "10000",
+            "1000",
             "-st",
             "Shared",
             "-n",
             "4",
-            "-c",
-            "4",
         ],
-        feed_producer_args=["-time", "60", "-r", "999999", "-s", "1024", "-c", "4"],
+        feed_producer_args=["-time", "60", "-r", "999999", "-s", "1024", "-o", "1000"],
         estimated_duration=60,
     ),
 ]
@@ -221,9 +209,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--broker-backend",
-        choices=["local", "docker"],
+        choices=["local", "docker", "external"],
         default="local",
-        help="Broker launch backend. local uses rust/target/release/pulsar-lite; docker builds and runs a constrained broker container.",
+        help="Broker launch backend. local uses rust/target/release/pulsar-lite; docker builds and runs a constrained broker container; external targets an already-running broker via --external-url.",
+    )
+    parser.add_argument(
+        "--external-url",
+        default="pulsar://127.0.0.1:6650",
+        help="Service URL of the external broker for --broker-backend=external.",
+    )
+    parser.add_argument(
+        "--external-unit",
+        default=None,
+        help="systemd unit name of the external broker (e.g. pulsar-standalone or pulsar-lite) to sample CPU/memory via 'systemctl show <unit> -p MainPID' + /proc.",
     )
 
     parser.add_argument(
@@ -273,7 +271,9 @@ def _topic_for(run_id: str, scenario: StressScenario) -> str:
     return f"non-persistent://public/default/{run_id}-{scenario.name}"
 
 
-def _service_url_for(scenario: StressScenario) -> str:
+def _service_url_for(scenario: StressScenario, external_url: str | None = None) -> str:
+    if external_url:
+        return external_url
     cfg = BROKERS[scenario.broker]
     return f"pulsar://127.0.0.1:{cfg.port}"
 
@@ -284,10 +284,11 @@ def _run_produce_scenario(
     scenario_dir: Path,
     broker_proc: BrokerProcess,
     perf_collector: PerfCollector | None,
+    external_url: str | None = None,
 ) -> dict:
     """Execute a single producer-only stress scenario."""
     topic = _topic_for(run_id, scenario)
-    service_url = _service_url_for(scenario)
+    service_url = _service_url_for(scenario, external_url)
     timeout = scenario.estimated_duration + 120
 
     histogram_path = scenario_dir / "producer_histogram.log"
@@ -337,10 +338,11 @@ def _run_consume_e2e_scenario(
     scenario_dir: Path,
     broker_proc: BrokerProcess,
     perf_collector: PerfCollector | None,
+    external_url: str | None = None,
 ) -> dict:
     """Execute a single consumer e2e stress scenario (feed-producer + consumer)."""
     topic = _topic_for(run_id, scenario)
-    service_url = _service_url_for(scenario)
+    service_url = _service_url_for(scenario, external_url)
     timeout = scenario.estimated_duration + 120
 
     consumer_args = scenario.consumer_args or []
@@ -356,7 +358,7 @@ def _run_consume_e2e_scenario(
 
     started_at = datetime.now(timezone.utc).isoformat()
     t0 = time.monotonic()
-    consumer_out, producer_out, consumer_rc, producer_rc = run_consumer_then_feed(
+    consumer_out, producer_out, consumer_rc, producer_rc, first_failed = run_consumer_then_feed(
         consumer_cmd,
         producer_cmd,
         consumer_log,
@@ -375,8 +377,23 @@ def _run_consume_e2e_scenario(
     status = (
         "ok"
         if consumer_rc == 0 and producer_rc == 0
-        else (f"consumer_exit:{consumer_rc},producer_exit:{producer_rc}")
+        else (
+            f"consumer_exit:{consumer_rc},producer_exit:{producer_rc}"
+            f",first_failed:{first_failed}"
+        )
     )
+    if consumer_rc != 0 or producer_rc != 0:
+        # Keep going (non-persistent stress soft-fails), but print full dual-rc diagnosis.
+        print(
+            format_e2e_process_failure(
+                consumer_rc=consumer_rc,
+                producer_rc=producer_rc,
+                consumer_out=consumer_out,
+                producer_out=producer_out,
+                first_failed=first_failed,
+            ),
+            flush=True,
+        )
     result: dict = {
         "name": scenario.name,
         "kind": scenario.kind,
@@ -463,6 +480,18 @@ def main(argv: list[str] | None = None) -> None:
                 cpuset_cpus=args.docker_cpuset,
                 memory=args.docker_memory,
             )
+        elif args.broker_backend == "external":
+            from urllib.parse import urlparse
+
+            parsed = urlparse(args.external_url)
+            if parsed.scheme != "pulsar" or not parsed.hostname:
+                raise ValueError(
+                    f"--external-url must be pulsar://host:port, got {args.external_url!r}"
+                )
+            bp = ExternalBrokerProcess(
+                BrokerConfig("external", parsed.port or 6650, 0),
+                unit=args.external_unit,
+            )
         else:
             bp = BrokerProcess(cfg)
         bp.start()
@@ -482,8 +511,9 @@ def main(argv: list[str] | None = None) -> None:
             scenario_dir.mkdir(parents=True, exist_ok=True)
 
             # Restart broker between scenarios to clear residual topics/subscriptions
-            print(f"  restarting broker [{scenario.broker}] ...", file=sys.stderr)
-            broker_proc.restart()
+            if args.broker_backend != "external":
+                print(f"  restarting broker [{scenario.broker}] ...", file=sys.stderr)
+                broker_proc.restart()
 
             # Start perf recording (must be after restart to capture the new PID)
             perf_data_path = scenario_dir / "perf.data"
@@ -506,6 +536,7 @@ def main(argv: list[str] | None = None) -> None:
                         scenario_dir,
                         broker_proc,
                         perf_collector,
+                        args.external_url if args.broker_backend == "external" else None,
                     )
                 elif scenario.kind == "consume_e2e":
                     result = _run_consume_e2e_scenario(
@@ -514,6 +545,7 @@ def main(argv: list[str] | None = None) -> None:
                         scenario_dir,
                         broker_proc,
                         perf_collector,
+                        args.external_url if args.broker_backend == "external" else None,
                     )
                 else:
                     print(f"  UNKNOWN kind: {scenario.kind}, skipping", file=sys.stderr)
@@ -526,7 +558,10 @@ def main(argv: list[str] | None = None) -> None:
                     "name": scenario.name,
                     "kind": scenario.kind,
                     "broker_profile": scenario.broker,
-                    "service_url": _service_url_for(scenario),
+                    "service_url": _service_url_for(
+                        scenario,
+                        args.external_url if args.broker_backend == "external" else None,
+                    ),
                     "description": scenario.description,
                     "topic": _topic_for(run_id, scenario),
                     "started_at": datetime.now(timezone.utc).isoformat(),

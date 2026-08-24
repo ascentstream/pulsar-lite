@@ -9,16 +9,20 @@ use pulsar_lite::broker::handle_connection;
 use pulsar_lite::broker::service::topic::TopicPublishRate;
 use pulsar_lite::broker::{BrokerService, ConnectionLimiter};
 use pulsar_lite::config::Config;
-use pulsar_lite::protocol::codec::PulsarFrameCodec;
-use pulsar_lite::protocol::ServerCommand;
-use pulsar_lite::storage::Storage;
+use pulsar_lite_proto::codec::PulsarFrameCodec;
+use pulsar_lite_proto::ServerCommand;
+use pulsar_lite_storage::Storage;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tikv_jemallocator::Jemalloc;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Duration;
 use tokio_util::codec::Framed;
+
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 #[derive(Debug, Parser)]
 #[command(name = "pulsar-lite")]

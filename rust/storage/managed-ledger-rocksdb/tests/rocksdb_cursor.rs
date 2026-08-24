@@ -3,13 +3,14 @@
 mod common;
 
 use common::*;
-use pulsar_lite_storage_managed_ledger::{ManagedCursor, ManagedLedger};
+use pulsar_lite_storage_managed_ledger::ManagedCursor;
 use pulsar_lite_storage_managed_ledger::{
     ManagedLedgerConfig, ManagedLedgerFactory, ManagedLedgerPosition,
 };
 use pulsar_lite_storage_managed_ledger_rocksdb::test_support::{
-    ack_managed_cursor_shared, is_managed_position_acknowledged, RocksDBManagedCursor,
-    RocksDBManagedLedger, RocksDBManagedLedgerFactory,
+    ack_managed_cursor_shared, append_payload, append_with_partition,
+    is_managed_position_acknowledged, RocksDBManagedCursor, RocksDBManagedLedger,
+    RocksDBManagedLedgerFactory,
 };
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -91,18 +92,19 @@ fn shared_ack_advances_contiguously_across_rolled_ledgers() {
     };
     let entry_log = open_test_entry_log(&db_path);
     let mut factory = RocksDBManagedLedgerFactory::new(Arc::clone(&db), entry_log);
-    let mut ledger = factory.open("ledger-a", &config).unwrap();
-    let first = ledger.add_entry(b"first").unwrap();
-    let second = ledger.add_entry(b"second").unwrap();
-    let third = ledger.add_entry(b"third").unwrap();
+    let ledger = factory.open("ledger-a", &config).unwrap();
+    let first = append_payload(&ledger, b"first").unwrap();
+    let second = append_payload(&ledger, b"second").unwrap();
+    let third = append_payload(&ledger, b"third").unwrap();
     let mut cursor = ledger.open_cursor("sub-a").unwrap();
 
-    ack_managed_cursor_shared(&mut cursor, third.clone(), &ledger.ledger_info()).unwrap();
+    ack_managed_cursor_shared(&mut cursor, third.clone(), &ledger.info_snapshot().as_ref())
+        .unwrap();
     assert_eq!(cursor.state().mark_delete, None);
     assert!(cursor.state().individually_deleted_entries.contains(&third));
 
-    ack_managed_cursor_shared(&mut cursor, first, &ledger.ledger_info()).unwrap();
-    ack_managed_cursor_shared(&mut cursor, second, &ledger.ledger_info()).unwrap();
+    ack_managed_cursor_shared(&mut cursor, first, &ledger.info_snapshot().as_ref()).unwrap();
+    ack_managed_cursor_shared(&mut cursor, second, &ledger.info_snapshot().as_ref()).unwrap();
 
     assert_eq!(cursor.state().mark_delete, Some(third));
     assert!(cursor.state().individually_deleted_entries.is_empty());
@@ -116,14 +118,14 @@ fn managed_ledger_open_cursor_recovers_cursor_state() {
     {
         let db = open_test_db(&db_path);
         let entry_log = open_test_entry_log(&db_path);
-        let mut ledger = RocksDBManagedLedger::open("ledger-a", db, entry_log).unwrap();
+        let ledger = RocksDBManagedLedger::open("ledger-a", db, entry_log).unwrap();
         let mut cursor = ledger.open_cursor("sub-a").unwrap();
         cursor.mark_delete(mark_delete.clone()).unwrap();
     }
 
     let db = open_test_db(&db_path);
     let entry_log = open_test_entry_log(&db_path);
-    let mut ledger = RocksDBManagedLedger::open("ledger-a", db, entry_log).unwrap();
+    let ledger = RocksDBManagedLedger::open("ledger-a", db, entry_log).unwrap();
     let cursor = ledger.open_cursor("sub-a").unwrap();
 
     assert_eq!(cursor.state().mark_delete, Some(mark_delete));
@@ -259,16 +261,17 @@ fn shared_ack_normalizes_partition_when_advancing_mark_delete() {
     let db = open_test_db(&db_path);
     let entry_log = open_test_entry_log(&db_path);
 
-    let mut ledger = RocksDBManagedLedger::open("ledger-a", Arc::clone(&db), entry_log).unwrap();
+    let ledger = RocksDBManagedLedger::open("ledger-a", Arc::clone(&db), entry_log).unwrap();
 
-    let first = ledger.add_entry_with_partition(7, b"first").unwrap();
+    let first = append_with_partition(&ledger, 7, b"first").unwrap();
 
-    let second = ledger.add_entry_with_partition(7, b"second").unwrap();
+    let second = append_with_partition(&ledger, 7, b"second").unwrap();
 
     let mut cursor = ledger.open_cursor("sub-a").unwrap();
 
     // First, reorder ACK item 'second'. It should enter the individual collection
-    ack_managed_cursor_shared(&mut cursor, second.clone(), ledger.ledger_info()).unwrap();
+    ack_managed_cursor_shared(&mut cursor, second.clone(), ledger.info_snapshot().as_ref())
+        .unwrap();
 
     assert_eq!(cursor.state().mark_delete, None);
     assert!(cursor
@@ -281,7 +284,7 @@ fn shared_ack_normalizes_partition_when_advancing_mark_delete() {
         }));
 
     // Then move on to the first item, 'mark_delete'proceed forward
-    ack_managed_cursor_shared(&mut cursor, first.clone(), ledger.ledger_info()).unwrap();
+    ack_managed_cursor_shared(&mut cursor, first.clone(), ledger.info_snapshot().as_ref()).unwrap();
     assert_eq!(
         cursor.state().mark_delete,
         Some(ManagedLedgerPosition {

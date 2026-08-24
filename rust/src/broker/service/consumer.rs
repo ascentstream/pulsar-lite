@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, RwLock};
 
 use super::topic::KeySharedPolicy;
 use super::topic::{AckCommandType, Subscription, SubscriptionType};
-use crate::storage::MessageId;
+use pulsar_lite_storage_managed_ledger::MessageId;
 
 /// Consumer statistics
 #[derive(Debug, Default, Clone)]
@@ -208,6 +208,11 @@ impl Consumer {
         self.available_permits.fetch_add(permits, Ordering::Relaxed);
     }
 
+    /// Instrumentation/gate: dispatched-but-unacked message count for this consumer.
+    pub(crate) async fn pending_acks_len(&self) -> usize {
+        self.pending_acks.len().await
+    }
+
     /// Use one permit when dispatching a message
     pub async fn use_permit(&self) -> bool {
         let mut current = self.available_permits.load(Ordering::Relaxed);
@@ -354,7 +359,7 @@ impl Consumer {
     {
         let metadata = metadata.into();
         let payload = payload.into();
-        let wire_size = crate::protocol::codec::estimate_message_parts_size(
+        let wire_size = pulsar_lite_proto::codec::estimate_message_parts_size(
             self.consumer_id,
             message_id.ledger,
             message_id.entry,
@@ -431,7 +436,7 @@ impl Consumer {
         }
 
         // Step 2: Calculate wire size
-        let wire_size = crate::protocol::codec::estimate_message_parts_size(
+        let wire_size = pulsar_lite_proto::codec::estimate_message_parts_size(
             self.consumer_id,
             message_id.ledger,
             message_id.entry,
@@ -660,7 +665,7 @@ impl Consumer {
     }
 
     /// Record consumer-level ack stats (Exclusive/Failover path).
-    pub async fn ack_message(&self, message_id: crate::storage::MessageId) {
+    pub async fn ack_message(&self, message_id: pulsar_lite_storage_managed_ledger::MessageId) {
         log::debug!(
             "Consumer {} acking message {}:{}",
             self.consumer_id,
@@ -823,7 +828,7 @@ mod tests {
     use super::super::topic::{Subscription, SubscriptionRuntimeMode};
     use super::super::{ConnectionWriteState, SharedStorage};
     use super::*;
-    use crate::storage::Storage;
+    use pulsar_lite_storage::Storage;
     use std::path::Path;
     use tokio::sync::Mutex;
 
@@ -926,7 +931,7 @@ mod tests {
         assert_eq!(consumer.get_available_permits().await, 10);
 
         // Test ack
-        let msg_id = crate::storage::MessageId {
+        let msg_id = pulsar_lite_storage_managed_ledger::MessageId {
             ledger: 1,
             entry: 1,
             partition: -1,
@@ -1092,7 +1097,7 @@ mod tests {
                 .await
         );
 
-        let expected_wire_size = crate::protocol::codec::estimate_message_parts_size(
+        let expected_wire_size = pulsar_lite_proto::codec::estimate_message_parts_size(
             consumer.consumer_id,
             1,
             1,

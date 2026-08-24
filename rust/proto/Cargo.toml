@@ -1,0 +1,14 @@
+[package]
+name = "pulsar-lite-proto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Protobuf
+prost = "0.13"
+prost-types = "0.13"
+bytes = "1.5"
+tokio-util = { version = "0.7", features = ["codec"] }
+
+[build-dependencies]
+prost-build = "0.13"

@@ -4,9 +4,9 @@
  */
 
 use crate::broker::SharedBrokerService;
-use crate::protocol::codec::{proto::pulsar::BaseCommand, PulsarFrameCodec};
-use crate::protocol::ServerCommand;
 use futures::SinkExt;
+use pulsar_lite_proto::codec::{proto::pulsar::BaseCommand, PulsarFrameCodec};
+use pulsar_lite_proto::ServerCommand;
 use tokio_util::codec::Framed;
 
 /// Handle PartitionMetadata command
@@ -85,10 +85,10 @@ where
 mod tests {
     use super::*;
     use crate::broker::broker_service::BrokerService;
-    use crate::protocol::codec::proto::pulsar::{
+    use pulsar_lite_proto::codec::proto::pulsar::{
         base_command, CommandLookupTopic, CommandPartitionedTopicMetadata,
     };
-    use crate::storage::Storage;
+    use pulsar_lite_storage::Storage;
     use std::path::Path;
     use std::sync::Arc;
     use std::time::Instant;

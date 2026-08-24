@@ -208,6 +208,11 @@ impl Consumer {
         self.available_permits.fetch_add(permits, Ordering::Relaxed);
     }
 
+    /// Instrumentation/gate: dispatched-but-unacked message count for this consumer.
+    pub(crate) async fn pending_acks_len(&self) -> usize {
+        self.pending_acks.len().await
+    }
+
     /// Use one permit when dispatching a message
     pub async fn use_permit(&self) -> bool {
         let mut current = self.available_permits.load(Ordering::Relaxed);

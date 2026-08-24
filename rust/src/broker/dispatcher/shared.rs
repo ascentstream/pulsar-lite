@@ -33,8 +33,18 @@ pub struct SharedDispatcher {
     /// Total available permits across all consumers (atomic for thread safety)
     total_available_permits: AtomicU32,
 
-    /// Flag to prevent reentrant dispatching
+    /// Flag to prevent reentrant dispatching (Pulsar readMoreEntriesInProgress).
     dispatch_in_progress: AtomicBool,
+
+    /// Set by triggers that arrive while a dispatch loop is already running;
+    /// the loop checks this at the end of each pass and runs one more pass if
+    /// set (Pulsar shouldRescheduleRead). No triggers are lost and no fixed
+    /// time constants are involved.
+    should_reschedule: AtomicBool,
+
+    /// Per-consumer delivered-but-unacked budget. Dispatch pauses when a
+    /// consumer exceeds it (aligns with Pulsar maxUnackedMessagesPerConsumer).
+    max_unacked_messages: usize,
 
     // Pending messages to redeliver. Shared does not use sticky hash blocking.
     redelivery_controller: Arc<RwLock<RedeliveryController>>,
@@ -42,6 +52,9 @@ pub struct SharedDispatcher {
     /// Next managed-ledger position to read from for new dispatches.
     read_position: RwLock<Option<ManagedLedgerPosition>>,
 }
+
+/// Aligns with Apache Pulsar broker.conf maxUnackedMessagesPerConsumer default.
+const DEFAULT_MAX_UNACKED_MESSAGES_PER_CONSUMER: usize = 50_000;
 
 impl SharedDispatcher {
     /// Create a new SharedDispatcher
@@ -52,6 +65,8 @@ impl SharedDispatcher {
             round_robin_index: AtomicUsize::new(0),
             total_available_permits: AtomicU32::new(0),
             dispatch_in_progress: AtomicBool::new(false),
+            should_reschedule: AtomicBool::new(false),
+            max_unacked_messages: DEFAULT_MAX_UNACKED_MESSAGES_PER_CONSUMER,
             redelivery_controller: Arc::new(RwLock::new(RedeliveryController::new(false))),
             read_position: RwLock::new(None),
         }
@@ -260,6 +275,25 @@ impl SharedDispatcher {
 
             let consumer_id = consumer.consumer_id;
 
+            // Unacked budget gate: pause dispatch for consumers whose
+            // delivered-but-unacked set exceeds the budget (Pulsar
+            // maxUnackedMessagesPerConsumer semantics). Without this, the
+            // redelivery/Flow feedback loop grows permits and reads unboundedly.
+            //
+            // TODO(dispatchers): extract this gate (plus the merge-trigger in
+            // dispatch_messages and the send-failure break) into a shared
+            // module so Exclusive/Failover/KeyShared dispatchers reuse the
+            // same bounded-dispatch logic instead of duplicating it.
+            if consumer.pending_acks_len().await >= self.max_unacked_messages {
+                log::warn!(
+                    "Consumer {} unacked budget exceeded ({} >= {}), pausing dispatch",
+                    consumer_id,
+                    consumer.pending_acks_len().await,
+                    self.max_unacked_messages
+                );
+                break;
+            }
+
             // Use one permit
             if !consumer.use_permit().await {
                 log::warn!("Consumer {} permits exhausted during dispatch", consumer_id);
@@ -325,6 +359,10 @@ impl SharedDispatcher {
                         });
                         consumer.add_permits(1).await;
                         self.total_available_permits.fetch_add(1, Ordering::Relaxed);
+                        // Send failed: connection/write path is saturated.
+                        // Stop this pass instead of immediately re-reading the
+                        // same entry (previous `continue` caused the spin).
+                        break;
                     }
                 } else {
                     // Message no longer exists (may have been deleted), restore permit
@@ -370,6 +408,10 @@ impl SharedDispatcher {
                     commit_read_position(&self.read_position, candidate.next_position);
                     consumer.add_permits(1).await;
                     self.total_available_permits.fetch_add(1, Ordering::Relaxed);
+                    // Send failed: connection/write path is saturated. Stop
+                    // this pass rather than queueing the whole batch for
+                    // redelivery and re-reading in a tight loop.
+                    break;
                 }
             } else {
                 // No more messages, restore permit
@@ -626,34 +668,58 @@ impl Dispatcher for SharedDispatcher {
         topic: String,
         subscription: String,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Prevent reentrant dispatching
+        // Merge-trigger (Pulsar): only one dispatch loop runs at a time.
+        // Concurrent triggers set the reschedule flag instead of starting a
+        // new loop; the running loop checks the flag at the end of each pass
+        // and runs one more pass. No triggers are lost, no fixed time
+        // constants, and empty passes never read storage.
         if self.dispatch_in_progress.swap(true, Ordering::Relaxed) {
-            log::debug!("Dispatch already in progress, skipping");
+            log::debug!("Dispatch already in progress, scheduling reschedule");
+            self.should_reschedule.store(true, Ordering::Relaxed);
             return Ok(());
         }
+
         let result = async {
-            // Keep dispatching batches while we still make progress and have permits.
-            // read/send one batch, then readMoreEntries again
             loop {
-                let dispatcher = self
-                    .dispatch_messages_batch(storage.clone(), topic.clone(), subscription.clone())
-                    .await?;
-                if dispatcher == 0 {
-                    break;
-                }
-                if self.total_available_permits.load(Ordering::Relaxed) == 0 {
-                    break;
+                // One pass: dispatch batches while we make progress and have permits.
+                loop {
+                    let dispatcher = self
+                        .dispatch_messages_batch(
+                            storage.clone(),
+                            topic.clone(),
+                            subscription.clone(),
+                        )
+                        .await?;
+                    if dispatcher == 0 {
+                        break;
+                    }
+                    if self.total_available_permits.load(Ordering::Relaxed) == 0 {
+                        break;
+                    }
+
+                    // yield so other tasks can run on large backlogs.
+                    tokio::task::yield_now().await;
                 }
 
-                // yield so other tasks can run on large backlogs.
-                tokio::task::yield_now().await;
+                // Pulsar ordering: release the loop guard, then check whether
+                // triggers arrived during the pass. Re-acquire for the
+                // follow-up pass; if another trigger already grabbed the guard,
+                // that loop owns the reschedule handling.
+                self.dispatch_in_progress.store(false, Ordering::Relaxed);
+                if !self.should_reschedule.swap(false, Ordering::Relaxed) {
+                    return Ok(());
+                }
+                if self.dispatch_in_progress.swap(true, Ordering::Relaxed) {
+                    return Ok(());
+                }
             }
-            Ok(())
         }
         .await;
 
-        // Reset flag
-        self.dispatch_in_progress.store(false, Ordering::Relaxed);
+        if result.is_err() {
+            // Error propagated out of the pass loop with the guard still held.
+            self.dispatch_in_progress.store(false, Ordering::Relaxed);
+        }
 
         result
     }
@@ -696,6 +762,61 @@ mod tests {
             tx,
             priority_level,
         ))
+    }
+
+    #[tokio::test]
+    async fn shared_dispatch_pauses_when_unacked_budget_exceeded() {
+        let storage = create_test_storage();
+        let subscription = create_test_subscription(storage.clone());
+        let (tx, mut rx) = mpsc::channel(8);
+        let consumer = Arc::new(Consumer::new(
+            1,
+            "consumer-1".to_string(),
+            subscription,
+            "conn-1".to_string(),
+            tx,
+            0,
+        ));
+        consumer.add_permits(10).await;
+
+        let mut dispatcher = SharedDispatcher::new();
+        dispatcher.max_unacked_messages = 2;
+        dispatcher.add_consumer(consumer.clone()).unwrap();
+        dispatcher.consumer_flow(1, 10);
+
+        // Fill the delivered-but-unacked set past the budget (3 > 2).
+        for i in 0..3u64 {
+            consumer
+                .track_message_dispatched(
+                    &MessageId {
+                        ledger: 0,
+                        entry: i,
+                        partition: -1,
+                    },
+                    0,
+                )
+                .await;
+        }
+
+        let result = dispatcher
+            .dispatch_messages(
+                storage.clone(),
+                "persistent://public/default/test-topic".to_string(),
+                "test-sub".to_string(),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "dispatch should not error when budget exceeded"
+        );
+
+        // Budget exceeded -> dispatch paused: nothing should be delivered.
+        let delivered =
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            delivered.is_err(),
+            "dispatch must pause when unacked budget is exceeded"
+        );
     }
 
     #[tokio::test]

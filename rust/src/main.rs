@@ -15,10 +15,14 @@ use pulsar_lite::storage::Storage;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tikv_jemallocator::Jemalloc;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Duration;
 use tokio_util::codec::Framed;
+
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 #[derive(Debug, Parser)]
 #[command(name = "pulsar-lite")]

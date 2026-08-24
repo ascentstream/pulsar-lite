@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, oneshot, RwLock};
 
 /// Type alias for shared subscription
 pub type SharedSubscription = Arc<RwLock<Subscription>>;
@@ -53,6 +53,70 @@ impl NonPersistentPublish {
     }
 }
 
+/// One queued job for the per-topic non-persistent fan-out worker.
+struct NonPersistentFanoutJob {
+    publish: NonPersistentPublish,
+    /// When set, the worker replies after dispatching this job (used by
+    /// `publish_message` for deterministic in-process completion).
+    done: Option<oneshot::Sender<()>>,
+}
+
+/// Bounded depth of the per-topic non-persistent fan-out queue. The worker
+/// applies dispatch-or-drop semantics and never blocks on consumers, so this
+/// bounds only the producer-side burst between enqueue and fan-out.
+const NON_PERSISTENT_FANOUT_QUEUE_CAPACITY: usize = 4096;
+
+/// Jobs drained from the fan-out queue per worker pass. Batching amortizes
+/// the worker wakeup and (per subscription) the lock acquisition plus the
+/// vectorized dispatcher call across many messages.
+const NON_PERSISTENT_FANOUT_BATCH_MAX: usize = 128;
+
+/// Dispatch a drained batch of fan-out jobs.
+///
+/// Entries are grouped per subscription across the whole batch (jobs on one
+/// topic normally carry identical subscription snapshots), so each
+/// subscription pays one lock acquisition and one vectorized
+/// `send_non_persistent_entries` call per batch instead of per message.
+/// Entry order within a subscription follows job order (FIFO), preserving
+/// per-subscription delivery order. `done` replies fire after the whole
+/// batch is dispatched, which keeps `publish_message`'s barrier semantics
+/// conservative and deterministic.
+async fn dispatch_fanout_jobs(jobs: Vec<NonPersistentFanoutJob>) {
+    let mut groups: Vec<(SharedSubscription, Vec<NonPersistentEntry>)> = Vec::new();
+    let mut dones: Vec<oneshot::Sender<()>> = Vec::new();
+    for job in jobs {
+        let NonPersistentFanoutJob { publish, done } = job;
+        if let Some(done) = done {
+            dones.push(done);
+        }
+        let entry = publish.entry;
+        for subscription in publish.subscriptions {
+            match groups
+                .iter_mut()
+                .find(|(s, _)| Arc::ptr_eq(s, &subscription))
+            {
+                Some((_, entries)) => entries.push(entry.retained_duplicate()),
+                None => groups.push((subscription, vec![entry.retained_duplicate()])),
+            }
+        }
+        entry.release();
+    }
+    for (subscription, entries) in groups {
+        let result = {
+            let sub_guard = subscription.read().await;
+            sub_guard.send_non_persistent_entries(entries).await
+        };
+        if let Err(e) = result {
+            log::error!(
+                "Failed to dispatch non-persistent entries to subscription: {}",
+                e
+            );
+        }
+    }
+    for done in dones {
+        let _ = done.send(());
+    }
+}
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TopicPublishRate {
     pub messages_per_sec: u64,
@@ -163,6 +227,11 @@ pub struct Topic {
     /// Storage backend
     storage: SharedStorage,
     publish_rate_limiter: TopicPublishRateLimiter,
+    /// Ordered fan-out queue for non-persistent publishes (lock-free hot path).
+    /// Mirrors the persistent write-queue shape: connection tasks enqueue under
+    /// a short read lock and return immediately; a single worker drains FIFO,
+    /// preserving per-subscription delivery order.
+    non_persistent_fanout_tx: Option<mpsc::Sender<NonPersistentFanoutJob>>,
 }
 
 impl Topic {
@@ -191,7 +260,7 @@ impl Topic {
             runtime_mode
         );
         let persistent_runtime = PersistentTopicRuntime::new(storage.clone());
-        Self {
+        let mut topic = Self {
             name,
             partition,
             producers: HashMap::new(),
@@ -200,7 +269,12 @@ impl Topic {
             persistent_runtime,
             storage,
             publish_rate_limiter: TopicPublishRateLimiter::new(),
+            non_persistent_fanout_tx: None,
+        };
+        if topic.runtime_mode == TopicRuntimeMode::NonPersistent {
+            topic.ensure_non_persistent_fanout_worker();
         }
+        topic
     }
 
     pub fn runtime_mode(&self) -> TopicRuntimeMode {
@@ -209,6 +283,9 @@ impl Topic {
 
     pub fn set_runtime_mode(&mut self, mode: TopicRuntimeMode) {
         self.runtime_mode = mode;
+        if mode == TopicRuntimeMode::NonPersistent {
+            self.ensure_non_persistent_fanout_worker();
+        }
     }
 
     pub fn set_publish_rate(&mut self, limits: TopicPublishRate) {
@@ -277,7 +354,7 @@ impl Topic {
     }
 
     pub fn prepare_non_persistent_publish(
-        &mut self,
+        &self,
         metadata: Option<Bytes>,
         payload: Bytes,
     ) -> Result<NonPersistentPublish, Box<dyn std::error::Error + Send + Sync>> {
@@ -299,6 +376,74 @@ impl Topic {
         self.validate_publish_rate(metadata.as_ref(), payload.len())?;
 
         Ok(self.build_non_persistent_publish(metadata, payload))
+    }
+
+    /// Spawn the per-topic ordered fan-out worker (idempotent).
+    ///
+    /// Topics constructed outside a tokio runtime (sync unit-test contexts)
+    /// skip this and keep the inline `dispatch_sequential` fallback.
+    fn ensure_non_persistent_fanout_worker(&mut self) {
+        if self.non_persistent_fanout_tx.is_some() {
+            return;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let (tx, mut rx) =
+            mpsc::channel::<NonPersistentFanoutJob>(NON_PERSISTENT_FANOUT_QUEUE_CAPACITY);
+        tokio::spawn(async move {
+            while let Some(first) = rx.recv().await {
+                let mut jobs = Vec::with_capacity(NON_PERSISTENT_FANOUT_BATCH_MAX);
+                jobs.push(first);
+                while jobs.len() < NON_PERSISTENT_FANOUT_BATCH_MAX {
+                    match rx.try_recv() {
+                        Ok(job) => jobs.push(job),
+                        Err(_) => break,
+                    }
+                }
+                dispatch_fanout_jobs(jobs).await;
+            }
+        });
+        self.non_persistent_fanout_tx = Some(tx);
+    }
+
+    /// Non-persistent publish hot path — the lock-free mirror of the persistent
+    /// write-queue enqueue: one short read lock for the rate check and the
+    /// subscription snapshot, then enqueue to the ordered fan-out worker and
+    /// return. The SendReceipt is an accept-ack; fan-out completes
+    /// asynchronously (same contract as the drop gate's fake receipts).
+    pub(crate) async fn publish_non_persistent(
+        topic: &Arc<RwLock<Topic>>,
+        metadata: Option<Bytes>,
+        payload: Bytes,
+    ) -> Result<MessageId, Box<dyn std::error::Error + Send + Sync>> {
+        let (publish, fanout_tx) = {
+            let topic_guard = topic.read().await;
+            let publish = topic_guard.prepare_non_persistent_publish(metadata, payload)?;
+            (publish, topic_guard.non_persistent_fanout_tx.clone())
+        };
+        let message_id = publish.message_id();
+        Self::fan_out_non_persistent(publish, fanout_tx).await?;
+        Ok(message_id)
+    }
+
+    async fn fan_out_non_persistent(
+        publish: NonPersistentPublish,
+        fanout_tx: Option<mpsc::Sender<NonPersistentFanoutJob>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match fanout_tx {
+            Some(tx) => tx
+                .send(NonPersistentFanoutJob {
+                    publish,
+                    done: None,
+                })
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("non-persistent fan-out worker gone: {e}").into()
+                })?,
+            None => publish.dispatch_sequential().await,
+        }
+        Ok(())
     }
 
     /// Extract partition ID from topic name
@@ -536,7 +681,22 @@ impl Topic {
             TopicRuntimeMode::NonPersistent => {
                 let publish = self.build_non_persistent_publish(metadata, payload);
                 let message_id = publish.message_id();
-                publish.dispatch_sequential().await;
+                match self.non_persistent_fanout_tx.clone() {
+                    Some(tx) => {
+                        // Same ordered queue as the network path; wait for this
+                        // job so in-process callers (and tests) observe delivery
+                        // deterministically. The worker never locks the topic,
+                        // so awaiting under the caller's topic write lock is safe.
+                        let (done_tx, done_rx) = oneshot::channel();
+                        tx.send(NonPersistentFanoutJob {
+                            publish,
+                            done: Some(done_tx),
+                        })
+                        .await?;
+                        let _ = done_rx.await;
+                    }
+                    None => publish.dispatch_sequential().await,
+                }
                 message_id
             }
         };

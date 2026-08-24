@@ -384,6 +384,65 @@ async fn test_non_persistent_dispatches_entries_per_subscription_in_order() {
 }
 
 #[tokio::test]
+async fn non_persistent_fire_and_forget_enqueue_preserves_order() {
+    let storage = create_test_storage();
+    let topic = Arc::new(RwLock::new(Topic::new(
+        "non-persistent://public/default/fanout-order".to_string(),
+        storage,
+    )));
+
+    // Publishes with no subscription enqueue and drain without blocking.
+    for i in 0..5 {
+        Topic::publish_non_persistent(&topic, None, Bytes::from(format!("nosub-{i}")))
+            .await
+            .unwrap();
+    }
+
+    let subscription = topic
+        .write()
+        .await
+        .get_or_create_subscription("sub1", SubscriptionType::Exclusive)
+        .await
+        .unwrap();
+    let (consumer, mut rx) = create_test_consumer_with_rx(1, subscription.clone());
+    {
+        let mut sub_guard = subscription.write().await;
+        sub_guard.add_consumer(consumer).unwrap();
+    }
+    {
+        let sub_guard = subscription.read().await;
+        sub_guard.get_consumer(1).unwrap().add_permits(400).await;
+    }
+    {
+        let sub_guard = subscription.read().await;
+        sub_guard.consumer_flow(1, 400).await;
+    }
+
+    // Hot-path semantics: enqueue and return without awaiting fan-out.
+    for i in 0..300 {
+        Topic::publish_non_persistent(&topic, None, Bytes::from(format!("m{i}")))
+            .await
+            .unwrap();
+    }
+    // Barrier: publish_message queues behind all fire-and-forget jobs and
+    // awaits its own completion, so every earlier job has been dispatched.
+    topic
+        .write()
+        .await
+        .publish_message(None, Bytes::from_static(b"barrier"))
+        .await
+        .unwrap();
+
+    let mut received = Vec::with_capacity(301);
+    while let Ok((_, pending)) = rx.try_recv() {
+        received.push(pending.payload);
+    }
+    let mut expected: Vec<Vec<u8>> = (0..300).map(|i| format!("m{i}").into_bytes()).collect();
+    expected.push(b"barrier".to_vec());
+    assert_eq!(received, expected);
+}
+
+#[tokio::test]
 async fn test_non_persistent_topic_immediately_drops_for_blocked_subscription() {
     let storage = create_test_storage();
     let mut topic = Topic::new("test-topic".to_string(), storage);

@@ -195,7 +195,10 @@ pub async fn handle_flow(
     consumers: &mut HashMap<u64, Arc<Consumer>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let flow_cmd = cmd.flow.as_ref().ok_or("Missing flow command")?;
-    log::info!(
+    // Per-Flow logging is debug-level: clients send thousands of Flow
+    // commands per second under load; INFO floods the journal/PTY and the
+    // synchronous logger write can stall runtime workers under backpressure.
+    log::debug!(
         "Handling Flow command: consumer_id={}, permits={}",
         flow_cmd.consumer_id,
         flow_cmd.message_permits

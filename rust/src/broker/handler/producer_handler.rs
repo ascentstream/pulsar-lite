@@ -130,13 +130,11 @@ pub async fn publish_send(
 
     let message_id = if is_non_persistent {
         producer.record_message_sent(frame.payload.len()).await;
-        let publish = {
-            let mut topic_guard = topic.write().await;
-            topic_guard.prepare_non_persistent_publish(frame.metadata, frame.payload)?
-        };
-        let message_id = publish.message_id();
-        publish.dispatch_sequential().await;
-        message_id
+        // Lock-free hot path (mirror of the persistent write-queue enqueue):
+        // short read lock for rate check + subscription snapshot, then hand
+        // off to the per-topic ordered fan-out worker. The connection task is
+        // free to read the next frame while fan-out runs.
+        Topic::publish_non_persistent(&topic, frame.metadata, frame.payload).await?
     } else {
         let message_id = producer
             .publish_message(frame.metadata, frame.payload)

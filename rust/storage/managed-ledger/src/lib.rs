@@ -8,6 +8,7 @@ mod ledger;
 mod legacy_storage;
 mod memory;
 mod position;
+mod range_set;
 
 pub use config::ManagedLedgerConfig;
 pub use cursor::{
@@ -27,3 +28,4 @@ pub use memory::{
     InMemoryManagedLedgerStorage,
 };
 pub use position::{ManagedLedgerPosition, MessageId, NonPersistentEntry, StoredMessage};
+pub use range_set::{RangeSet, Succ};

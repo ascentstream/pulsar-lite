@@ -678,18 +678,18 @@ impl Subscription {
 
     /// Get total available permits across all consumers
     pub async fn get_total_permits(&self) -> u32 {
-        let mut total = 0;
+        let mut total = 0i32;
         for consumer in self.get_consumers() {
             total += consumer.get_available_permits().await;
         }
-        total
+        total.max(0) as u32
     }
 
     /// Get subscription statistics
     pub async fn get_stats(&self) -> SubscriptionStats {
         let consumers = self.get_consumers();
         let consumer_count = consumers.len();
-        let mut total_permits = 0;
+        let mut total_permits = 0i32;
         for consumer in consumers {
             total_permits += consumer.get_available_permits().await;
         }
@@ -699,7 +699,7 @@ impl Subscription {
             topic: self.topic.clone(),
             sub_type: self.sub_type,
             consumer_count,
-            total_permits,
+            total_permits: total_permits.max(0) as u32,
             received_messages: match self.runtime_mode {
                 SubscriptionRuntimeMode::Persistent => 0,
                 SubscriptionRuntimeMode::NonPersistent => self
@@ -794,6 +794,35 @@ impl Subscription {
         if self.runtime_mode == SubscriptionRuntimeMode::NonPersistent {
             if let Some(runtime) = self.non_persistent_runtime.as_ref() {
                 runtime.record_drop(count);
+            }
+        }
+    }
+
+    /// Apply a Flow's permits to both accounting layers (consumer-local via
+    /// the handler, dispatcher aggregate here) without triggering dispatch.
+    /// Runs synchronously under the subscription read lock so a concurrent
+    /// consumer removal (write lock) never observes a half-applied Flow.
+    pub fn apply_flow_permits(&self, consumer_id: u64, additional_permits: u32) {
+        match self.runtime_mode {
+            SubscriptionRuntimeMode::Persistent => {
+                if let Some(runtime) = self.persistent_runtime.as_ref() {
+                    runtime.apply_flow_permits(consumer_id, additional_permits);
+                } else {
+                    log::warn!(
+                        "No persistent runtime available for subscription '{}'",
+                        self.name
+                    );
+                }
+            }
+            SubscriptionRuntimeMode::NonPersistent => {
+                if let Some(ref runtime) = self.non_persistent_runtime {
+                    runtime.consumer_flow(consumer_id, additional_permits);
+                } else {
+                    log::warn!(
+                        "No non-persistent runtime available for subscription '{}'",
+                        self.name
+                    );
+                }
             }
         }
     }

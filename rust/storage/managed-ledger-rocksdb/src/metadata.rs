@@ -1,9 +1,8 @@
 use super::entrylog::EntryIndex;
 use anyhow::{anyhow, Result};
 use prost::Message;
-use pulsar_lite_storage_managed_ledger::{ManagedCursorState, ManagedLedgerPosition};
+use pulsar_lite_storage_managed_ledger::{ManagedCursorState, ManagedLedgerPosition, RangeSet};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod proto {
@@ -36,7 +35,7 @@ impl From<EntryIndex> for StoredEntryLocation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredManagedCursorState {
     pub mark_delete: Option<ManagedLedgerPosition>,
-    pub individually_deleted_entries: BTreeSet<ManagedLedgerPosition>,
+    pub individually_deleted_entries: RangeSet<ManagedLedgerPosition>,
 }
 
 impl From<ManagedCursorState> for StoredManagedCursorState {
@@ -68,7 +67,7 @@ impl StoredManagedCursorState {
             individual_deleted_messages: self
                 .individually_deleted_entries
                 .iter()
-                .map(position_range)
+                .map(|(start, end)| position_range(start, end))
                 .collect(),
             properties: Vec::new(),
             last_active: None,
@@ -88,21 +87,28 @@ impl StoredManagedCursorState {
             }),
             _ => None,
         };
-        let mut individually_deleted_entries = BTreeSet::new();
+        let mut individually_deleted_entries = RangeSet::new();
 
         for range in info.individual_deleted_messages {
             let lower = range.lower_endpoint;
             let upper = range.upper_endpoint;
-            if lower.ledger_id != upper.ledger_id || lower.entry_id != upper.entry_id {
+            if lower.ledger_id != upper.ledger_id {
                 return Err(anyhow!(
-                    "cursor delete range spans multiple positions, which pulsar-lite does not support yet"
+                    "cursor delete range spans multiple ledgers, which is unsupported"
                 ));
             }
-            individually_deleted_entries.insert(ManagedLedgerPosition {
-                ledger_id: lower.ledger_id.try_into()?,
-                entry_id: lower.entry_id.try_into()?,
-                partition: -1,
-            });
+            individually_deleted_entries.insert_range(
+                ManagedLedgerPosition {
+                    ledger_id: lower.ledger_id.try_into()?,
+                    entry_id: lower.entry_id.try_into()?,
+                    partition: -1,
+                },
+                ManagedLedgerPosition {
+                    ledger_id: upper.ledger_id.try_into()?,
+                    entry_id: upper.entry_id.try_into()?,
+                    partition: -1,
+                },
+            );
         }
 
         Ok(Self {
@@ -214,13 +220,17 @@ fn current_time_millis() -> u64 {
         .unwrap_or_default()
 }
 
-fn position_range(position: &ManagedLedgerPosition) -> proto::MessageRange {
-    let endpoint = proto::NestedPositionInfo {
-        ledger_id: position.ledger_id as i64,
-        entry_id: position.entry_id as i64,
+fn position_range(start: &ManagedLedgerPosition, end: &ManagedLedgerPosition) -> proto::MessageRange {
+    let lower_endpoint = proto::NestedPositionInfo {
+        ledger_id: start.ledger_id as i64,
+        entry_id: start.entry_id as i64,
+    };
+    let upper_endpoint = proto::NestedPositionInfo {
+        ledger_id: end.ledger_id as i64,
+        entry_id: end.entry_id as i64,
     };
     proto::MessageRange {
-        lower_endpoint: endpoint,
-        upper_endpoint: endpoint,
+        lower_endpoint,
+        upper_endpoint,
     }
 }

@@ -59,6 +59,14 @@ pub struct Config {
     #[serde(default = "default_max_pending_publish_requests_per_connection")]
     pub max_pending_publish_requests_per_connection: usize,
 
+    /// Byte-level TCP throttle high watermark per connection.
+    /// In-flight publish bytes reaching this limit also pause reads (same
+    /// hysteresis as the request-count limit: resume at 50%). This caps memory
+    /// for large-message workloads where 1000 requests could hold GBs.
+    /// Default: 256 MiB
+    #[serde(default = "default_max_pending_publish_bytes_per_connection")]
+    pub max_pending_publish_bytes_per_connection: usize,
+
     /// Maximum allowed message size in bytes.
     #[serde(default = "default_max_message_size_bytes")]
     pub max_message_size_bytes: usize,
@@ -114,6 +122,10 @@ fn default_max_pending_publish_requests_per_connection() -> usize {
     1000
 }
 
+fn default_max_pending_publish_bytes_per_connection() -> usize {
+    256 * 1024 * 1024
+}
+
 fn default_max_message_size_bytes() -> usize {
     5 * 1024 * 1024
 }
@@ -143,6 +155,8 @@ impl Default for Config {
                 default_max_concurrent_non_persistent_messages_per_connection(),
             max_pending_publish_requests_per_connection:
                 default_max_pending_publish_requests_per_connection(),
+            max_pending_publish_bytes_per_connection:
+                default_max_pending_publish_bytes_per_connection(),
             max_message_size_bytes: default_max_message_size_bytes(),
             publish_rate_messages_per_sec: 0,
             publish_rate_bytes_per_sec: 0,
@@ -271,6 +285,7 @@ managed_ledger_store = "rocksdb"
             max_connections_per_ip: 8,
             max_concurrent_non_persistent_messages_per_connection: 10000,
             max_pending_publish_requests_per_connection: 2000,
+            max_pending_publish_bytes_per_connection: 512 * 1024 * 1024,
             max_message_size_bytes: 2048,
             publish_rate_messages_per_sec: 123,
             publish_rate_bytes_per_sec: 456,
@@ -338,6 +353,7 @@ managed_ledger_store = "rocksdb"
             max_connections_per_ip: 8,
             max_concurrent_non_persistent_messages_per_connection: 10000,
             max_pending_publish_requests_per_connection: 2000,
+            max_pending_publish_bytes_per_connection: 512 * 1024 * 1024,
             max_message_size_bytes: 2048,
             publish_rate_messages_per_sec: 123,
             publish_rate_bytes_per_sec: 456,

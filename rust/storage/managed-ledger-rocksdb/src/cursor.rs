@@ -158,14 +158,19 @@ pub fn ack_managed_cursor_shared(
         Some(_) => {}
     }
 
+    // Advance the mark-delete frontier across contiguous acknowledged ranges.
+    // `take_covering` consumes a whole coalesced range in one step.
     while let Some(mark_delete) = cursor.state().mark_delete.clone() {
         let Some(next) = next_position(&mark_delete, info) else {
             break;
         };
-        if cursor.state.individually_deleted_entries.remove(&next) {
-            cursor.mark_delete(next)?;
-        } else {
-            break;
+        match cursor
+            .state
+            .individually_deleted_entries
+            .take_covering(&next)
+        {
+            Some(end) => cursor.mark_delete(end)?,
+            None => break,
         }
     }
 

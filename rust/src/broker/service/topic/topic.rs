@@ -61,6 +61,15 @@ pub struct TopicPublishRate {
 
 #[derive(Debug)]
 struct TopicPublishRateLimiter {
+    /// Interior mutability: checked from read-locked Topic context on the hot
+    /// send path, so the window state lives behind a short std Mutex instead of
+    /// requiring `&mut Topic`. The default unlimited configuration takes the
+    /// fast path before any window arithmetic.
+    inner: std::sync::Mutex<TopicPublishRateLimiterState>,
+}
+
+#[derive(Debug)]
+struct TopicPublishRateLimiterState {
     limits: TopicPublishRate,
     window_started_at: Instant,
     messages_in_window: u64,
@@ -70,40 +79,45 @@ struct TopicPublishRateLimiter {
 impl TopicPublishRateLimiter {
     fn new() -> Self {
         Self {
-            limits: TopicPublishRate::default(),
-            window_started_at: Instant::now(),
-            messages_in_window: 0,
-            bytes_in_window: 0,
+            inner: std::sync::Mutex::new(TopicPublishRateLimiterState {
+                limits: TopicPublishRate::default(),
+                window_started_at: Instant::now(),
+                messages_in_window: 0,
+                bytes_in_window: 0,
+            }),
         }
     }
 
-    fn set_limits(&mut self, limits: TopicPublishRate) {
-        self.limits = limits;
-        self.window_started_at = Instant::now();
-        self.messages_in_window = 0;
-        self.bytes_in_window = 0;
+    fn set_limits(&self, limits: TopicPublishRate) {
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        state.limits = limits;
+        state.window_started_at = Instant::now();
+        state.messages_in_window = 0;
+        state.bytes_in_window = 0;
     }
 
-    fn allow_publish(&mut self, message_count: u64, bytes: u64) -> bool {
-        if self.limits.messages_per_sec == 0 && self.limits.bytes_per_sec == 0 {
+    fn allow_publish(&self, message_count: u64, bytes: u64) -> bool {
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        if state.limits.messages_per_sec == 0 && state.limits.bytes_per_sec == 0 {
             return true;
         }
 
-        if self.window_started_at.elapsed() >= Duration::from_secs(1) {
-            self.window_started_at = Instant::now();
-            self.messages_in_window = 0;
-            self.bytes_in_window = 0;
+        if state.window_started_at.elapsed() >= Duration::from_secs(1) {
+            state.window_started_at = Instant::now();
+            state.messages_in_window = 0;
+            state.bytes_in_window = 0;
         }
 
-        let next_messages = self.messages_in_window.saturating_add(message_count);
-        let next_bytes = self.bytes_in_window.saturating_add(bytes);
+        let next_messages = state.messages_in_window.saturating_add(message_count);
+        let next_bytes = state.bytes_in_window.saturating_add(bytes);
         let messages_ok =
-            self.limits.messages_per_sec == 0 || next_messages <= self.limits.messages_per_sec;
-        let bytes_ok = self.limits.bytes_per_sec == 0 || next_bytes <= self.limits.bytes_per_sec;
+            state.limits.messages_per_sec == 0 || next_messages <= state.limits.messages_per_sec;
+        let bytes_ok = state.limits.bytes_per_sec == 0 || next_bytes <= state.limits.bytes_per_sec;
 
         if messages_ok && bytes_ok {
-            self.messages_in_window = next_messages;
-            self.bytes_in_window = next_bytes;
+            state.messages_in_window = next_messages;
+            state.bytes_in_window = next_bytes;
             true
         } else {
             false
@@ -206,15 +220,10 @@ impl Topic {
         self.persistent_runtime.clone()
     }
 
-    #[cfg(feature = "rocksdb-storage")]
-    pub(crate) fn shared_storage(&self) -> SharedStorage {
-        self.storage.clone()
-    }
-
     /// Rate-limit check used by producers that release the topic write lock
     /// before waiting on storage IO.
     pub(crate) fn validate_publish_rate_public(
-        &mut self,
+        &self,
         metadata: Option<&Bytes>,
         payload_len: usize,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -250,7 +259,7 @@ impl Topic {
     }
 
     fn validate_publish_rate(
-        &mut self,
+        &self,
         metadata: Option<&Bytes>,
         payload_len: usize,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -543,11 +552,22 @@ impl Topic {
         Ok(message_id)
     }
 
+    /// Fire-and-forget dispatch: never blocks the caller's connection task.
+    /// The dispatcher's merge-trigger (dispatch_in_progress + should_reschedule
+    /// in dispatcher/shared.rs) coalesces concurrent triggers, so spawning one
+    /// task per completion is safe: no lost wakeups, no duplicate dispatch.
+    pub fn spawn_dispatcher(topic: Arc<RwLock<Topic>>) {
+        tokio::spawn(async move {
+            let topic_guard = topic.read().await;
+            topic_guard.dispatch_to_subscriptions().await;
+        });
+    }
+
     /// Dispatch messages to all subscriptions (Push mode - Apache Pulsar style)
     ///
     /// This should be called after publish_message() to push messages to consumers.
     /// It triggers the dispatcher for each subscription to deliver pending messages.
-    pub async fn dispatch_to_subscriptions(&mut self) {
+    pub async fn dispatch_to_subscriptions(&self) {
         let subscription_count = self.subscriptions.len();
         match self.runtime_mode {
             TopicRuntimeMode::Persistent => {

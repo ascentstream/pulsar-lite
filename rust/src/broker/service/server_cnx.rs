@@ -7,6 +7,7 @@ use futures::future::pending;
 use futures::{SinkExt, StreamExt};
 use prost::Message;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -16,8 +17,8 @@ use tokio_util::codec::Framed;
 use super::consumer::PendingMessage;
 use super::{ConnectionWriteState, Consumer, Producer, SharedStorage};
 use crate::broker::broker_service::SharedBrokerService;
-use crate::broker::handler;
 use crate::broker::service::topic::TopicPublishRateExceeded;
+use crate::broker::{handler, Topic};
 use pulsar_lite_proto::codec::{
     proto::pulsar::{base_command, BaseCommand, ProtocolVersion, ServerError},
     PulsarFrame, PulsarFrameCodec,
@@ -56,7 +57,7 @@ type CnxError = Box<dyn Error + Send + Sync>;
 type CnxResult<T> = Result<T, CnxError>;
 
 #[cfg(feature = "rocksdb-storage")]
-use pulsar_lite_storage_managed_ledger_rocksdb::ConnAppendResult;
+use pulsar_lite_storage_managed_ledger_rocksdb::{ConcurrentAppender, ConnAppendResult};
 
 fn to_cnx_error(error: impl ToString) -> CnxError {
     Box::new(std::io::Error::other(error.to_string()))
@@ -151,17 +152,32 @@ where
     /// Number of in-flight publish tasks on this connection
     /// (non-persistent sync path + persistent pipelined path).
     pending_send_requests: usize,
+    /// In-flight publish bytes on this connection (payload + metadata).
+    /// Byte-level counterpart of pending_send_requests: caps memory for
+    /// large-message workloads where 1000 requests could hold GBs.
+    pending_send_bytes: usize,
+    /// FIFO of in-flight persistent publish sizes, pairing enqueue order with
+    /// completion order (write-queue is single-worker FIFO) for exact accounting.
+    pending_send_sizes: VecDeque<usize>,
     /// Drop gate: messages are silently dropped with fake receipt when this is exceeded.
     /// Maps to Pulsar's maxConcurrentNonPersistentMessagePerConnection.
     max_concurrent_non_persistent: usize,
     /// TCP throttle gate: reading from framed stops when pending reaches this limit.
     /// Maps to Pulsar's maxPendingPublishRequestsPerConnection.
     max_pending_publish_requests: usize,
+    /// Byte-level TCP throttle high watermark (hysteresis: resume at 50%).
+    max_pending_publish_bytes: usize,
     /// Cap for pipelined persistent Send tasks on this connection.
     #[cfg(feature = "rocksdb-storage")]
     max_persistent_in_flight: usize,
+    /// Write-queue handle cloned once at connection setup so the per-Send hot
+    /// path never takes Mutex<Storage> to obtain an appender.
+    #[cfg(feature = "rocksdb-storage")]
+    persistent_appender: Option<ConcurrentAppender>,
     /// Resume reading threshold (hysteresis = max_pending_publish_requests / 2).
     resume_threshold: usize,
+    /// Resume reading threshold for bytes (max_pending_publish_bytes / 2).
+    resume_bytes_threshold: usize,
     /// When true, the event loop skips framed.next(), equivalent to Netty auto-read = false.
     read_paused: bool,
     /// Maximum message size accepted by the broker.
@@ -210,10 +226,12 @@ where
         connection_liveness_check_timeout: Duration,
         max_concurrent_non_persistent: usize,
         max_pending_publish_requests: usize,
+        max_pending_publish_bytes: usize,
         max_message_size: usize,
         broker_service_url: String,
         channel_write_buffer_high_water_mark_bytes: usize,
         channel_write_buffer_low_water_mark_bytes: usize,
+        #[cfg(feature = "rocksdb-storage")] persistent_appender: Option<ConcurrentAppender>,
     ) -> Self {
         let mut framed = Framed::new(socket, PulsarFrameCodec::new());
         framed.set_backpressure_boundary(channel_write_buffer_high_water_mark_bytes);
@@ -245,11 +263,17 @@ where
             connection_id,
             topic_manager,
             pending_send_requests: 0,
+            pending_send_bytes: 0,
+            pending_send_sizes: VecDeque::new(),
             max_concurrent_non_persistent,
             max_pending_publish_requests,
+            max_pending_publish_bytes,
             #[cfg(feature = "rocksdb-storage")]
             max_persistent_in_flight: DEFAULT_MAX_PERSISTENT_IN_FLIGHT,
+            #[cfg(feature = "rocksdb-storage")]
+            persistent_appender,
             resume_threshold: max_pending_publish_requests / 2,
+            resume_bytes_threshold: max_pending_publish_bytes / 2,
             read_paused: false,
             max_message_size,
             #[cfg(feature = "rocksdb-storage")]
@@ -290,7 +314,7 @@ where
                 tokio::select! {
 
                 // Inbound protocol commands — skipped when read_paused (TCP backpressure).
-                frame_result = self.framed.next(), if !self.read_paused && self.connection_write_state.is_writable() => {
+                frame_result = self.framed.next(), if !self.read_paused => {
                     let Some(frame) = frame_result else {
                         self.close_reason.get_or_insert(CloseReason::ClientClosed);
                         break Ok(());
@@ -383,7 +407,7 @@ where
                 tokio::select! {
 
                 // Inbound protocol commands — skipped when read_paused (TCP backpressure).
-                frame_result = self.framed.next(), if !self.read_paused && self.connection_write_state.is_writable() => {
+                frame_result = self.framed.next(), if !self.read_paused => {
                     let Some(frame) = frame_result else {
                         self.close_reason.get_or_insert(CloseReason::ClientClosed);
                         break Ok(());
@@ -739,14 +763,28 @@ where
         .map_err(to_cnx_error)
     }
 
+    fn maybe_pause_read(&mut self) {
+        if self.pending_send_requests >= self.max_pending_publish_requests
+            || self.pending_send_bytes >= self.max_pending_publish_bytes
+        {
+            self.read_paused = true;
+        }
+    }
+
     fn maybe_resume_read_after_send(&mut self) {
-        if self.read_paused && self.pending_send_requests <= self.resume_threshold {
+        if self.read_paused
+            && self.pending_send_requests <= self.resume_threshold
+            && self.pending_send_bytes <= self.resume_bytes_threshold
+        {
             self.read_paused = false;
         }
     }
 
     async fn complete_persistent_send(&mut self, outcome: PersistentSendOutcome) -> CnxResult<()> {
         self.pending_send_requests = self.pending_send_requests.saturating_sub(1);
+        if let Some(size) = self.pending_send_sizes.pop_front() {
+            self.pending_send_bytes = self.pending_send_bytes.saturating_sub(size);
+        }
         self.maybe_resume_read_after_send();
 
         match outcome.result {
@@ -762,9 +800,7 @@ where
                     .await
                     .map_err(to_cnx_error)?;
                 if let Some(producer) = self.producers.get(&outcome.producer_id) {
-                    let topic = producer.get_topic();
-                    let mut topic_guard = topic.write().await;
-                    topic_guard.dispatch_to_subscriptions().await;
+                    Topic::spawn_dispatcher(producer.get_topic());
                 }
             }
             Err(message) => {
@@ -832,13 +868,13 @@ where
             }
 
             self.pending_send_requests += 1;
-            if self.pending_send_requests >= self.max_pending_publish_requests {
-                self.read_paused = true;
-            }
+            self.pending_send_bytes += message_size;
+            self.maybe_pause_read();
 
             let result = handler::handle_send(&mut self.framed, cmd, frame, &self.producers).await;
 
             self.pending_send_requests = self.pending_send_requests.saturating_sub(1);
+            self.pending_send_bytes = self.pending_send_bytes.saturating_sub(message_size);
             self.maybe_resume_read_after_send();
 
             return match result {
@@ -880,8 +916,8 @@ where
             let meta_len = frame.metadata.as_ref().map(|m| m.len()).unwrap_or(0);
             let payload_len = frame.payload.len();
 
-            let (topic_name, partition, storage) = {
-                let mut topic_guard = topic.write().await;
+            let (topic_name, partition) = {
+                let topic_guard = topic.read().await;
                 if let Err(error) =
                     topic_guard.validate_publish_rate_public(frame.metadata.as_ref(), payload_len)
                 {
@@ -899,20 +935,12 @@ where
                     }
                     return Err(to_cnx_error(error));
                 }
-                (
-                    topic_guard.name.clone(),
-                    topic_guard.partition,
-                    topic_guard.shared_storage(),
-                )
+                (topic_guard.name.clone(), topic_guard.partition)
             };
 
-            let appender = {
-                let guard = storage.lock().await;
-                guard
-                    .concurrent_appender()
-                    .map_err(|e| to_cnx_error(e.to_string()))?
-            };
-            if let Some(appender) = appender {
+            // Write-queue handle was cloned once at connection setup; the hot
+            // path never locks Mutex<Storage>.
+            if let Some(appender) = self.persistent_appender.clone() {
                 let meta_slice = frame.metadata.as_ref().map(|b| b.as_ref()).unwrap_or(&[]);
                 appender
                     .enqueue_for_connection(
@@ -929,18 +957,19 @@ where
                 producer.record_message_sent(payload_len + meta_len).await;
 
                 self.pending_send_requests += 1;
-                if self.pending_send_requests >= self.max_pending_publish_requests {
-                    self.read_paused = true;
-                }
+                let send_size = payload_len + meta_len;
+                self.pending_send_bytes += send_size;
+                self.pending_send_sizes.push_back(send_size);
+                self.maybe_pause_read();
                 return Ok(());
             }
         }
 
         // Memory backend fallback (unit tests): await publish on this task.
         self.pending_send_requests += 1;
-        if self.pending_send_requests >= self.max_pending_publish_requests {
-            self.read_paused = true;
-        }
+        self.pending_send_bytes += message_size;
+        self.pending_send_sizes.push_back(message_size);
+        self.maybe_pause_read();
         let metadata = frame.metadata.clone();
         let payload = frame.payload.clone();
         match handler::publish_persistent_send(
@@ -962,6 +991,9 @@ where
             }
             Err(error) => {
                 self.pending_send_requests = self.pending_send_requests.saturating_sub(1);
+                if let Some(size) = self.pending_send_sizes.pop_front() {
+                    self.pending_send_bytes = self.pending_send_bytes.saturating_sub(size);
+                }
                 self.maybe_resume_read_after_send();
                 if let Some(rate_error) = error.downcast_ref::<TopicPublishRateExceeded>() {
                     self.framed
@@ -1080,6 +1112,7 @@ pub async fn handle_connection(
     connection_liveness_check_timeout: Duration,
     max_non_persistent_pending_messages: usize,
     max_pending_publish_requests: usize,
+    max_pending_publish_bytes: usize,
     max_message_size: usize,
     broker_service_url: String,
     channel_write_buffer_high_water_mark_bytes: usize,
@@ -1092,6 +1125,13 @@ pub async fn handle_connection(
         "conn-{}",
         CONNECTION_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
+    // Clone the write-queue handle once per connection (before storage is
+    // moved into ServerCnx) so the per-Send path never locks Mutex<Storage>.
+    #[cfg(feature = "rocksdb-storage")]
+    let persistent_appender = {
+        let guard = storage.lock().await;
+        guard.concurrent_appender().ok().flatten()
+    };
     let mut server_cnx = ServerCnx::new(
         socket,
         storage,
@@ -1102,10 +1142,13 @@ pub async fn handle_connection(
         connection_liveness_check_timeout,
         max_non_persistent_pending_messages,
         max_pending_publish_requests,
+        max_pending_publish_bytes,
         max_message_size,
         broker_service_url,
         channel_write_buffer_high_water_mark_bytes,
         channel_write_buffer_low_water_mark_bytes,
+        #[cfg(feature = "rocksdb-storage")]
+        persistent_appender,
     );
     server_cnx.run().await
 }
@@ -1145,10 +1188,13 @@ mod tests {
             Duration::from_secs(10),
             1000,
             1000,
+            256 * 1024 * 1024,
             5 * 1024 * 1024,
             "pulsar://127.0.0.1:6650".to_string(),
             64 * 1024,
             32 * 1024,
+            #[cfg(feature = "rocksdb-storage")]
+            None,
         );
         let client_framed = Framed::new(client, PulsarFrameCodec::new());
         (server_cnx, client_framed, test_dir)

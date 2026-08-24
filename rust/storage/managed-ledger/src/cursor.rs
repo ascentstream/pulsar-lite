@@ -1,6 +1,6 @@
 use crate::position::ManagedLedgerPosition;
+use crate::range_set::RangeSet;
 use anyhow::Result;
-use std::collections::BTreeSet;
 
 /// Managed-cursor state skeleton.
 ///
@@ -9,7 +9,10 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ManagedCursorState {
     pub mark_delete: Option<ManagedLedgerPosition>,
-    pub individually_deleted_entries: BTreeSet<ManagedLedgerPosition>,
+    /// Out-of-order acknowledgements past the mark-delete frontier, stored as
+    /// coalesced ranges (see `RangeSet`) so memory stays O(ranges) even when
+    /// millions of individual acks arrive out of order.
+    pub individually_deleted_entries: RangeSet<ManagedLedgerPosition>,
 }
 
 /// Cursor abstraction for managed-ledger style persistence.
@@ -29,7 +32,7 @@ pub trait ManagedCursor: Send + Sync {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SubscriptionCursor {
     pub mark_delete: Option<u64>,
-    pub acked_holes: BTreeSet<u64>,
+    pub acked_holes: RangeSet<u64>,
 }
 
 pub fn is_message_acknowledged(cursor: Option<&SubscriptionCursor>, entry: u64) -> bool {
@@ -43,16 +46,24 @@ pub fn is_message_acknowledged(cursor: Option<&SubscriptionCursor>, entry: u64) 
         .unwrap_or(false)
 }
 
+/// Advances the mark-delete frontier across contiguous acknowledged ranges.
+///
+/// `take_covering` removes the whole covering range at once, so a long
+/// sequential ack streak is consumed in one step per stored range instead of
+/// one position at a time.
 pub fn advance_mark_delete(cursor: &mut SubscriptionCursor) {
-    let mut next_expected = cursor.mark_delete.map_or(0, |mark_delete| mark_delete + 1);
-    while cursor.acked_holes.remove(&next_expected) {
-        cursor.mark_delete = Some(next_expected);
-        next_expected += 1;
+    loop {
+        let next_expected = cursor.mark_delete.map_or(0, |mark_delete| mark_delete + 1);
+        match cursor.acked_holes.take_covering(&next_expected) {
+            Some(end) => cursor.mark_delete = Some(end),
+            None => break,
+        }
     }
 }
 
 pub fn ack_shared(cursor: &mut SubscriptionCursor, entry: u64) -> (Option<u64>, usize) {
     if is_message_acknowledged(Some(cursor), entry) {
+        // Second value is the number of stored ranges (not individual holes).
         return (cursor.mark_delete, cursor.acked_holes.len());
     }
 
@@ -75,5 +86,6 @@ pub fn ack_shared(cursor: &mut SubscriptionCursor, entry: u64) -> (Option<u64>, 
         }
     }
 
+    // Second value is the number of stored ranges (not individual holes).
     (cursor.mark_delete, cursor.acked_holes.len())
 }

@@ -6,6 +6,7 @@
 use crate::broker::broker_service::{SharedBrokerService, TopicRef};
 use crate::broker::service::topic::TopicRuntimeMode;
 use crate::broker::service::Producer;
+use crate::broker::Topic;
 use futures::SinkExt;
 use pulsar_lite_proto::codec::{proto::pulsar::BaseCommand, PulsarFrame, PulsarFrameCodec};
 use pulsar_lite_proto::ServerCommand;
@@ -150,9 +151,7 @@ pub async fn publish_send(
         );
 
         {
-            let topic = producer.get_topic();
-            let mut topic_guard = topic.write().await;
-            topic_guard.dispatch_to_subscriptions().await;
+            Topic::spawn_dispatcher(producer.get_topic());
         }
         message_id
     };
@@ -181,9 +180,7 @@ pub async fn publish_persistent_send(
         producer.get_topic_name()
     );
     {
-        let topic = producer.get_topic();
-        let mut topic_guard = topic.write().await;
-        topic_guard.dispatch_to_subscriptions().await;
+        Topic::spawn_dispatcher(producer.get_topic());
     }
     Ok(PublishedSend {
         producer_id,

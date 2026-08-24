@@ -2,18 +2,17 @@ use super::cursor::{ack_managed_cursor_shared, is_managed_position_acknowledged,
 use super::entrylog::EntryLogStore;
 use super::factory::{RocksDBManagedLedgerFactory, SharedLedger};
 use super::keys;
-use super::ledger::RocksDBManagedLedger;
 use super::write_queue::WriteQueue;
 use crate::cursor::first_position;
 use anyhow::{anyhow, Result};
-use rocksdb::{Options, DB};
+use rocksdb::{BlockBasedOptions, Cache, Options, DB};
 use std::fmt;
 use std::path::Path;
-use std::sync::{Arc, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use pulsar_lite_storage_managed_ledger::{
-    CursorInitOptions, CursorOpenResult, InitialPosition, ManagedCursor, ManagedLedger,
-    ManagedLedgerPosition, ManagedLedgerStorage, MessageId, StoredMessage,
+    CursorInitOptions, CursorOpenResult, InitialPosition, ManagedCursor, ManagedLedgerPosition,
+    ManagedLedgerStorage, MessageId, StoredMessage,
 };
 
 /// Cloned handle that can append without holding `Mutex<Storage>`.
@@ -58,8 +57,8 @@ impl ConcurrentAppender {
             .map_err(|e| anyhow!(e))
     }
 
-    /// Enqueue without waiting (BookKeeper logAddEntry style for connections).
-    /// Completion is delivered on `completion_tx` from the write-queue worker thread.
+    /// Enqueue without waiting. Completion is delivered on `completion_tx`
+    /// from the write-queue worker thread.
     pub fn enqueue_for_connection(
         &self,
         topic: &str,
@@ -94,6 +93,8 @@ impl fmt::Debug for ConcurrentAppender {
 pub struct RocksDbManagedLedgerStorage {
     factory: RocksDBManagedLedgerFactory,
     write_queue: WriteQueue,
+    /// Serializes cursor RMW (ack/seek/init). Must not cover entrylog IO.
+    cursor_mu: Mutex<()>,
 }
 
 impl fmt::Debug for RocksDbManagedLedgerStorage {
@@ -109,6 +110,14 @@ impl RocksDbManagedLedgerStorage {
     pub fn open(path: &Path) -> Result<Self> {
         let mut options = Options::default();
         options.create_if_missing(true);
+        options.set_max_open_files(512);
+        let mut block_opts = BlockBasedOptions::default();
+        block_opts.set_block_cache(&Cache::new_lru_cache(256 * 1024 * 1024));
+        block_opts.set_cache_index_and_filter_blocks(true);
+        options.set_block_based_table_factory(&block_opts);
+        options.set_write_buffer_size(64 * 1024 * 1024);
+        options.set_max_write_buffer_number(2);
+        options.set_max_background_jobs(4);
         let db = Arc::new(DB::open(&options, path)?);
         let entry_log = Arc::new(EntryLogStore::open(path)?);
         let factory = RocksDBManagedLedgerFactory::new(db, entry_log);
@@ -116,6 +125,7 @@ impl RocksDbManagedLedgerStorage {
         Ok(Self {
             write_queue: WriteQueue::new(factory.clone()),
             factory,
+            cursor_mu: Mutex::new(()),
         })
     }
 
@@ -131,10 +141,12 @@ impl RocksDbManagedLedgerStorage {
         self.factory.open_ledger(&ledger_name)
     }
 
-    fn lock_ledger(ledger: &SharedLedger) -> Result<MutexGuard<'_, RocksDBManagedLedger>> {
-        ledger
+    fn with_cursor_lock<R>(&self, f: impl FnOnce() -> Result<R>) -> Result<R> {
+        let _guard = self
+            .cursor_mu
             .lock()
-            .map_err(|_| anyhow!("managed ledger lock poisoned"))
+            .map_err(|_| anyhow!("cursor lock poisoned"))?;
+        f()
     }
 
     fn cursor_exists(&self, topic: &str, subscription: &str) -> Result<bool> {
@@ -144,25 +156,27 @@ impl RocksDbManagedLedgerStorage {
     }
 
     fn persist_empty_cursor(&self, topic: &str, subscription: &str) -> Result<()> {
-        let cursor_name = keys::encode_cursor_name(subscription);
-        let shared = self.topic_ledger(topic)?;
-        let mut ledger = Self::lock_ledger(&shared)?;
-        let cursor = ledger.open_cursor(&cursor_name)?;
-        cursor.persist_state()
+        self.with_cursor_lock(|| {
+            let cursor_name = keys::encode_cursor_name(subscription);
+            let ledger = self.topic_ledger(topic)?;
+            let cursor = ledger.open_cursor(&cursor_name)?;
+            cursor.persist_state()
+        })
     }
 
     fn apply_latest_cursor(&self, topic: &str, subscription: &str) -> Result<()> {
-        let cursor_name = keys::encode_cursor_name(subscription);
-        let shared = self.topic_ledger(topic)?;
-        let mut ledger = Self::lock_ledger(&shared)?;
-        let last = ledger.last_position()?;
-        let mut cursor = ledger.open_cursor(&cursor_name)?;
+        self.with_cursor_lock(|| {
+            let cursor_name = keys::encode_cursor_name(subscription);
+            let ledger = self.topic_ledger(topic)?;
+            let last = ledger.last_position()?;
+            let mut cursor = ledger.open_cursor(&cursor_name)?;
 
-        if let Some(last) = last {
-            cursor.mark_delete(last)
-        } else {
-            cursor.persist_state()
-        }
+            if let Some(last) = last {
+                cursor.mark_delete(last)
+            } else {
+                cursor.persist_state()
+            }
+        })
     }
 
     fn apply_start_message_id_cursor(
@@ -171,19 +185,19 @@ impl RocksDbManagedLedgerStorage {
         subscription: &str,
         start: &MessageId,
     ) -> Result<()> {
-        let cursor_name = keys::encode_cursor_name(subscription);
-        let target = ManagedLedgerPosition::from(start);
-        let shared = self.topic_ledger(topic)?;
-        let mut ledger = Self::lock_ledger(&shared)?;
+        self.with_cursor_lock(|| {
+            let cursor_name = keys::encode_cursor_name(subscription);
+            let target = ManagedLedgerPosition::from(start);
+            let ledger = self.topic_ledger(topic)?;
+            let previous = ledger.previous_position(&target);
+            let mut cursor = ledger.open_cursor(&cursor_name)?;
 
-        let previous = ledger.previous_position(&target);
-        let mut cursor = ledger.open_cursor(&cursor_name)?;
-
-        if let Some(previous) = previous {
-            cursor.mark_delete(previous)
-        } else {
-            cursor.persist_state()
-        }
+            if let Some(previous) = previous {
+                cursor.mark_delete(previous)
+            } else {
+                cursor.persist_state()
+            }
+        })
     }
 }
 
@@ -252,18 +266,14 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         message_id: &MessageId,
         _shared: bool,
     ) -> Result<()> {
-        let cursor_name = keys::encode_cursor_name(subscription);
-        let position = ManagedLedgerPosition::from(message_id);
-
-        let (mut cursor, marker_delete_posistion) = {
-            let shared = self.topic_ledger(topic)?;
-            let mut ledger = Self::lock_ledger(&shared)?;
-
+        self.with_cursor_lock(|| {
+            let cursor_name = keys::encode_cursor_name(subscription);
+            let position = ManagedLedgerPosition::from(message_id);
+            let ledger = self.topic_ledger(topic)?;
             let mark_delete_position = ledger.previous_position(&position);
-            let cursor = ledger.open_cursor(&cursor_name)?;
-            (cursor, mark_delete_position)
-        };
-        cursor.reset_cursor(marker_delete_posistion)
+            let mut cursor = ledger.open_cursor(&cursor_name)?;
+            cursor.reset_cursor(mark_delete_position)
+        })
     }
 
     fn first_unacked_position(
@@ -271,25 +281,33 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         topic: &str,
         subscription: &str,
     ) -> Result<Option<ManagedLedgerPosition>> {
-        let cursor_name = keys::encode_cursor_name(subscription);
-        let shared = self.topic_ledger(topic)?;
-        let mut ledger = Self::lock_ledger(&shared)?;
+        self.with_cursor_lock(|| {
+            let cursor_name = keys::encode_cursor_name(subscription);
+            let ledger = self.topic_ledger(topic)?;
+            let Some(lac) = ledger.last_position()? else {
+                return Ok(None);
+            };
 
-        let cursor = ledger.open_cursor(&cursor_name)?;
-        let state = cursor.state();
+            let cursor = ledger.open_cursor(&cursor_name)?;
+            let state = cursor.state();
+            let info = ledger.info_snapshot();
 
-        let mut candidate = match state.mark_delete.as_ref() {
-            Some(mark_delete) => next_position(mark_delete, &ledger.info),
-            None => first_position(&ledger.info, -1),
-        };
+            let mut candidate = match state.mark_delete.as_ref() {
+                Some(mark_delete) => next_position(mark_delete, info.as_ref()),
+                None => first_position(info.as_ref(), -1),
+            };
 
-        while let Some(position) = candidate {
-            if !is_managed_position_acknowledged(state, &position) {
-                return Ok(Some(position));
+            while let Some(position) = candidate {
+                if position > lac {
+                    return Ok(None);
+                }
+                if !is_managed_position_acknowledged(state, &position) {
+                    return Ok(Some(position));
+                }
+                candidate = next_position(&position, info.as_ref());
             }
-            candidate = next_position(&position, &ledger.info);
-        }
-        Ok(None)
+            Ok(None)
+        })
     }
 
     fn read_from(
@@ -298,9 +316,7 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         from: &ManagedLedgerPosition,
         limit: usize,
     ) -> Result<Vec<(MessageId, Vec<u8>)>> {
-        let shared = self.topic_ledger(topic)?;
-        let ledger = Self::lock_ledger(&shared)?;
-
+        let ledger = self.topic_ledger(topic)?;
         Ok(ledger
             .read_entries_from(from, limit)?
             .into_iter()
@@ -314,15 +330,11 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         from: &ManagedLedgerPosition,
         limit: usize,
     ) -> Result<Vec<StoredMessage>> {
-        let shared = self.topic_ledger(topic)?;
-        let ledger = Self::lock_ledger(&shared)?;
-        ledger.read_entries_from(from, limit)
+        self.topic_ledger(topic)?.read_entries_from(from, limit)
     }
 
     fn get_last_position(&self, topic: &str) -> Result<Option<ManagedLedgerPosition>> {
-        let shared = self.topic_ledger(topic)?;
-        let ledger = Self::lock_ledger(&shared)?;
-        ledger.last_position()
+        self.topic_ledger(topic)?.last_position()
     }
 
     fn get_next_position(
@@ -330,9 +342,9 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         topic: &str,
         current: &ManagedLedgerPosition,
     ) -> Result<Option<ManagedLedgerPosition>> {
-        let shared = self.topic_ledger(topic)?;
-        let ledger = Self::lock_ledger(&shared)?;
-        Ok(next_position(current, &ledger.info))
+        let ledger = self.topic_ledger(topic)?;
+        let info = ledger.info_snapshot();
+        Ok(next_position(current, info.as_ref()))
     }
 
     fn is_acknowledged(
@@ -350,11 +362,12 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         subscription: &str,
         message_id: MessageId,
     ) -> Result<()> {
-        let cursor_name = keys::encode_cursor_name(subscription);
-        let shared = self.topic_ledger(topic)?;
-        let mut ledger = Self::lock_ledger(&shared)?;
-        let mut cursor = ledger.open_cursor(&cursor_name)?;
-        cursor.mark_delete(ManagedLedgerPosition::from(message_id))
+        self.with_cursor_lock(|| {
+            let cursor_name = keys::encode_cursor_name(subscription);
+            let ledger = self.topic_ledger(topic)?;
+            let mut cursor = ledger.open_cursor(&cursor_name)?;
+            cursor.mark_delete(ManagedLedgerPosition::from(message_id))
+        })
     }
 
     fn ack_message_shared(
@@ -363,15 +376,17 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         subscription: &str,
         message_id: MessageId,
     ) -> Result<()> {
-        let cursor_name = keys::encode_cursor_name(subscription);
-        let shared = self.topic_ledger(topic)?;
-        let mut ledger = Self::lock_ledger(&shared)?;
-        let mut cursor = ledger.open_cursor(&cursor_name)?;
-        ack_managed_cursor_shared(
-            &mut cursor,
-            ManagedLedgerPosition::from(message_id),
-            &ledger.info,
-        )
+        self.with_cursor_lock(|| {
+            let cursor_name = keys::encode_cursor_name(subscription);
+            let ledger = self.topic_ledger(topic)?;
+            let mut cursor = ledger.open_cursor(&cursor_name)?;
+            let info = ledger.info_snapshot();
+            ack_managed_cursor_shared(
+                &mut cursor,
+                ManagedLedgerPosition::from(message_id),
+                info.as_ref(),
+            )
+        })
     }
 
     fn get_message_by_id(
@@ -379,9 +394,7 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         topic: &str,
         message_id: &MessageId,
     ) -> Option<(MessageId, Vec<u8>)> {
-        let shared = self.topic_ledger(topic).ok()?;
-        let ledger = Self::lock_ledger(&shared).ok()?;
-        ledger.get_message_by_id(message_id)
+        self.topic_ledger(topic).ok()?.get_message_by_id(message_id)
     }
 
     fn get_message_entry_by_id(
@@ -389,35 +402,13 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         topic: &str,
         message_id: &MessageId,
     ) -> Option<StoredMessage> {
-        let shared = self.topic_ledger(topic).ok()?;
-        let ledger = Self::lock_ledger(&shared).ok()?;
-        ledger.get_message_entry_by_id(message_id)
+        self.topic_ledger(topic)
+            .ok()?
+            .get_message_entry_by_id(message_id)
     }
 
     fn get_messages(&self, topic: &str) -> Vec<(MessageId, Vec<u8>)> {
-        let shared = match self.topic_ledger(topic) {
-            Ok(shared) => shared,
-            Err(error) => {
-                log::error!(
-                    "Failed to open managed ledger for topic '{}': {}",
-                    topic,
-                    error
-                );
-                return Vec::new();
-            }
-        };
-        let ledger = match Self::lock_ledger(&shared) {
-            Ok(ledger) => ledger,
-            Err(error) => {
-                log::error!(
-                    "Failed to lock managed ledger for topic '{}': {}",
-                    topic,
-                    error
-                );
-                return Vec::new();
-            }
-        };
-        match ledger.messages() {
+        match self.topic_ledger(topic).and_then(|l| l.messages()) {
             Ok(messages) => messages,
             Err(error) => {
                 log::error!(
@@ -431,29 +422,7 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
     }
 
     fn get_message_entries(&self, topic: &str) -> Vec<StoredMessage> {
-        let shared = match self.topic_ledger(topic) {
-            Ok(shared) => shared,
-            Err(error) => {
-                log::error!(
-                    "Failed to open managed ledger for topic '{}': {}",
-                    topic,
-                    error
-                );
-                return Vec::new();
-            }
-        };
-        let ledger = match Self::lock_ledger(&shared) {
-            Ok(ledger) => ledger,
-            Err(error) => {
-                log::error!(
-                    "Failed to lock managed ledger for topic '{}': {}",
-                    topic,
-                    error
-                );
-                return Vec::new();
-            }
-        };
-        match ledger.message_entries() {
+        match self.topic_ledger(topic).and_then(|l| l.message_entries()) {
             Ok(entries) => entries,
             Err(error) => {
                 log::error!(
@@ -472,13 +441,11 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
         subscription: &str,
         message_id: &MessageId,
     ) -> bool {
-        let shared = match self.topic_ledger(topic) {
-            Ok(shared) => shared,
-            Err(_) => return false,
+        let Ok(_guard) = self.cursor_mu.lock() else {
+            return false;
         };
-        let mut ledger = match Self::lock_ledger(&shared) {
-            Ok(ledger) => ledger,
-            Err(_) => return false,
+        let Ok(ledger) = self.topic_ledger(topic) else {
+            return false;
         };
         let cursor_name = keys::encode_cursor_name(subscription);
         ledger
@@ -493,13 +460,11 @@ impl ManagedLedgerStorage for RocksDbManagedLedgerStorage {
     }
 
     fn get_mark_delete_position(&self, topic: &str, subscription: &str) -> Option<u64> {
-        let cursor_name = keys::encode_cursor_name(subscription);
-        let shared = self.topic_ledger(topic).ok()?;
-        let mut ledger = match Self::lock_ledger(&shared) {
-            Ok(ledger) => ledger,
-            Err(_) => return None,
-        };
-        let cursor = ledger.open_cursor(&cursor_name).ok()?;
+        let _guard = self.cursor_mu.lock().ok()?;
+        let ledger = self.topic_ledger(topic).ok()?;
+        let cursor = ledger
+            .open_cursor(&keys::encode_cursor_name(subscription))
+            .ok()?;
         cursor
             .state()
             .mark_delete

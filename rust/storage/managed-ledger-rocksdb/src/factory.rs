@@ -9,13 +9,16 @@ use std::sync::Mutex;
 use crate::entrylog::EntryLogStore;
 use pulsar_lite_storage_managed_ledger::{ManagedLedgerConfig, ManagedLedgerFactory};
 
-pub(crate) type SharedLedger = Arc<Mutex<RocksDBManagedLedger>>;
+/// Shared handle for one managed ledger (write-queue worker and store readers).
+/// Contents are not wrapped in a mutex; published LAC/meta use interior atomics.
+pub(crate) type SharedLedger = Arc<RocksDBManagedLedger>;
 type LedgerCache = HashMap<String, SharedLedger>;
 
 #[derive(Debug, Clone)]
 pub struct RocksDBManagedLedgerFactory {
     db: Arc<DB>,
     entry_log: Arc<EntryLogStore>,
+    /// Serializes cache get/insert only (one Arc per name).
     ledgers: Arc<Mutex<LedgerCache>>,
 }
 
@@ -55,9 +58,8 @@ impl RocksDBManagedLedgerFactory {
             return Ok(Arc::clone(ledger));
         }
 
-        let ledger = Arc::new(Mutex::new(self.load_ledger(name, config)?));
+        let ledger = Arc::new(self.load_ledger(name, config)?);
         ledgers.insert(name.to_string(), Arc::clone(&ledger));
-
         Ok(ledger)
     }
 
@@ -77,25 +79,13 @@ impl RocksDBManagedLedgerFactory {
             .delete(keys::managed_cursor_key(ledger_name, cursor_name))?;
         Ok(())
     }
-
-    fn open_ledger_with_config(
-        &self,
-        name: &str,
-        config: &ManagedLedgerConfig,
-    ) -> Result<RocksDBManagedLedger> {
-        RocksDBManagedLedger::open_with_config(
-            name,
-            Arc::clone(&self.db),
-            Arc::clone(&self.entry_log),
-            config,
-        )
-    }
 }
 
 impl ManagedLedgerFactory for RocksDBManagedLedgerFactory {
     type Ledger = RocksDBManagedLedger;
 
+    /// Returns an uncached instance. Production appends must use `open_ledger` + write queue.
     fn open(&mut self, name: &str, config: &ManagedLedgerConfig) -> Result<Self::Ledger> {
-        self.open_ledger_with_config(name, config)
+        self.load_ledger(name, config)
     }
 }

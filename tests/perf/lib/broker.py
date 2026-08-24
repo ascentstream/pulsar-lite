@@ -11,6 +11,7 @@ import threading
 import time
 from pathlib import Path
 import shutil
+import sys
 
 from . import BASE_CONFIG, BROKER_BIN
 
@@ -23,10 +24,11 @@ class BrokerConfig:
 
 
 class BrokerSampler(threading.Thread):
-    def __init__(self, pid: int, interval: float = 0.5):
+    def __init__(self, pid: int, interval: float = 0.5, cgroup_dir: str | None = None):
         super().__init__(daemon=True)
         self.pid = pid
         self.interval = interval
+        self.cgroup_dir = cgroup_dir
         self.samples: list[dict[str, float]] = []
         self._stop_event = threading.Event()
         self._last_total = None
@@ -35,6 +37,13 @@ class BrokerSampler(threading.Thread):
 
     def stop(self) -> None:
         self._stop_event.set()
+
+    def reset(self) -> None:
+        """Drop samples and restart the CPU delta baseline. Call before each
+        scenario so metrics() reflects only that scenario's window."""
+        self.samples.clear()
+        self._last_total = None
+        self._last_time = None
 
     def run(self) -> None:
         while not self._stop_event.is_set():
@@ -58,12 +67,30 @@ class BrokerSampler(threading.Thread):
 
             rss_match = re.search(r"^VmRSS:\s+(\d+)\s+kB$", status_text, re.MULTILINE)
             rss_mb = (float(rss_match.group(1)) / 1024.0) if rss_match else 0.0
-            self.samples.append({"cpu_pct": cpu_pct, "rss_mb": rss_mb})
+            sample: dict[str, float] = {"cpu_pct": cpu_pct, "rss_mb": rss_mb}
+            if self.cgroup_dir:
+                try:
+                    with open(
+                        f"{self.cgroup_dir}/memory.stat", "r", encoding="utf-8"
+                    ) as fh:
+                        mem_stat = fh.read()
+                    for line in mem_stat.splitlines():
+                        key, _, value = line.partition(" ")
+                        if key == "anon":
+                            sample["anon_mb"] = int(value) / 1048576.0
+                        elif key == "file":
+                            sample["file_mb"] = int(value) / 1048576.0
+                except (OSError, ValueError):
+                    pass
+            self.samples.append(sample)
             time.sleep(self.interval)
 
     def write_csv(self, csv_path: Path) -> None:
+        fieldnames = ["cpu_pct", "rss_mb"]
+        if any("anon_mb" in sample for sample in self.samples):
+            fieldnames += ["anon_mb", "file_mb"]
         with csv_path.open("w", encoding="utf-8", newline="") as fh:
-            writer = csv.DictWriter(fh, fieldnames=["cpu_pct", "rss_mb"])
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(self.samples)
 
@@ -92,13 +119,45 @@ def _config_text(config: BrokerConfig, db_path: str) -> str:
 
 
 class BrokerProcess:
-    def __init__(self, config: BrokerConfig):
+    def __init__(
+        self,
+        config: BrokerConfig,
+        cgroup_memory: str | None = None,
+        cgroup_cpus: str | None = None,
+    ):
+        """Local broker process.
+
+        cgroup_memory: MemoryMax for systemd-run --user --scope (e.g. "4294967296"
+            or "4G"); MemorySwapMax is pinned to 0 to match docker --memory-swap.
+            Requires user-scope cgroup delegation (memory controller).
+        cgroup_cpus: CPU affinity via taskset -c (e.g. "0-3"), equivalent to
+            docker --cpuset-cpus (same sched_setaffinity mechanism).
+        """
         self.config = config
+        self.cgroup_memory = cgroup_memory
+        self.cgroup_cpus = cgroup_cpus
         self.proc: subprocess.Popen[str] | None = None
         self.broker_pid: int | None = None
         self.workdir: Path | None = None
         self.log_path: Path | None = None
         self.sampler: BrokerSampler | None = None
+
+    def _broker_cmd(self) -> list[str]:
+        cmd: list[str] = []
+        if self.cgroup_memory:
+            cmd += [
+                "systemd-run",
+                "--user",
+                "--scope",
+                "-p",
+                f"MemoryMax={self.cgroup_memory}",
+                "-p",
+                "MemorySwapMax=0",
+            ]
+        if self.cgroup_cpus:
+            cmd += ["taskset", "-c", self.cgroup_cpus]
+        cmd.append(str(BROKER_BIN))
+        return cmd
 
     def start(self) -> None:
         temp_dir = Path(
@@ -111,7 +170,7 @@ class BrokerProcess:
         self.log_path = temp_dir / "broker.log"
         log_file = self.log_path.open("w", encoding="utf-8")
         self.proc = subprocess.Popen(
-            [str(BROKER_BIN)],
+            self._broker_cmd(),
             cwd=temp_dir,
             stdout=log_file,
             stderr=subprocess.STDOUT,
@@ -178,7 +237,7 @@ class BrokerProcess:
             # Reopen log file for appending
             log_file = self.log_path.open("a", encoding="utf-8")
             self.proc = subprocess.Popen(
-                [str(BROKER_BIN)],
+                self._broker_cmd(),
                 cwd=self.workdir,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
@@ -190,8 +249,8 @@ class BrokerProcess:
             self.sampler = BrokerSampler(self.broker_pid)
             self.sampler.start()
         else:
-            # Original behavior: fresh start
-            self.stop()
+            # Fresh storage: drop the previous /tmp workdir so disk does not accumulate.
+            self.stop(cleanup=True)
             self.start()
 
     def metrics(self) -> dict[str, float]:
@@ -201,14 +260,99 @@ class BrokerProcess:
                 "broker_avg_cpu_pct": 0.0,
                 "broker_peak_cpu_pct": 0.0,
                 "broker_peak_rss_mb": 0.0,
+                "broker_peak_anon_mb": 0.0,
+                "broker_peak_file_mb": 0.0,
             }
         cpu_values = [sample["cpu_pct"] for sample in samples[1:]] or [0.0]
         rss_values = [sample["rss_mb"] for sample in samples]
+        anon_values = [sample.get("anon_mb", 0.0) for sample in samples]
+        file_values = [sample.get("file_mb", 0.0) for sample in samples]
         return {
             "broker_avg_cpu_pct": round(sum(cpu_values) / len(cpu_values), 3),
             "broker_peak_cpu_pct": round(max(cpu_values), 3),
             "broker_peak_rss_mb": round(max(rss_values), 3),
+            "broker_peak_anon_mb": round(max(anon_values), 3),
+            "broker_peak_file_mb": round(max(file_values), 3),
         }
+
+
+class ExternalBrokerProcess(BrokerProcess):
+    """Adapter for an already-running external broker (e.g. Apache Pulsar
+    standalone started manually with cgroup limits).
+
+    No lifecycle management: the harness only builds perf commands against
+    ``broker.config.port``. Scenarios that restart the broker
+    (restart_replay, redelivery_unacked) are not supported.
+
+    If ``unit`` is given (systemd unit name, e.g. ``pulsar-standalone``), the
+    broker PID is resolved via ``systemctl show <unit> -p MainPID`` and CPU /
+    RSS / cgroup anon+file metrics are sampled like the local backend.
+    """
+
+    def __init__(self, config: BrokerConfig, unit: str | None = None):
+        super().__init__(config)
+        self.log_path = None
+        self.unit = unit
+        self.sampler = None
+
+    def _resolve_pid(self) -> int | None:
+        try:
+            out = subprocess.run(
+                ["systemctl", "show", self.unit, "-p", "MainPID", "--value"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if not out.isdigit():
+            return None
+        pid = int(out)
+        if not os.path.exists(f"/proc/{pid}"):
+            return None
+        return pid
+
+    def _resolve_cgroup_dir(self, pid: int) -> str | None:
+        try:
+            with open(f"/proc/{pid}/cgroup", "r", encoding="utf-8") as fh:
+                rel = fh.read().strip().split(":")[-1]
+            path = f"/sys/fs/cgroup{rel}"
+            if os.path.isfile(f"{path}/memory.stat"):
+                return path
+        except OSError:
+            pass
+        return None
+
+    def start(self) -> None:
+        # External broker must already be listening.
+        self.broker_pid = None
+        self._wait_for_port()
+        if not self.unit:
+            return
+        pid = self._resolve_pid()
+        if pid is None:
+            print(
+                f"  [warn] systemd unit '{self.unit}' not found; "
+                "broker CPU/memory metrics disabled",
+                file=sys.stderr,
+            )
+            return
+        self.broker_pid = pid
+        self.sampler = BrokerSampler(pid, cgroup_dir=self._resolve_cgroup_dir(pid))
+        self.sampler.start()
+
+    def stop(self, cleanup: bool = False) -> dict[str, float]:
+        metrics = self.metrics()
+        if self.sampler:
+            self.sampler.stop()
+        return metrics
+
+    def restart(self, preserve_storage: bool = False) -> None:
+        raise NotImplementedError(
+            "external broker backend cannot restart the broker; "
+            "use scenarios that do not restart "
+            "(produce / consume_e2e / backlog_drain)"
+        )
 
 
 class DockerBrokerProcess(BrokerProcess):
@@ -378,6 +522,6 @@ class DockerBrokerProcess(BrokerProcess):
             self.sampler = BrokerSampler(self.broker_pid)
             self.sampler.start()
         else:
-            # Original behavior: fresh start
-            self.stop()
+            # Fresh storage: drop the previous /tmp workdir so disk does not accumulate.
+            self.stop(cleanup=True)
             self.start()

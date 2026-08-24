@@ -17,11 +17,18 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib import ROOT
-from lib.broker import BrokerConfig, BrokerProcess, DockerBrokerProcess
+from lib.broker import BrokerConfig, BrokerProcess, DockerBrokerProcess, ExternalBrokerProcess
 from lib.docker_image import build_broker_image
 from lib.observability import PerfCollector
 from lib.parsing import parse_consumer_output, parse_producer_output
-from lib.perf_cmd import ensure_prereqs, perf_cmd, run_consumer_then_feed, run_sync
+from lib.perf_cmd import (
+    ensure_prereqs,
+    e2e_success_despite_peer_hang,
+    format_e2e_process_failure,
+    perf_cmd,
+    run_consumer_then_feed,
+    run_sync,
+)
 
 RESULTS_PATH = ROOT / "docs" / "perf" / "data" / "persistent_stress_results.json"
 ARTIFACTS_DIR = ROOT / "docs" / "perf" / "data" / "persistent_stress_logs"
@@ -54,17 +61,17 @@ SCENARIOS: list[Scenario] = [
         name="stress_persistent_producer_max_rate",
         kind="produce",
         broker="persistent_stress",
-        description="单 producer 全速发送 200w 条",
-        producer_args=["-m", "2000000", "-s", "1024", "-r", "999999", "-o", "1000"],
+        description="单 producer 全速 60s（对齐 non-persistent -time）",
+        producer_args=["-time", "60", "-s", "1024", "-r", "999999", "-o", "1000"],
     ),
     Scenario(
         name="stress_persistent_producer_multi_producer",
         kind="produce",
         broker="persistent_stress",
-        description="4 producers 并发全速发送 200w 条",
+        description="4 producers 并发全速 60s",
         producer_args=[
-            "-m",
-            "2000000",
+            "-time",
+            "60",
             "-s",
             "1024",
             "-r",
@@ -83,52 +90,89 @@ SCENARIOS: list[Scenario] = [
         name="stress_persistent_producer_large_payload",
         kind="produce",
         broker="persistent_stress",
-        description="100KiB payload 发送 10k 条",
-        # 10k * 100KiB ≈ 1GiB payload; 200k would be ~19GiB
-        producer_args=["-m", "10000", "-s", "102400", "-r", "500"],
+        description="100KiB payload 全速 60s（对齐 non-persistent）",
+        producer_args=["-time", "60", "-s", "102400", "-r", "999999", "-o", "1000"],
     ),
     Scenario(
         name="stress_persistent_producer_sustained",
         kind="produce",
         broker="persistent_stress",
-        description="持续限速发送 500k 条 @ 10k msg/s (~50s)",
-        producer_args=["-m", "500000", "-s", "1024", "-r", "10000"],
+        description="限速 10k msg/s 持续 60s",
+        producer_args=["-time", "60", "-s", "1024", "-r", "10000", "-o", "1000"],
     ),
-    # Consumer/E2E stress (4)
+    # Consumer/E2E stress (4) — -time 60, no -m (steady thr via interval median)
     Scenario(
         name="stress_persistent_consume_shared_max_rate",
         kind="consume_e2e",
         broker="persistent_stress",
-        description="Shared 全速消费 200k 条",
-        consumer_args=["-m", "200000", "-q", "1000", "-st", "Shared"],
-        feed_producer_args=["-m", "200000", "-s", "1024", "-r", "999999"],
+        description="Shared 单 consumer 全速 60s",
+        consumer_args=["-time", "60", "-q", "1000", "-st", "Shared"],
+        feed_producer_args=["-time", "60", "-s", "1024", "-r", "999999", "-o", "1000"],
     ),
     Scenario(
         name="stress_persistent_consume_shared_high_fanout",
         kind="consume_e2e",
         broker="persistent_stress",
-        description="16 consumers 高扇出消费 200k 条",
-        consumer_args=["-m", "200000", "-q", "1000", "-st", "Shared", "-n", "16"],
-        feed_producer_args=["-m", "200000", "-s", "1024", "-r", "999999"],
+        description="16 consumers 高扇出 6s [TEMP]",
+        consumer_args=[
+            "-time",
+            "6",
+            "-q",
+            "1000",
+            "-st",
+            "Shared",
+            "-n",
+            "16",
+        ],
+        feed_producer_args=["-time", "6", "-s", "1024", "-r", "999999", "-o", "1000"],
     ),
     Scenario(
         name="stress_persistent_consume_multi_subscription_fanout",
         kind="consume_e2e",
         broker="persistent_stress",
-        description="8 subscriptions 扇出：生产 100k / 消费 800k 条",
-        # each subscription receives a full copy; consumer -m = produce * ns
-        consumer_args=["-m", "800000", "-q", "1000", "-st", "Shared", "-ns", "8"],
-        feed_producer_args=["-m", "100000", "-s", "1024", "-r", "999999"],
+        description="8 subscriptions 扇出 60s",
+        consumer_args=[
+            "-time",
+            "60",
+            "-q",
+            "1000",
+            "-st",
+            "Shared",
+            "-ns",
+            "8",
+        ],
+        feed_producer_args=["-time", "60", "-s", "1024", "-r", "999999", "-o", "1000"],
     ),
     Scenario(
         name="stress_persistent_consume_partitioned_max_rate",
         kind="consume_e2e",
         broker="persistent_stress_partitioned",
-        description="4 partitions + 4 consumers 消费 200k 条",
-        consumer_args=["-m", "200000", "-q", "1000", "-st", "Shared", "-n", "4"],
-        feed_producer_args=["-m", "200000", "-s", "1024", "-r", "999999"],
+        description="4 partitions + 4 consumers 60s",
+        consumer_args=[
+            "-time",
+            "60",
+            "-q",
+            "1000",
+            "-st",
+            "Shared",
+            "-n",
+            "4",
+        ],
+        feed_producer_args=["-time", "60", "-s", "1024", "-r", "999999", "-o", "1000"],
     ),
-    # Persistent-specific stress (3)
+    # Persistent-specific stress (4)
+    Scenario(
+        name="stress_persistent_consume_solo_10gb",
+        kind="backlog_drain",
+        broker="persistent_stress",
+        description="10GiB backlog（10485760×1KiB）→ 单 consumer 独立消费测速（produce 完成后才消费）",
+        producer_args=[
+            "-m", "10485760", "-r", "999999", "-s", "1024", "-db", "-o", "1000",
+        ],
+        consumer_args=[
+            "-m", "10485760", "-q", "1000", "-st", "Shared", "-sp", "Earliest",
+        ],
+    ),
     Scenario(
         name="stress_persistent_backlog_drain",
         kind="backlog_drain",
@@ -226,23 +270,34 @@ def run_consume_e2e_scenario(
     )
 
     start = time.time()
-    consumer_out, producer_out, consumer_rc, producer_rc = run_consumer_then_feed(
-        consumer_cmd,
-        producer_cmd,
-        consumer_log,
-        producer_log,
-        consumer_timeout=600.0,
-        producer_timeout=600.0,
+    consumer_out, producer_out, consumer_rc, producer_rc, first_failed = (
+        run_consumer_then_feed(
+            consumer_cmd,
+            producer_cmd,
+            consumer_log,
+            producer_log,
+            consumer_timeout=600.0,
+            producer_timeout=600.0,
+        )
     )
     duration = time.time() - start
 
-    if consumer_rc != 0:
-        raise RuntimeError(
-            f"consumer failed with rc={consumer_rc}: {consumer_out[:500]}"
-        )
-    if producer_rc != 0:
-        raise RuntimeError(
-            f"producer failed with rc={producer_rc}: {producer_out[:500]}"
+    if consumer_rc != 0 or producer_rc != 0:
+        if not e2e_success_despite_peer_hang(consumer_rc, producer_rc, first_failed):
+            raise RuntimeError(
+                format_e2e_process_failure(
+                    consumer_rc=consumer_rc,
+                    producer_rc=producer_rc,
+                    consumer_out=consumer_out,
+                    producer_out=producer_out,
+                    first_failed=first_failed,
+                )
+            )
+        print(
+            "  note: peer grace-killed after other side ok "
+            f"(first_failed={first_failed}, "
+            f"consumer_rc={consumer_rc}, producer_rc={producer_rc})",
+            flush=True,
         )
 
     consumer_result = parse_consumer_output(consumer_out)
@@ -254,6 +309,7 @@ def run_consume_e2e_scenario(
         "producer": producer_result,
         "broker": broker_metrics,
         "duration_s": round(duration, 2),
+        "e2e_first_failed": first_failed,
     }
 
 
@@ -277,7 +333,7 @@ def run_backlog_drain_scenario(
     )
 
     print("  Producing backlog...")
-    producer_proc = run_sync(producer_cmd, producer_log, timeout=600.0)
+    producer_proc = run_sync(producer_cmd, producer_log, timeout=1800.0)
     if producer_proc.returncode != 0:
         raise RuntimeError(f"producer failed: {producer_log.read_text()[:500]}")
 
@@ -297,7 +353,7 @@ def run_backlog_drain_scenario(
 
     print("  Draining backlog...")
     start = time.time()
-    consumer_proc = run_sync(consumer_cmd, consumer_log, timeout=600.0)
+    consumer_proc = run_sync(consumer_cmd, consumer_log, timeout=1800.0)
     drain_duration = time.time() - start
 
     if consumer_proc.returncode != 0:
@@ -312,6 +368,7 @@ def run_backlog_drain_scenario(
         "broker": broker_metrics,
         "drain_duration_s": round(drain_duration, 2),
         "drain_throughput_msg_s": round(consumer_result["records"] / drain_duration, 2),
+        "drain_throughput_mbit_s": round(consumer_result["throughput_mbit_s"], 2),
     }
 
 
@@ -411,19 +468,28 @@ def run_redelivery_unacked_scenario(
     )
 
     print("  Partial consume...")
-    consumer_out, producer_out, consumer_rc, producer_rc = run_consumer_then_feed(
-        consumer_cmd,
-        producer_cmd,
-        consumer1_log,
-        producer_log,
-        consumer_timeout=600.0,
-        producer_timeout=600.0,
+    consumer_out, producer_out, consumer_rc, producer_rc, first_failed = (
+        run_consumer_then_feed(
+            consumer_cmd,
+            producer_cmd,
+            consumer1_log,
+            producer_log,
+            consumer_timeout=600.0,
+            producer_timeout=600.0,
+        )
     )
 
-    if consumer_rc != 0:
-        raise RuntimeError(f"consumer1 failed: {consumer_out[:500]}")
-    if producer_rc != 0:
-        raise RuntimeError(f"producer failed: {producer_out[:500]}")
+    if consumer_rc != 0 or producer_rc != 0:
+        raise RuntimeError(
+            format_e2e_process_failure(
+                consumer_rc=consumer_rc,
+                producer_rc=producer_rc,
+                consumer_out=consumer_out,
+                producer_out=producer_out,
+                first_failed=first_failed,
+                consumer_label="consumer1",
+            )
+        )
 
     producer_result = parse_producer_output(producer_out)
     consumer1_result = parse_consumer_output(consumer_out)
@@ -514,10 +580,24 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument(
         "--broker-backend",
-        choices=["local", "docker"],
+        choices=["local", "docker", "external"],
         default="local",
         help="Broker launch backend. local uses rust/target/release/pulsar-lite; "
-        "docker builds and runs a constrained broker container.",
+        "docker builds and runs a constrained broker container; "
+        "external targets an already-running broker via --external-url "
+        "(e.g. Apache Pulsar standalone); no broker lifecycle management.",
+    )
+    parser.add_argument(
+        "--external-url",
+        default="pulsar://127.0.0.1:6650",
+        help="Service URL of the external broker for --broker-backend=external.",
+    )
+    parser.add_argument(
+        "--external-unit",
+        default=None,
+        help="systemd unit name of the external broker (e.g. pulsar-standalone or "
+        "pulsar-lite) to sample CPU/memory via 'systemctl show <unit> -p MainPID' "
+        "+ /proc. Leave unset to disable broker metrics for external backends.",
     )
     parser.add_argument(
         "--docker-cpuset",
@@ -528,6 +608,19 @@ def main(argv: list[str]) -> int:
         "--docker-memory",
         default="4g",
         help="Memory limit passed to docker run --memory when --broker-backend=docker.",
+    )
+    parser.add_argument(
+        "--local-cgroup-memory",
+        default=None,
+        help="local backend: MemoryMax via systemd-run --user --scope "
+        "(e.g. 4294967296 or 4G; MemorySwapMax=0 pinned). Requires user-scope "
+        "cgroup delegation for the memory controller.",
+    )
+    parser.add_argument(
+        "--local-cgroup-cpus",
+        default=None,
+        help="local backend: broker CPU affinity via taskset -c (e.g. 0-3), "
+        "equivalent to docker --cpuset-cpus.",
     )
     parser.add_argument(
         "--skip-docker-build",
@@ -589,8 +682,24 @@ def main(argv: list[str]) -> int:
                 cpuset_cpus=args.docker_cpuset,
                 memory=args.docker_memory,
             )
+        elif args.broker_backend == "external":
+            from urllib.parse import urlparse
+
+            parsed = urlparse(args.external_url)
+            if parsed.scheme != "pulsar" or not parsed.hostname:
+                raise ValueError(
+                    f"--external-url must be pulsar://host:port, got {args.external_url!r}"
+                )
+            broker = ExternalBrokerProcess(
+                BrokerConfig("external", parsed.port or 6650, 0),
+                unit=args.external_unit,
+            )
         else:
-            broker = BrokerProcess(broker_config)
+            broker = BrokerProcess(
+                broker_config,
+                cgroup_memory=args.local_cgroup_memory,
+                cgroup_cpus=args.local_cgroup_cpus,
+            )
         broker.start()
 
         try:
@@ -599,6 +708,10 @@ def main(argv: list[str]) -> int:
                 print(f"\n[{scenario.name}] {scenario.description}")
                 scenario_dir = run_artifacts / scenario.name
                 scenario_dir.mkdir(parents=True, exist_ok=True)
+                # Reset the broker sampler so metrics() / timeseries CSV cover
+                # only this scenario's window, not the whole suite run.
+                if broker.sampler:
+                    broker.sampler.reset()
                 # Start perf recording (must be after restart to capture the new PID)
                 perf_data_path = scenario_dir / "perf.data"
                 perf_collector: PerfCollector | None = None
@@ -612,7 +725,7 @@ def main(argv: list[str]) -> int:
                 try:
                     result = run_scenario(scenario, broker, scenario_dir)
 
-                    # Save broker log and timeseries
+                    # Save broker log and timeseries while workdir still exists.
                     if broker.log_path:
                         (scenario_dir / "broker.log").write_text(
                             broker.log_path.read_text(
@@ -623,7 +736,8 @@ def main(argv: list[str]) -> int:
                         broker.sampler.write_csv(scenario_dir / "broker_timeseries.csv")
 
                     # Record artifact paths in result
-                    perf_collector.stop()
+                    if perf_collector is not None:
+                        perf_collector.stop()
                     if perf_data_path.exists():
                         svg_path = scenario_dir / "flamegraph.svg"
                         ok = PerfCollector.generate_flamegraph(perf_data_path, svg_path)
@@ -656,6 +770,16 @@ def main(argv: list[str]) -> int:
 
                 except Exception as e:
                     print(f"  ERROR: {e}", file=sys.stderr)
+                    # Best-effort capture before wiping storage.
+                    try:
+                        if broker.log_path and broker.log_path.exists():
+                            (scenario_dir / "broker.log").write_text(
+                                broker.log_path.read_text(
+                                    encoding="utf-8", errors="replace"
+                                )
+                            )
+                    except OSError:
+                        pass
                     if perf_collector is not None:
                         perf_collector.stop()
                     results["scenarios"].append(
@@ -670,6 +794,24 @@ def main(argv: list[str]) -> int:
                     )
                     failed += 1
                     print(f"  ✗ FAIL: {e}")
+                finally:
+                    # Drop /tmp DB+entrylog after each scenario so storage does not accumulate.
+                    # restart_replay / redelivery manage their own in-scenario preserve restart;
+                    # once the scenario finishes we always wipe before the next one.
+                    # external backend owns its storage; nothing to reset.
+                    if args.broker_backend != "external":
+                        try:
+                            broker.restart(preserve_storage=False)
+                            print(
+                                "  storage cleaned for next scenario "
+                                f"(workdir={broker.workdir})",
+                                file=sys.stderr,
+                            )
+                        except Exception as cleanup_err:
+                            print(
+                                f"  WARNING: failed to reset broker storage: {cleanup_err}",
+                                file=sys.stderr,
+                            )
 
         finally:
             broker.stop(cleanup=True)

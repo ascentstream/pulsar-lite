@@ -93,7 +93,9 @@ prometheus.workspace = true
 prometheus-hyper.workspace = true
 pulsar-lite-metrics = { path = "metrics" }
 
-# 内存分配器：jemalloc（缓解 glibc arena 内存滞留导致的 RSS 高水位）
+# 内存分配器：jemalloc（缓解 glibc arena 内存滞留导致的 RSS 高水位）。
+# 仅 Linux：动机是 glibc 特有，且 tikv-jemalloc-sys 无法在 windows-msvc 构建。
+[target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator.workspace = true
 tikv-jemalloc-sys.workspace = true
 

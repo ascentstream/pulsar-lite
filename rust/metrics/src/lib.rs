@@ -40,8 +40,11 @@ pub use topic::{parse_topic_labels, TopicLabels, TopicMetrics};
 
 static GLOBAL: LazyLock<Arc<Registry>> = LazyLock::new(|| {
     let registry = Registry::new();
-    // The process collector (RSS / CPU gauges) is registered best-effort: a
-    // missing /proc mount only drops those gauges, never breaks collection.
+    // The process collector (RSS / CPU gauges) is linux-only in prometheus
+    // (gated behind `target_os = "linux"` even with the "process" feature);
+    // register it best-effort: a missing /proc mount only drops those gauges,
+    // never breaks collection.
+    #[cfg(target_os = "linux")]
     match registry.register(Box::new(
         prometheus::process_collector::ProcessCollector::for_self(),
     )) {

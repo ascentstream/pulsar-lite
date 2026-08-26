@@ -23,7 +23,7 @@ Pulsar Lite - 嵌入式轻量级消息队列
     client = pulsar.Client(broker.url)
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .client import PulsarClient
 from .process_manager import BrokerHandle, start_broker

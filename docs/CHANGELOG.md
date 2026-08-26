@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-26
+
+### Highlights
+
+v0.1.0 之后最大的一次升级：broker 从纯内存存储演进为 **RocksDB managed-ledger 持久化存储引擎**（entrylog + cursor 持久化 + 重启恢复），补齐持久化订阅语义（KeyShared、redelivery、seek、cumulative ack），新增 **Prometheus 指标 + Grafana 看板**可观测性栈，并落地 **write-queue 异步批量写入**性能栈（批量 RocksDB 写、entrylog 批量刷盘、send-receipt 批量回执、fan-out worker、ack range 合并、jemalloc）。工作区拆分为 proto / storage / metrics 多 crate。
+
+### Added
+
+#### 持久化存储引擎（RocksDB managed ledger + entrylog）
+- Pulsar 风格 RocksDB managed-ledger key 布局，protobuf 编码的 ledger 元数据，全局 ledger ID 分配
+- entrylog 文件存储消息 payload，entry 位置索引与读取校验
+- cursor 持久化：订阅时 cursor 初始化、按 position 的读取 API、重启后 cursor 位置归一化
+- managed-ledger entry metadata 持久化与恢复
+- RocksDB 调优：managed ledger 缓存、有界点读替代全 ledger 扫描、内存上限、LAC 经 ArcSwap 发布
+- 存储层拆为 workspace crates：pulsar-lite-storage（core / metadata / resources / managed-ledger / managed-ledger-rocksdb）
+
+#### 持久化订阅语义
+- broker 重启后恢复订阅：从 read position 分发、ack 状态与 redelivery 恢复
+- KeyShared 订阅：sticky key hash 路由、hash blocking、redelivery 期间保持 key ownership
+- RedeliveryController（Shared/KeyShared）：redeliver unacknowledged 命令、redelivery 队列在 ack 后剪枝
+- seek：按 message id（cursor 重置 + dispatcher 状态清理）、按 publish time（顺序扫描 + RocksDB 二分）
+- Failover 持久化恢复：active consumer 确定性选择、single-active rewind
+- cumulative ack、reader 起始/最后 message id、unsubscribe cursor 重置修复与测试覆盖
+
+#### 可观测性
+- 新增 pulsar-lite-metrics crate：storage 侧 Prometheus 指标家族
+- broker 各层接线 Prometheus 指标，`GET /metrics` 暴露
+- Grafana dashboard + docker compose 栈（Prometheus/Grafana，宿主 7070 端口）；perf broker 专属可抓取 metrics 端口，支持 perf 运行实时观测
+- batch 感知的消息计数（修正 batched-send 计数与聚合锯齿）；storage 锁忙时 gauge 保持上次值
+
+#### 性能（write-queue 栈）
+- managed-ledger 单写者 append 队列；append 批量合并为 RocksDB 批量写；等待 IO 期间释放 topic/storage 锁
+- entrylog 专用 writer 线程批量刷盘；异步 write-queue + send pipeline + entrylog batch flush
+- 持久化 enqueue 热路径去锁；dispatch 与 send-receipt 解耦；push completions；持久化 send receipt 批量 flush
+- 非 persistent 发布：有序 batched fan-out worker
+- ack 合并成 range；TCP_NODELAY；jemalloc 分配器（缓解 glibc arena RSS 滞留）
+- 背压：pending publish 字节上限 + 连接写状态配置；unacked 闸门限制 shared dispatcher 内存；permit 计数修复；flow permits 在 subscription 锁下同步应用
+- dispatcher 按剩余 permit 批量 drain；write-queue 拆分独立 crate 并增加 backpressure
+
+#### perf 测试套件
+- persistent stress / e2e matrix 脚本；pulsar-perf 读结果解析；broker restart 保留存储参数
+- 外部 broker backend（直连 standalone，无生命周期管理）+ systemd-run/taskset 本地资源限制；10GB solo-consumer backlog drain 场景
+
+### Changed
+- 协议层拆出 pulsar-lite-proto crate，broker 迁移并移除主 crate 中重复的 protocol/storage 模块
+- persistent topic / subscription runtime 提取重构；seek helpers 移入 storage core
+- CI/CD：工作流合并为统一 CD 流水线，构建提速 40-50%；SHA256SUMS 不随 dist 上传 PyPI
+- 依赖升级：tokio 1.52、rocksdb 0.24、clap 4.6、log 0.4.33、bytes 1.12、uuid 1.23、serde_json 1.0.150 及 GitHub Actions v6/v7
+
+### Fixed
+- LAC 读可见性：write-queue 批量写入路由进共享 ledger 缓存
+- 共享订阅重启后 redelivery 恢复；shared redelivery 队列在 ack 后剪枝
+- persistent 订阅 unsubscribe / seek by message id / reader start ids / last message id
+- accept_cnx 竞态；murmur3 hash `as_chunks` 兼容；clippy 1.98 全量修复
+
+### 早期条目（2026-03，首次随本版发布）
+
 ### Added - 2026-03-04
 
 #### 分区 Topic 支持
@@ -216,5 +273,6 @@ if sub_type == SubscriptionType::Exclusive {
 - 消息分配追踪（避免重复消费）
 - Round-robin 批处理（dispatcherMaxRoundRobinBatchSize = 20）
 
-[Unreleased]: https://github.com/ascentstream/pulsar-lite/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ascentstream/pulsar-lite/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ascentstream/pulsar-lite/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ascentstream/pulsar-lite/releases/tag/v0.1.0

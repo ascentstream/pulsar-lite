@@ -106,7 +106,12 @@ jobs:
       - name: Install LLVM/Clang (Windows, for rocksdb bindgen)
         if: steps.should-run.outputs.skip != 'true' && runner.os == 'Windows'
         shell: pwsh
-        run: choco install llvm -y --no-progress
+        run: |
+          choco install llvm -y --no-progress
+          # NOTE: only set LIBCLANG_PATH where needed. clang-sys searches ONLY
+          # this path once the variable is set (even to an empty string);
+          # Linux/macOS locates libclang via their default globs.
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install protoc (macOS)
         if: steps.should-run.outputs.skip != 'true' && runner.os == 'macOS'
@@ -135,9 +140,6 @@ jobs:
       - name: Build Rust broker
         if: steps.should-run.outputs.skip != 'true'
         shell: bash
-        env:
-          # choco llvm install location, for rocksdb bindgen on Windows
-          LIBCLANG_PATH: ${{ runner.os == 'Windows' && 'C:\Program Files\LLVM\bin' || '' }}
         run: cargo build --manifest-path rust/Cargo.toml --release --features rocksdb-storage
 
       - name: Copy broker binary into Python package

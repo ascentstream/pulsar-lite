@@ -113,7 +113,7 @@ jobs:
 
       # 📥 下载预构建的 broker（节省 3-8 分钟）
       - name: Download broker binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: pulsar-lite-broker
           path: rust/target/release/

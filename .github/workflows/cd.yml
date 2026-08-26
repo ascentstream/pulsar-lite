@@ -122,9 +122,9 @@ jobs:
               source "$HOME/.cargo/env"
               export CARGO_TARGET_DIR=/tmp/t
               export RUSTFLAGS="-C link-arg=-static-libstdc++ -C link-arg=-static-libgcc"
-              cargo build --manifest-path /src/Cargo.toml --release --features rocksdb-storage
-              mkdir -p /src/target/release
-              cp /tmp/t/release/pulsar-lite /src/target/release/pulsar-lite
+              cargo build --manifest-path /src/rust/Cargo.toml --release --features rocksdb-storage
+              mkdir -p /src/rust/target/release
+              cp /tmp/t/release/pulsar-lite /src/rust/target/release/pulsar-lite
             '
 
       - name: Install LLVM/Clang (Windows, for rocksdb bindgen)

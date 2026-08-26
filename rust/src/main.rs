@@ -16,12 +16,16 @@ use pulsar_lite_storage::Storage;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+// jemalloc only on Linux: the glibc arena RSS retention it fixes is
+// linux-specific, and tikv-jemalloc-sys cannot build on windows-msvc.
+#[cfg(target_os = "linux")]
 use tikv_jemallocator::Jemalloc;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Duration;
 use tokio_util::codec::Framed;
 
+#[cfg(target_os = "linux")]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 

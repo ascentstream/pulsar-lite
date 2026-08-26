@@ -100,7 +100,13 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          # clang/libclang-dev: librocksdb-sys runs bindgen at build time
+          sudo apt-get install -y --no-install-recommends protobuf-compiler clang libclang-dev
+
+      - name: Install LLVM/Clang (Windows, for rocksdb bindgen)
+        if: steps.should-run.outputs.skip != 'true' && runner.os == 'Windows'
+        shell: pwsh
+        run: choco install llvm -y --no-progress
 
       - name: Install protoc (macOS)
         if: steps.should-run.outputs.skip != 'true' && runner.os == 'macOS'
@@ -129,7 +135,10 @@ jobs:
       - name: Build Rust broker
         if: steps.should-run.outputs.skip != 'true'
         shell: bash
-        run: cargo build --manifest-path rust/Cargo.toml --release
+        env:
+          # choco llvm install location, for rocksdb bindgen on Windows
+          LIBCLANG_PATH: ${{ runner.os == 'Windows' && 'C:\Program Files\LLVM\bin' || '' }}
+        run: cargo build --manifest-path rust/Cargo.toml --release --features rocksdb-storage
 
       - name: Copy broker binary into Python package
         if: steps.should-run.outputs.skip != 'true'

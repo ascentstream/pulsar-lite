@@ -60,7 +60,8 @@ v0.1.0 之后最大的一次升级：broker 从纯内存存储演进为 **RocksD
 - LAC 读可见性：write-queue 批量写入路由进共享 ledger 缓存
 - 共享订阅重启后 redelivery 恢复；shared redelivery 队列在 ack 后剪枝
 - persistent 订阅 unsubscribe / seek by message id / reader start ids / last message id
-- accept_cnx 竞态；murmur3 hash `as_chunks` 兼容；clippy 1.98 全量修复
+- 发版构建修复：CD 构建 broker 补上 `--features rocksdb-storage`（此前 wheel 内 broker 会静默退化为内存存储）及 rocksdb 构建依赖（Linux clang/libclang、Windows LLVM）
+- 跨平台编译：prometheus process collector 与 jemalloc 仅在 Linux 启用（前者是 linux-only API，后者无法在 windows-msvc 构建），macOS/Windows wheel 构建首次打通
 
 ### 早期条目（2026-03，首次随本版发布）
 

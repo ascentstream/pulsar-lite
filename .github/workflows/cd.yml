@@ -95,13 +95,37 @@ jobs:
         if: steps.should-run.outputs.skip != 'true'
         uses: actions/checkout@v6
 
-      - name: Install Linux system dependencies
+      # Linux builds happen inside the manylinux container below; the host
+      # needs no compiler toolchain (only uv + the wheel packaging steps run
+      # natively on this runner).
+
+      - name: Build Rust broker (Linux, manylinux container)
         if: steps.should-run.outputs.skip != 'true' && runner.os == 'Linux'
         shell: bash
         run: |
-          sudo apt-get update
-          # clang/libclang-dev: librocksdb-sys runs bindgen at build time
-          sudo apt-get install -y --no-install-recommends protobuf-compiler clang libclang-dev
+          # Building on ubuntu-24.04 couples the binary to glibc 2.38
+          # (__isoc23_* redirects from gcc-13 headers) and to the host
+          # libstdc++. Build inside the manylinux_2_28 image instead and
+          # static-link libstdc++/libgcc so the wheel has no GLIBCXX floor;
+          # setup.py relabels the wheel as manylinux_2_28_x86_64.
+          docker run --rm -v "$PWD:/src" -w /src \
+            quay.io/pypa/manylinux_2_28_x86_64:latest bash -exc '
+              # Alma 8 protoc (3.5) is too old for prost-build; use the same
+              # protoc 25.x as the macOS/Windows legs.
+              dnf install -y -q clang clang-devel libstdc++-static unzip
+              curl -fsSL -o /tmp/protoc.zip \
+                https://github.com/protocolbuffers/protobuf/releases/download/v25.6/protoc-25.6-linux-x86_64.zip
+              unzip -q /tmp/protoc.zip -d /usr/local
+              protoc --version
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain stable
+              source "$HOME/.cargo/env"
+              export CARGO_TARGET_DIR=/tmp/t
+              export RUSTFLAGS="-C link-arg=-static-libstdc++ -C link-arg=-static-libgcc"
+              cargo build --manifest-path /src/Cargo.toml --release --features rocksdb-storage
+              mkdir -p /src/target/release
+              cp /tmp/t/release/pulsar-lite /src/target/release/pulsar-lite
+            '
 
       - name: Install LLVM/Clang (Windows, for rocksdb bindgen)
         if: steps.should-run.outputs.skip != 'true' && runner.os == 'Windows'
@@ -137,8 +161,8 @@ jobs:
         with:
           enable-cache: false
 
-      - name: Build Rust broker
-        if: steps.should-run.outputs.skip != 'true'
+      - name: Build Rust broker (macOS/Windows)
+        if: steps.should-run.outputs.skip != 'true' && runner.os != 'Linux'
         shell: bash
         run: cargo build --manifest-path rust/Cargo.toml --release --features rocksdb-storage
 
@@ -183,11 +207,11 @@ jobs:
         run: |
           uv tool install auditwheel
           export PATH="$HOME/.local/bin:$PATH"
-          # setup.py already tags the wheel manylinux_2_17_x86_64 directly,
-          # because the bundled Rust broker is a static binary with no glibc
-          # coupling. auditwheel is kept only as a diagnostic; we do not let
-          # it rewrite the wheel (it cannot analyze a static Rust binary and
-          # would silently fail).
+          # The Linux broker is built in the manylinux_2_28 container with
+          # libstdc++/libgcc statically linked, and setup.py relabels the
+          # wheel manylinux_2_28_x86_64. auditwheel stays as a diagnostic
+          # only: it cannot analyze an executable shipped in purelib and
+          # would refuse to rewrite the tag.
           auditwheel show dist/*.whl || true
 
       - name: Inspect wheel contents

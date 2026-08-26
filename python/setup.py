@@ -33,6 +33,15 @@ class bdist_platform_wheel(bdist_wheel):
             plat_name = "linux_i686"
 
         plat_name = plat_name.lower().replace("-", "_").replace(".", "_")
+
+        # PyPI rejects bare "linux_*" platform tags (PEP 513/599/600). The
+        # Linux broker is built inside quay.io/pypa/manylinux_2_28_x86_64 in
+        # CD (glibc 2.28 floor, libstdc++/libgcc statically linked), so the
+        # manylinux_2_28 tag is the honest relabel for the host-built tag.
+        if plat_name == "linux_x86_64":
+            plat_name = "manylinux_2_28_x86_64"
+        elif plat_name == "linux_i686":
+            plat_name = "manylinux_2_28_i686"
         return self.python_tag, "none", plat_name
 
 

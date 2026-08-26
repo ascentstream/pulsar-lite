@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pulsar-lite"
-version = "0.1.0"
+version = "0.2.0"
 description = "Embedded lightweight message queue compatible with Apache Pulsar - Milvus Lite style experience"
 authors = [{name = "Ascentstream", email = "community@ascentstream.com"}]
 license = {text = "Apache-2.0"}

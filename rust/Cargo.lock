@@ -976,7 +976,7 @@ dependencies = [
 
 [[package]]
 name = "pulsar-lite"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1013,7 +1013,7 @@ dependencies = [
 
 [[package]]
 name = "pulsar-lite-metrics"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "log",
  "prometheus",
@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "pulsar-lite-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "prost",
@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "pulsar-lite-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "log",
@@ -1049,7 +1049,7 @@ dependencies = [
 
 [[package]]
 name = "pulsar-lite-storage-managed-ledger"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1061,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "pulsar-lite-storage-managed-ledger-rocksdb"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1080,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "pulsar-lite-storage-metadata"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "log",
@@ -1091,7 +1091,7 @@ dependencies = [
 
 [[package]]
 name = "pulsar-lite-storage-resources"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "log",
